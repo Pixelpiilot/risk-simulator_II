@@ -33,18 +33,18 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2,
+  rr: 2.5,
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2000,
+  currentPrice: 2600,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
   cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 60,
-  lossRiskPct: 20,
-  lossRiskAdjustPct: 0,
+  winRiskPct: 65,
+  lossRiskPct: 18,
+  lossRiskAdjustPct: -1,
   perTradeCapPct: 90,
   overallCapPct: 60,
   // Risk Allocation reset: if calculated cascade risk reaches this % of
@@ -55,11 +55,11 @@ const DEFAULTS = {
   riskAllocationResetPct: 50,
   // Risk-of-Ruin uses a fixed internal 80% loss threshold; no user-facing input.
   slipMode: "percent",
-  slipPct: 0.01,
+  slipPct: 0,
   slipTicks: 1,
-  tickValue: 1,
+  tickValue: 0.1,
   entrySpread: 0,
-  exitSpread: 0,
+  exitSpread: 0.2,
   winRate: 50,
   numTrades: 10,
   sweepStep: 10,
@@ -930,7 +930,7 @@ function GroupTitle({ children, icon: Icon, color = "blue" }) {
   );
 }
 
-function StatCell({ label, value, tone, icon: Icon, sub, valueColor }) {
+function StatCell({ label, value, tone, icon: Icon, sub, valueColor, subColor }) {
   const toneClass = tone === "pos" ? "text-emerald-400" : tone === "neg" ? "text-red-400" : "text-zinc-100";
   const barColor = tone === "pos" ? "bg-emerald-500" : tone === "neg" ? "bg-red-500" : "bg-zinc-500";
   return (
@@ -950,7 +950,14 @@ function StatCell({ label, value, tone, icon: Icon, sub, valueColor }) {
       >
         {value}
       </div>
-      {sub && <div className={`text-[11px] mt-1 font-mono ${toneClass}`}>{sub}</div>}
+      {sub && (
+        <div
+          className={`text-[11px] mt-1 font-mono ${subColor ? "" : toneClass}`}
+          style={subColor ? { color: subColor } : undefined}
+        >
+          {sub}
+        </div>
+      )}
     </div>
   );
 }
@@ -1071,7 +1078,23 @@ function TradeChartsTooltip({ active, payload, label }) {
 // Renders the per-trade P/L histogram shown above the Trade Log, colored by
 // win/loss. Used by both the Single Run and Day/F&O result panels — same
 // trade shape (n, netPL, capital, win), just different cfg.
-function TradeAnalyticsSection({ trades, initialCapital }) {
+function CollapsibleSectionToggle({ open, onClick, label }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-expanded={open}
+      aria-label={`${open ? "Collapse" : "Expand"} ${label}`}
+      title={open ? `Collapse ${label}` : `Expand ${label}`}
+      className="w-7 h-7 rounded-md flex items-center justify-center text-zinc-500 hover:text-zinc-200 hover:bg-zinc-800/70 transition-colors flex-none"
+    >
+      <ChevronDown size={15} className={`transition-transform duration-200 ${open ? "rotate-0" : "-rotate-90"}`} />
+    </button>
+  );
+}
+
+function TradeAnalyticsSection({ trades, initialCapital, collapsible = false, defaultOpen = true }) {
+  const [open, setOpen] = useState(defaultOpen);
   if (!trades || !trades.length) return null;
 
   const data = trades.map((t) => ({
@@ -1122,12 +1145,17 @@ function TradeAnalyticsSection({ trades, initialCapital }) {
           <BarChart2 size={14} className="text-zinc-300" />
           Per-Trade P/L
         </span>
-        <span className="flex items-center gap-3">
-          <LegendDot color="bg-[#7BF1A8]" label="Win" />
-          <LegendDot color="bg-[#FF8904]" label="Loss" />
+        <span className="flex items-center gap-2">
+          <span className="flex items-center gap-3">
+            <LegendDot color="bg-[#7BF1A8]" label="Win" />
+            <LegendDot color="bg-[#FF8904]" label="Loss" />
+          </span>
+          {collapsible && <CollapsibleSectionToggle open={open} onClick={() => setOpen((v) => !v)} label="Per-Trade P/L" />}
         </span>
       </div>
 
+      {(!collapsible || open) && (
+        <>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-zinc-800">
         <div className="bg-zinc-900 px-3 py-2.5">
           <div className="text-[10px] text-zinc-500">Max Win Streak</div>
@@ -1197,6 +1225,8 @@ function TradeAnalyticsSection({ trades, initialCapital }) {
           </ComposedChart>
         </ResponsiveContainer>
       </div>
+        </>
+      )}
     </div>
   );
 }
@@ -2225,7 +2255,7 @@ function CombinationBadge({ sequence, compact = false, draggable = false, onMove
   };
 
   return (
-    <span className={`inline-flex items-center gap-0.5 ${compact ? "" : "p-1 rounded-md bg-zinc-950/70 border border-white/[0.06]"} ${draggable ? "cursor-grab active:cursor-grabbing" : ""}`}
+    <span className={`inline-flex w-max shrink-0 items-center gap-0.5 whitespace-nowrap ${compact ? "" : "p-1 rounded-md bg-zinc-950/70 border border-white/[0.06]"} ${draggable ? "cursor-grab active:cursor-grabbing" : ""}`}
       title={draggable ? "Drag W/L chips to reorder the combination" : undefined}
     >
       {sequence.split("").map((ch, i) => (
@@ -2240,8 +2270,8 @@ function CombinationBadge({ sequence, compact = false, draggable = false, onMove
             compact ? "w-4 h-4 text-[9px]" : "w-5 h-5 text-[9px]"
           } ${
             ch === "W"
-              ? "bg-emerald-500/12 border-emerald-400/25 text-emerald-300"
-              : "bg-orange-500/10 border-orange-400/25 text-orange-300"
+              ? "bg-[#7CCF35]/12 border-[#7CCF35]/35 text-[#7CCF35]"
+              : "bg-[#FF2056]/10 border-[#FF2056]/35 text-[#FF2056]"
           } ${
             dragIdx === i ? "opacity-40" : ""
           } ${
@@ -2284,6 +2314,8 @@ function BuilderScenarioTooltip({ active, payload, label }) {
 
 function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderCombination }) {
   const [selectedWinRate, setSelectedWinRate] = useState(0);
+  const [matrixOpen, setMatrixOpen] = useState(true);
+  const [winningScenariosOpen, setWinningScenariosOpen] = useState(true);
 
   useEffect(() => {
     if (!builder) return;
@@ -2341,6 +2373,8 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           value={losingRates.length}
           tone="neg"
           icon={Shield}
+          valueColor="#FF8904"
+          subColor="#FF8904"
           sub={
             losingRates.length
               ? `Range: ${losingRateRangeLabels.join(" · ")} · no profitable combination`
@@ -2350,10 +2384,21 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
       </div>
 
       <div className={`${CARD} overflow-hidden`}>
-        <div className="px-4 py-3 border-b border-zinc-800">
-          <div className="text-[13px] font-semibold text-zinc-200">Win-Rate Strategy Matrix</div>
-          <div className="text-[10px] text-zinc-600 mt-1">Click a Win Rate to inspect its profitable scenarios. Drag the W/L chips in a Combination to reorder it and recalculate.</div>
+        <div className="px-4 py-2.5 border-b border-zinc-800 flex items-center justify-between gap-3">
+          <button
+            type="button"
+            onClick={() => setMatrixOpen((v) => !v)}
+            className="flex-1 min-w-0 text-left hover:text-zinc-100 transition-colors"
+            aria-expanded={matrixOpen}
+          >
+            <div className="text-[13px] font-semibold text-zinc-200">Win-Rate Strategy Matrix</div>
+            {matrixOpen && (
+              <div className="text-[10px] text-zinc-600 mt-1">Click a Win Rate to inspect its profitable scenarios. Drag the W/L chips in a Combination to reorder it and recalculate.</div>
+            )}
+          </button>
+          <CollapsibleSectionToggle open={matrixOpen} onClick={() => setMatrixOpen((v) => !v)} label="Win-Rate Strategy Matrix" />
         </div>
+        {matrixOpen && (
         <div className="overflow-x-auto">
           <table className="w-full text-[11px] font-mono min-w-[1120px]">
             <thead className="bg-zinc-950/60 text-zinc-500">
@@ -2394,9 +2439,9 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
                       </span>
                     </td>
                     <td className="px-3 py-2 text-right">{c ? c.tradeCount : "—"}</td>
-                    <td className="px-3 py-2">
+                    <td className="px-3 py-2 align-middle">
                       {c ? (
-                        <span onClick={(e) => e.stopPropagation()} className="inline-flex">
+                        <span onClick={(e) => e.stopPropagation()} className="flex min-w-0 items-center overflow-x-auto overflow-y-hidden">
                           <CombinationBadge
                             sequence={c.sequence}
                             draggable
@@ -2409,23 +2454,38 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
                     <td className={`px-3 py-2 text-right font-semibold ${c && c.returnPct > 0 ? "text-emerald-400" : "text-red-400"}`}>{c ? `${c.returnPct >= 0 ? "+" : ""}${c.returnPct.toFixed(2)}` : "—"}</td>
                     <td className="px-3 py-2 text-right text-zinc-200">{c ? fmtMoney(c.finalCapital) : "—"}</td>
                     <td className="px-3 py-2 text-right text-red-400">{c ? c.maxDD.toFixed(2) : "—"}</td>
-                    <td className="px-3 py-2"><span className={c && c.returnPct > 0 ? "text-emerald-400" : "text-red-400"}>{point.status}</span></td>
+                    <td className="px-3 py-2">
+                      <span style={{ color: c && c.returnPct > 0 ? "#05DF72" : "#F54927" }}>{point.status}</span>
+                    </td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
         </div>
+        )}
       </div>
 
       <div className={`${CARD} overflow-hidden`}>
-        <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-3">
-          <div>
+        <div className="px-4 py-2.5 border-b border-zinc-800 flex items-center justify-between gap-3">
+          <button
+            type="button"
+            onClick={() => setWinningScenariosOpen((v) => !v)}
+            className="flex-1 min-w-0 text-left hover:text-zinc-100 transition-colors"
+            aria-expanded={winningScenariosOpen}
+          >
             <div className="text-[13px] font-semibold text-zinc-200">Winning Combination Scenarios</div>
-            <div className="text-[10px] text-zinc-600 mt-1">{formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} profitable combination{winningScenarios.length === 1 ? "" : "s"} · Click any bar to open that exact Trade Log.</div>
-          </div>
-          <div className="text-right font-mono text-[10px] text-emerald-300">{winningScenarios.length} scenarios</div>
+            {winningScenariosOpen && (
+              <div className="text-[10px] text-zinc-600 mt-1">{formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} profitable combination{winningScenarios.length === 1 ? "" : "s"} · Click any bar to open that exact Trade Log.</div>
+            )}
+          </button>
+          <span className="flex items-center gap-2">
+            <span className="text-right font-mono text-[10px] text-emerald-300">{winningScenarios.length} scenarios</span>
+            <CollapsibleSectionToggle open={winningScenariosOpen} onClick={() => setWinningScenariosOpen((v) => !v)} label="Winning Combination Scenarios" />
+          </span>
         </div>
+        {winningScenariosOpen && (
+        <>
         {chartData.length ? (
           <div className="h-64 sm:h-72 px-2 pt-5 pb-2">
             <ResponsiveContainer width="100%" height="100%">
@@ -2455,6 +2515,8 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
         ) : (
           <div className="py-12 text-center text-zinc-500 text-xs">No profitable combination scenarios at {formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate.</div>
         )}
+        </>
+        )}
       </div>
 
       {best && (
@@ -2466,12 +2528,12 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
             </div>
             <div className="font-mono text-sm text-emerald-400">+{best.returnPct.toFixed(2)}</div>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-px bg-zinc-800">
-            <div className="bg-zinc-900 px-3 py-3"><div className="text-[10px] text-zinc-500">Win Rate</div><div className="font-mono text-sm mt-1 text-[#FFDF20]">{formatBuilderWinRate(best.actualWinRate)}</div></div>
-            <div className="bg-zinc-900 px-3 py-3"><div className="text-[10px] text-zinc-500">Trade Count</div><div className="font-mono text-sm mt-1 text-zinc-200">{best.tradeCount}</div></div>
-            <div className="bg-zinc-900 px-3 py-3">
+          <div className="grid grid-cols-2 sm:grid-cols-[0.82fr_0.82fr_1.8fr_0.88fr_0.88fr] gap-px bg-zinc-800">
+            <div className="bg-zinc-900 px-3 py-3 min-w-0"><div className="text-[10px] text-zinc-500">Win Rate</div><div className="font-mono text-sm mt-1 text-[#FFDF20]">{formatBuilderWinRate(best.actualWinRate)}</div></div>
+            <div className="bg-zinc-900 px-3 py-3 min-w-0"><div className="text-[10px] text-zinc-500">Trade Count</div><div className="font-mono text-sm mt-1 text-zinc-200">{best.tradeCount}</div></div>
+            <div className="bg-zinc-900 px-3 py-3 min-w-0">
               <div className="text-[10px] text-zinc-500">Combination</div>
-              <div className="mt-1">
+              <div className="mt-1 flex min-w-0 items-center overflow-x-auto overflow-y-hidden">
                 <CombinationBadge
                   sequence={best.sequence}
                   compact
@@ -2480,8 +2542,8 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
                 />
               </div>
             </div>
-            <div className="bg-zinc-900 px-3 py-3"><div className="text-[10px] text-zinc-500">Total Risk</div><div className="font-mono text-sm mt-1 text-violet-300">{best.totalAllocatedRiskPct.toFixed(2)}%</div></div>
-            <div className="bg-zinc-900 px-3 py-3"><div className="text-[10px] text-zinc-500">Max DD</div><div className="font-mono text-sm mt-1 text-red-300">{best.maxDD.toFixed(2)}</div></div>
+            <div className="bg-zinc-900 px-3 py-3 min-w-0"><div className="text-[10px] text-zinc-500">Total Risk</div><div className="font-mono text-sm mt-1 text-violet-300">{best.totalAllocatedRiskPct.toFixed(2)}%</div></div>
+            <div className="bg-zinc-900 px-3 py-3 min-w-0"><div className="text-[10px] text-zinc-500">Max DD</div><div className="font-mono text-sm mt-1 text-red-300">{best.maxDD.toFixed(2)}</div></div>
           </div>
         </div>
       )}
@@ -2551,7 +2613,7 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
         )}
       </div>
 
-      <TradeAnalyticsSection trades={result.trades} initialCapital={initialCapital} />
+      <TradeAnalyticsSection trades={result.trades} initialCapital={initialCapital} collapsible defaultOpen={true} />
 
       <div className={`${CARD} overflow-hidden`}>
         <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-zinc-800">
