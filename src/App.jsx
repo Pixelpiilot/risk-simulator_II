@@ -903,13 +903,15 @@ function Field({ label, hint, children }) {
   );
 }
 
-function NumInput({ value, onChange, step = "1", color = "blue" }) {
+function NumInput({ value, onChange, step = "1", color = "blue", min, max }) {
   const c = SECTION_COLORS[color] || SECTION_COLORS.blue;
   return (
     <input
       type="number"
       value={value}
       step={step}
+      min={min}
+      max={max}
       onChange={onChange}
       className={`w-full bg-black/30 border border-white/[0.08] text-zinc-100 rounded-lg text-sm px-3 py-2.5 outline-none focus:ring-1 transition-colors font-mono ${c.ring}`}
     />
@@ -1998,8 +2000,10 @@ function applyBuilderCandidateEdit(builder, targetWinRate, oldKey, editedCandida
 function runStrategyBuilder(rawCfg) {
   const initialCapital = Math.max(0, Number(rawCfg.builderInitialCapital) || 0);
   const totalRiskPct = Math.max(0, Number(rawCfg.builderTotalRiskPct) || 0);
-  const minTrades = Math.min(10, Math.max(5, Math.round(Number(rawCfg.builderMinTrades) || 5)));
-  const maxTrades = Math.min(10, Math.max(minTrades, Math.round(Number(rawCfg.builderMaxTrades) || 10)));
+  const requestedMinTrades = Math.round(Number(rawCfg.builderMinTrades) || 5);
+  const requestedMaxTrades = Math.round(Number(rawCfg.builderMaxTrades) || 10);
+  const minTrades = Math.max(1, requestedMinTrades);
+  const maxTrades = Math.max(minTrades, requestedMaxTrades);
   const totalRiskAmount = initialCapital * (totalRiskPct / 100);
   const baseMode = rawCfg.builderBaseMode === "fno" ? "fno" : "single";
   const useFno = baseMode === "fno";
@@ -2009,9 +2013,10 @@ function runStrategyBuilder(rawCfg) {
     initialCapital,
   });
 
-  // Group every mathematically possible W/L ratio from 5–10 trades by its
-  // reduced fraction. This means 50% from 6, 8 and 10 trades is one matrix row,
-  // while 33.33%, 37.50%, 42.86%, etc. are also tested automatically.
+  // Group every mathematically possible W/L ratio inside the user-selected
+  // custom trade range (minimum 1, no fixed maximum) by its reduced fraction.
+  // This means 50% from 6, 8 and 10 trades is one matrix row, while 33.33%,
+  // 37.50%, 42.86%, etc. are also tested automatically.
   const rateGroups = new Map();
   for (let n = minTrades; n <= maxTrades; n++) {
     for (let wins = 0; wins <= n; wins++) {
@@ -2118,11 +2123,11 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
           <NumInput value={cfg.builderTotalRiskPct} onChange={onChange("builderTotalRiskPct")} step="0.1" color="blue" />
         </Field>
         <div className="grid grid-cols-2 gap-2.5">
-          <Field label="Min Trades" hint="5 minimum">
-            <NumInput value={cfg.builderMinTrades} onChange={onChange("builderMinTrades")} step="1" color="indigo" />
+          <Field label="Min Trades" hint="1 minimum · any whole number">
+            <NumInput value={cfg.builderMinTrades} onChange={onChange("builderMinTrades")} step="1" min="1" color="indigo" />
           </Field>
-          <Field label="Max Trades" hint="10 maximum">
-            <NumInput value={cfg.builderMaxTrades} onChange={onChange("builderMaxTrades")} step="1" color="indigo" />
+          <Field label="Max Trades" hint="any whole number ≥ Min Trades">
+            <NumInput value={cfg.builderMaxTrades} onChange={onChange("builderMaxTrades")} step="1" min="1" color="indigo" />
           </Field>
         </div>
       </div>
@@ -2790,8 +2795,10 @@ export default function RiskSimulator() {
       ...cfg,
       builderInitialCapital: Math.max(0, Number(cfg.builderInitialCapital) || 0),
       builderTotalRiskPct: Math.max(0, Number(cfg.builderTotalRiskPct) || 0),
-      builderMinTrades: Math.min(10, Math.max(5, Math.round(Number(cfg.builderMinTrades) || 5))),
-      builderMaxTrades: Math.min(10, Math.max(5, Math.round(Number(cfg.builderMaxTrades) || 10))),
+      // Both controls are fully custom. Minimum is 1 trade; there is no fixed
+      // Builder maximum, and Max Trades is automatically kept >= Min Trades.
+      builderMinTrades: Math.max(1, Math.round(Number(cfg.builderMinTrades) || 1)),
+      builderMaxTrades: Math.max(1, Math.round(Number(cfg.builderMaxTrades) || 1)),
       builderBaseMode: strategyBaseMode,
     };
     if (normalized.builderMaxTrades < normalized.builderMinTrades) {
@@ -2804,7 +2811,7 @@ export default function RiskSimulator() {
 
     // Let React paint the busy state before the exact W/L enumeration starts.
     // The Builder evaluates every mathematically possible sequence from the
-    // requested 5–10 trade window, so the small yield makes the UI feel
+    // requested custom trade window, so the small yield makes the UI feel
     // responsive instead of looking frozen for the duration of the build.
     window.setTimeout(() => {
       if (buildId !== builderBuildIdRef.current) return;
