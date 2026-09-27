@@ -45,8 +45,8 @@ const DEFAULTS = {
   winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
-  perTradeCapPct: 90,
-  overallCapPct: 60,
+  perTradeCapPct: 70,
+  overallCapPct: 30,
   // Risk Allocation reset: if calculated cascade risk reaches this % of
   // initial capital, the current trade risk is reset to this % of initial
   // capital. The next trade then continues normal Win/Loss cascade sizing.
@@ -60,9 +60,9 @@ const DEFAULTS = {
   tickValue: 0.1,
   entrySpread: 0,
   exitSpread: 0.2,
-  winRate: 50,
+  winRate: 40,
   numTrades: 10,
-  sweepStep: 10,
+  sweepStep: 5,
   sweepRuns: 100,
   batchCount: "",
   // --- Day / F&O mode (Indian market) ---
@@ -2139,10 +2139,10 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
           <NumInput value={cfg.builderTotalRiskPct} onChange={onChange("builderTotalRiskPct")} step="0.1" color="blue" />
         </Field>
         <div className="grid grid-cols-2 gap-2.5">
-          <Field label="Min Trades" hint="1 minimum · any whole number">
+          <Field label="Min Trades">
             <NumInput value={cfg.builderMinTrades} onChange={onChange("builderMinTrades")} step="1" min="1" color="indigo" />
           </Field>
-          <Field label="Max Trades" hint="any whole number ≥ Min Trades">
+          <Field label="Max Trades">
             <NumInput value={cfg.builderMaxTrades} onChange={onChange("builderMaxTrades")} step="1" min="1" color="indigo" />
           </Field>
         </div>
