@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useRef, useEffect } from "react";
+import React, { useState, useCallback, useRef, useEffect } from "react";
 import {
   ComposedChart,
   Area,
@@ -2735,11 +2736,110 @@ export default function RiskSimulator() {
   const [builderBuilding, setBuilderBuilding] = useState(false);
   const builderBuildIdRef = useRef(0);
   const [activeRunLabel, setActiveRunLabel] = useState(null);
-  const [scenarioInput, setScenarioInput] = useState("");
   const [dragIdx, setDragIdx] = useState(null);
   const [dragOverIdx, setDragOverIdx] = useState(null);
   const lastCleanCfgRef = useRef(null);
   const lastRunModeRef = useRef(null);
+
+  // Keep an independent workspace for Single Run and Day / F&O.
+  // Builder can temporarily replace the visible Trade Log/result, but it must
+  // never overwrite the user's last configuration/result for either strategy tab.
+  const strategyWorkspaceRef = useRef({
+    single: {
+      cfg: null,
+      result: null,
+      cleanCfg: null,
+      activeRunLabel: null,
+      batchResult: null,
+      selectedBatchRunIdx: null,
+    },
+    fno: {
+      cfg: null,
+      result: null,
+      cleanCfg: null,
+      activeRunLabel: null,
+      batchResult: null,
+      selectedBatchRunIdx: null,
+    },
+  });
+
+  const saveStrategyWorkspace = useCallback(
+    (workspaceMode = mode) => {
+      if (workspaceMode !== "single" && workspaceMode !== "fno") return;
+
+      strategyWorkspaceRef.current[workspaceMode] = {
+        cfg: { ...cfg },
+        result,
+        cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
+        activeRunLabel,
+        batchResult,
+        selectedBatchRunIdx,
+      };
+    },
+    [mode, cfg, result, activeRunLabel, batchResult, selectedBatchRunIdx]
+  );
+
+  // Switching tabs restores the last workspace belonging to that strategy.
+  // This is especially important after Builder: Builder's selected combination
+  // may be the current result, but it is not the user's Single/F&O workspace.
+  const handleModeChange = useCallback(
+    (nextMode) => {
+      if (mode === "single" || mode === "fno") {
+        strategyWorkspaceRef.current[mode] = {
+          cfg: { ...cfg },
+          result,
+          cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
+          activeRunLabel,
+          batchResult,
+          selectedBatchRunIdx,
+        };
+      }
+
+      setMode(nextMode);
+
+      if (nextMode === "single" || nextMode === "fno") {
+        const workspace = strategyWorkspaceRef.current[nextMode];
+
+        if (workspace?.cfg) {
+          setCfg(workspace.cfg);
+          setResult(workspace.result);
+          setSweep(null);
+          setBatchResult(workspace.batchResult);
+          setSelectedBatchRunIdx(workspace.selectedBatchRunIdx);
+          setActiveRunLabel(workspace.activeRunLabel);
+
+          lastCleanCfgRef.current =
+            workspace.cleanCfg || cleanConfig(workspace.cfg);
+          lastRunModeRef.current = nextMode;
+        } else {
+          // First visit to this strategy tab: keep the current shared config,
+          // but clear Builder/Sweep output so the tab starts on its own surface.
+          setSweep(null);
+          setBatchResult(null);
+          setSelectedBatchRunIdx(null);
+          setActiveRunLabel(null);
+          lastCleanCfgRef.current = null;
+          lastRunModeRef.current = nextMode;
+        }
+
+        setSweepBaseMode(nextMode);
+        setStrategyBaseMode(nextMode);
+      }
+
+      if (nextMode === "builder") {
+        setCfg((c) => ({ ...c, builderInitialCapital: c.initialCapital }));
+        setBuilderSelectedKey(null);
+      }
+    },
+    [
+      mode,
+      cfg,
+      result,
+      activeRunLabel,
+      batchResult,
+      selectedBatchRunIdx,
+    ]
+  );
 
   // The config panel (and, when running a sweep, the sweep engine itself)
   // should reflect Single Run's fields while on that tab, Day/F&O's fields
@@ -2772,7 +2872,6 @@ export default function RiskSimulator() {
     lastCleanCfgRef.current = runCfg;
     lastRunModeRef.current = baseMode;
     setActiveRunLabel(`Combination · ${candidate.actualWinRate.toFixed(0)}% WR · ${candidate.tradeCount} trades`);
-    setScenarioInput("");
   }, [cfg]);
 
   // Builder Combination drag reorder: moving one W/L chip to another
@@ -2813,7 +2912,6 @@ export default function RiskSimulator() {
     lastCleanCfgRef.current = editedCandidate.autoStrategyCfg || builderResult.strategyCfg;
     lastRunModeRef.current = builderResult.baseMode;
     setActiveRunLabel(`Combination · ${formatBuilderWinRate(editedCandidate.actualWinRate)} WR · ${editedCandidate.tradeCount} trades · sequence reordered`);
-    setScenarioInput("");
     setSelectedBatchRunIdx(null);
   }, [builderResult]);
 
@@ -2863,7 +2961,6 @@ export default function RiskSimulator() {
           lastCleanCfgRef.current = built.strategyCfg;
           lastRunModeRef.current = built.baseMode;
           setActiveRunLabel(null);
-          setScenarioInput("");
         }
       } finally {
         if (buildId === builderBuildIdRef.current) setBuilderBuilding(false);
@@ -2920,21 +3017,37 @@ export default function RiskSimulator() {
     } else if (!clean.initialCapital || !clean.baseLots) return;
 
     if (mode === "single") {
+      const nextResult = runSimulation(clean);
+      strategyWorkspaceRef.current.single = {
+        cfg: { ...cfg },
+        result: nextResult,
+        cleanCfg: clean,
+        activeRunLabel: null,
+        batchResult: null,
+        selectedBatchRunIdx: null,
+      };
       setSweep(null);
       lastCleanCfgRef.current = clean;
       lastRunModeRef.current = "single";
-      setResult(runSimulation(clean));
+      setResult(nextResult);
       setActiveRunLabel(null);
-      setScenarioInput("");
       setSelectedBatchRunIdx(null);
       setBatchResult(null);
     } else if (mode === "fno") {
+      const nextResult = runSimulationFnO(clean);
+      strategyWorkspaceRef.current.fno = {
+        cfg: { ...cfg },
+        result: nextResult,
+        cleanCfg: clean,
+        activeRunLabel: null,
+        batchResult: null,
+        selectedBatchRunIdx: null,
+      };
       setSweep(null);
       lastCleanCfgRef.current = clean;
       lastRunModeRef.current = "fno";
-      setResult(runSimulationFnO(clean));
+      setResult(nextResult);
       setActiveRunLabel(null);
-      setScenarioInput("");
       setSelectedBatchRunIdx(null);
       setBatchResult(null);
     } else if (mode === "sweep") {
@@ -3010,7 +3123,7 @@ export default function RiskSimulator() {
     const ruinedCount = runs.filter((r) => r.result.finalCapital <= ruinThresholdCapital || r.result.maxLossValue <= -clean.initialCapital * (ruinLossPct / 100)).length;
     const riskOfRuinPct = runs.length ? (ruinedCount / runs.length) * 100 : 0;
 
-    setBatchResult({
+    const nextBatchResult = {
       runs,
       mode: activeMode,
       cfg: clean,
@@ -3030,10 +3143,20 @@ export default function RiskSimulator() {
         maxLossRun,
         maxDDRun,
       },
-    });
+    };
+
+    setBatchResult(nextBatchResult);
     setSelectedBatchRunIdx(null);
     setActiveRunLabel(null);
-    setScenarioInput("");
+
+    strategyWorkspaceRef.current[activeMode] = {
+      cfg: { ...cfg },
+      result,
+      cleanCfg: clean,
+      activeRunLabel: null,
+      batchResult: nextBatchResult,
+      selectedBatchRunIdx: null,
+    };
   }, [cfg, mode]);
 
 
@@ -3044,7 +3167,6 @@ export default function RiskSimulator() {
   const handleClearBatch = useCallback(() => {
     setBatchResult(null);
     setSelectedBatchRunIdx(null);
-    setScenarioInput("");
   }, []);
 
   // Loads one batch run's exact trade sequence + result into the normal
@@ -3056,36 +3178,26 @@ export default function RiskSimulator() {
       if (!batchResult) return;
       lastCleanCfgRef.current = batchResult.cfg;
       lastRunModeRef.current = batchResult.mode;
-      setResult({ ...run.result, winLossSeq: run.winLossSeq });
+      const nextResult = { ...run.result, winLossSeq: run.winLossSeq };
+      setResult(nextResult);
       setSelectedBatchRunIdx(run.index);
-      setScenarioInput(String(run.index));
       setActiveRunLabel(`Scenario : ${run.index}`);
+
+      if (batchResult.mode === "single" || batchResult.mode === "fno") {
+        strategyWorkspaceRef.current[batchResult.mode] = {
+          cfg: { ...batchResult.cfg },
+          result: nextResult,
+          cleanCfg: { ...batchResult.cfg },
+          activeRunLabel: `Scenario : ${run.index}`,
+          batchResult,
+          selectedBatchRunIdx: run.index,
+        };
+        lastCleanCfgRef.current = { ...batchResult.cfg };
+        lastRunModeRef.current = batchResult.mode;
+      }
     },
     [batchResult]
   );
-
-  // Lets the user type any existing Multi Simulation scenario number directly
-  // in the Trade Log header. Commit on Enter/blur so partially typed values
-  // (for example changing 15 to 75) do not trigger an intermediate scenario load.
-  const commitScenarioInput = useCallback(() => {
-    if (!batchResult || !result) return;
-
-    const activeMode = mode === "fno" ? "fno" : "single";
-    if (batchResult.mode !== activeMode) {
-      setScenarioInput(selectedBatchRunIdx != null ? String(selectedBatchRunIdx) : "");
-      return;
-    }
-
-    const scenarioNo = Math.round(Number(scenarioInput));
-    const run = batchResult.runs.find((r) => r.index === scenarioNo);
-
-    if (!run) {
-      setScenarioInput(selectedBatchRunIdx != null ? String(selectedBatchRunIdx) : "");
-      return;
-    }
-
-    handleSelectBatchRun(run);
-  }, [batchResult, result, mode, scenarioInput, selectedBatchRunIdx, handleSelectBatchRun]);
 
   // After a manual drag-reorder or Result-flip recalculates the Trade Log,
   // checks whether the new outcome (net P/L, at display precision) now
@@ -3156,7 +3268,6 @@ export default function RiskSimulator() {
       lastCleanCfgRef.current = editedCandidate.autoStrategyCfg || builderResult.strategyCfg;
       lastRunModeRef.current = builderResult.baseMode;
       setActiveRunLabel(`Combination · ${formatBuilderWinRate(editedCandidate.actualWinRate)} WR · ${editedCandidate.tradeCount} trades · edited sequence`);
-      setScenarioInput("");
       setSelectedBatchRunIdx(null);
     },
     [result, builderResult, builderSelectedKey]
@@ -3184,9 +3295,22 @@ export default function RiskSimulator() {
       const recalculated = simulateFn(lastCleanCfgRef.current, seq);
       setResult({ ...recalculated, winLossSeq: seq });
       const match = matchBatchRun(recalculated);
-      setActiveRunLabel(match ? `Scenario : ${match.index}` : null);
-      setScenarioInput(match ? String(match.index) : "");
-      setSelectedBatchRunIdx(match ? match.index : null);
+      const nextActiveRunLabel = match ? `Scenario : ${match.index}` : null;
+      const nextSelectedBatchRunIdx = match ? match.index : null;
+      setActiveRunLabel(nextActiveRunLabel);
+      setSelectedBatchRunIdx(nextSelectedBatchRunIdx);
+
+      if (lastRunModeRef.current === "single" || lastRunModeRef.current === "fno") {
+        strategyWorkspaceRef.current[lastRunModeRef.current] = {
+          ...strategyWorkspaceRef.current[lastRunModeRef.current],
+          cfg: { ...(lastCleanCfgRef.current || cfg) },
+          result: { ...recalculated, winLossSeq: seq },
+          cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
+          activeRunLabel: nextActiveRunLabel,
+          batchResult,
+          selectedBatchRunIdx: nextSelectedBatchRunIdx,
+        };
+      }
     },
     [result, matchBatchRun]
   );
@@ -3207,10 +3331,27 @@ export default function RiskSimulator() {
       const recalculated = simulateFn(lastCleanCfgRef.current, seq);
       setResult({ ...recalculated, winLossSeq: seq });
       const match = matchBatchRun(recalculated);
-      setActiveRunLabel(match ? `Scenario : ${match.index}` : null);
-      setScenarioInput(match ? String(match.index) : "");
-      setSelectedBatchRunIdx(match ? match.index : null);
+      const nextActiveRunLabel = match ? `Scenario : ${match.index}` : null;
+      const nextSelectedBatchRunIdx = match ? match.index : null;
+      setActiveRunLabel(nextActiveRunLabel);
+      setSelectedBatchRunIdx(nextSelectedBatchRunIdx);
       const newWinRate = seq.length ? (seq.filter(Boolean).length / seq.length) * 100 : 0;
+
+      if (lastRunModeRef.current === "single" || lastRunModeRef.current === "fno") {
+        const nextCfg = {
+          ...(lastCleanCfgRef.current || cfg),
+          winRate: Number(newWinRate.toFixed(2)),
+        };
+        strategyWorkspaceRef.current[lastRunModeRef.current] = {
+          ...strategyWorkspaceRef.current[lastRunModeRef.current],
+          cfg: { ...nextCfg },
+          result: { ...recalculated, winLossSeq: seq },
+          cleanCfg: { ...(lastCleanCfgRef.current || nextCfg) },
+          activeRunLabel: nextActiveRunLabel,
+          batchResult,
+          selectedBatchRunIdx: nextSelectedBatchRunIdx,
+        };
+      }
       setCfg((c) => ({ ...c, winRate: Number(newWinRate.toFixed(2)) }));
     },
     [result, matchBatchRun]
@@ -3323,17 +3464,7 @@ export default function RiskSimulator() {
             {["single", "sweep", "fno", "builder"].map((m) => (
               <button
                 key={m}
-                onClick={() => {
-                  setMode(m);
-                  if (m === "single" || m === "fno") {
-                    setSweepBaseMode(m);
-                    setStrategyBaseMode(m);
-                  }
-                  if (m === "builder") {
-                    setCfg((c) => ({ ...c, builderInitialCapital: c.initialCapital }));
-                    setBuilderSelectedKey(null);
-                  }
-                }}
+                onClick={() => handleModeChange(m)}
                 className={`px-3 sm:px-4 py-2 sm:py-1.5 text-[11px] sm:text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
                   mode === m ? "bg-zinc-100 text-zinc-900" : "text-zinc-500 hover:text-zinc-300"
                 }`}
@@ -3830,34 +3961,11 @@ export default function RiskSimulator() {
                     <span className="flex items-center gap-2 text-[13px] font-semibold text-zinc-200">
                       <Layers size={14} className="text-zinc-300" />
                       Trade Log
-                      {activeRunLabel && activeRunLabel.startsWith("Scenario :") && batchResult?.mode === (mode === "fno" ? "fno" : "single") ? (
-                        <span className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 text-[10px] font-mono font-normal">
-                          <span>Scenario :</span>
-                          <input
-                            type="number"
-                            min="1"
-                            max={batchResult.runs.length}
-                            step="1"
-                            value={scenarioInput}
-                            onChange={(e) => setScenarioInput(e.target.value)}
-                            onBlur={commitScenarioInput}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.preventDefault();
-                                commitScenarioInput();
-                                e.currentTarget.blur();
-                              }
-                            }}
-                            aria-label="Scenario number"
-                            title={`Enter a scenario number from 1 to ${batchResult.runs.length}`}
-                            className="w-12 bg-black/40 border border-zinc-700 rounded px-1.5 py-0.5 text-zinc-100 text-[10px] font-mono text-center outline-none focus:border-indigo-500/70 focus:ring-1 focus:ring-indigo-500/20"
-                          />
-                        </span>
-                      ) : activeRunLabel ? (
+                      {activeRunLabel && (
                         <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 text-[10px] font-mono font-normal">
                           {activeRunLabel}
                         </span>
-                      ) : null}
+                      )}
                     </span>
                     <span className="flex items-center gap-1.5 text-[10px] text-zinc-500">
                       <GripVertical size={12} />
@@ -4083,34 +4191,11 @@ export default function RiskSimulator() {
                     <span className="flex items-center gap-2 text-[13px] font-semibold text-zinc-200">
                       <Layers size={14} className="text-zinc-300" />
                       Trade Log
-                      {activeRunLabel && activeRunLabel.startsWith("Scenario :") && batchResult?.mode === (mode === "fno" ? "fno" : "single") ? (
-                        <span className="flex items-center gap-1.5 px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 text-[10px] font-mono font-normal">
-                          <span>Scenario :</span>
-                          <input
-                            type="number"
-                            min="1"
-                            max={batchResult.runs.length}
-                            step="1"
-                            value={scenarioInput}
-                            onChange={(e) => setScenarioInput(e.target.value)}
-                            onBlur={commitScenarioInput}
-                            onKeyDown={(e) => {
-                              if (e.key === "Enter") {
-                                e.preventDefault();
-                                commitScenarioInput();
-                                e.currentTarget.blur();
-                              }
-                            }}
-                            aria-label="Scenario number"
-                            title={`Enter a scenario number from 1 to ${batchResult.runs.length}`}
-                            className="w-12 bg-black/40 border border-zinc-700 rounded px-1.5 py-0.5 text-zinc-100 text-[10px] font-mono text-center outline-none focus:border-indigo-500/70 focus:ring-1 focus:ring-indigo-500/20"
-                          />
-                        </span>
-                      ) : activeRunLabel ? (
+                      {activeRunLabel && (
                         <span className="px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 text-[10px] font-mono font-normal">
                           {activeRunLabel}
                         </span>
-                      ) : null}
+                      )}
                     </span>
                     <span className="flex items-center gap-1.5 text-[10px] text-zinc-500">
                       <GripVertical size={12} />
