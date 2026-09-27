@@ -33,18 +33,18 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2.5,
+  rr: 2,
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2600,
+  currentPrice: 2000,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
   cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 65,
-  lossRiskPct: 18,
-  lossRiskAdjustPct: -1,
+  winRiskPct: 60,
+  lossRiskPct: 20,
+  lossRiskAdjustPct: 0,
   perTradeCapPct: 90,
   overallCapPct: 60,
   // Risk Allocation reset: if calculated cascade risk reaches this % of
@@ -55,11 +55,11 @@ const DEFAULTS = {
   riskAllocationResetPct: 50,
   // Risk-of-Ruin uses a fixed internal 80% loss threshold; no user-facing input.
   slipMode: "percent",
-  slipPct: 0,
+  slipPct: 0.01,
   slipTicks: 1,
-  tickValue: 0.1,
+  tickValue: 1,
   entrySpread: 0,
-  exitSpread: 0.2,
+  exitSpread: 0,
   winRate: 50,
   numTrades: 10,
   sweepStep: 10,
@@ -2743,7 +2743,13 @@ export default function RiskSimulator() {
     if (!candidate) return;
     const baseMode = builderCfg?.baseMode === "fno" ? "fno" : "single";
     const runResult = candidate.result;
-    const runCfg = builderCfg?.strategyCfg || cleanConfig(cfg);
+    // IMPORTANT: candidate.result was generated from the Builder's calibrated
+    // autoStrategyCfg. Keep that exact calibrated config attached to the result
+    // so the Combination Trade Log, price math and any later drag-reorder use
+    // the same risk/lot basis that produced the candidate. Falling back to the
+    // source strategy config would mix an auto-scaled risk plan with the source
+    // lot value and produce a different Price Chg.
+    const runCfg = candidate.autoStrategyCfg || builderCfg?.strategyCfg || cleanConfig(cfg);
     setBuilderSelectedKey(candidate.key);
     setResult({ ...runResult, winLossSeq: candidate.sequenceArray });
     lastCleanCfgRef.current = runCfg;
@@ -2781,8 +2787,12 @@ export default function RiskSimulator() {
     );
     setBuilderResult(nextBuilder);
     setBuilderSelectedKey(editedCandidate.key);
+    // Use the exact calibrated result/config produced by evaluateBuilderSequence.
+    // Do NOT replay the risk plan through the unscaled source config: that mixes
+    // calibrated risk amounts with the old lot-value basis and changes Price Chg,
+    // fees and downstream cascade values.
     setResult({ ...editedCandidate.result, winLossSeq: seq });
-    lastCleanCfgRef.current = builderResult.strategyCfg;
+    lastCleanCfgRef.current = editedCandidate.autoStrategyCfg || builderResult.strategyCfg;
     lastRunModeRef.current = builderResult.baseMode;
     setActiveRunLabel(`Combination · ${formatBuilderWinRate(editedCandidate.actualWinRate)} WR · ${editedCandidate.tradeCount} trades · sequence reordered`);
     setSelectedBatchRunIdx(null);
@@ -3090,11 +3100,12 @@ export default function RiskSimulator() {
       setBuilderResult(nextBuilder);
       setBuilderSelectedKey(editedCandidate.key);
 
-      const runCfg = builderResult.strategyCfg;
-      const simulateFn = builderResult.baseMode === "fno" ? simulateFromSequenceFnO : simulateFromSequence;
-      const recalculated = simulateFn(runCfg, seq, editedCandidate.riskPlan);
-      setResult({ ...recalculated, winLossSeq: seq });
-      lastCleanCfgRef.current = runCfg;
+      // editedCandidate already contains the fully recalculated result using
+      // the Builder's calibrated cascade config. Reusing it keeps the trade log
+      // numerically identical to the matrix/chart candidate and preserves the
+      // same risk-per-lot / Price Chg invariant as the source strategy.
+      setResult({ ...editedCandidate.result, winLossSeq: seq });
+      lastCleanCfgRef.current = editedCandidate.autoStrategyCfg || builderResult.strategyCfg;
       lastRunModeRef.current = builderResult.baseMode;
       setActiveRunLabel(`Combination · ${formatBuilderWinRate(editedCandidate.actualWinRate)} WR · ${editedCandidate.tradeCount} trades · edited sequence`);
       setSelectedBatchRunIdx(null);
