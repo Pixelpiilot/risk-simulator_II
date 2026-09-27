@@ -57,7 +57,7 @@ const DEFAULTS = {
   slipMode: "percent",
   slipPct: 0,
   slipTicks: 1,
-  tickValue:0.1,
+  tickValue: 0.1,
   entrySpread: 0,
   exitSpread: 0.2,
   winRate: 50,
@@ -235,6 +235,9 @@ function fmtMoney(v) {
 }
 function fmtPct(v) {
   return Number(v).toFixed(2) + "%";
+}
+function fmtPct3(v) {
+  return Number(v).toFixed(3) + "%";
 }
 
 
@@ -1705,20 +1708,30 @@ function buildAllWinLossSequences(n, wins) {
 }
 
 
+function roundBuilderInput(value, decimals = 2) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return 0;
+  const factor = 10 ** decimals;
+  return Math.round((n + Number.EPSILON) * factor) / factor;
+}
+
 function buildBuilderScaledConfig(engineCfg, scale, useFno) {
   const s = Math.max(1e-9, Number(scale) || 0);
+  const sourceRiskPct = Math.max(1e-9, Number(engineCfg.riskPct) || 0);
+  const sourceBaseLots = Math.max(1e-9, Number(engineCfg.baseLots) || 0);
   const next = {
     ...engineCfg,
-    // Builder deliberately ignores the source Base Risk % and Base Lots at
-    // execution time. Both are scaled together so risk-per-lot stays constant
-    // and the same strategy produces the same price movement as Single Run.
-    riskPct: Math.max(1e-9, Number(engineCfg.riskPct) || 0) * s,
-    baseLots: Math.max(1e-9, Number(engineCfg.baseLots) || 0) * s,
+    // Builder calibrates against the same 2-decimal precision that the
+    // normal Base Risk % / Base Lots inputs display. This is intentional:
+    // when a user copies the Builder's Auto Base Risk/Lots into Single Run,
+    // both screens then run the exact same numerical configuration rather
+    // than Builder secretly using extra hidden decimals.
+    riskPct: Math.max(0.01, roundBuilderInput(sourceRiskPct * s, 2)),
+    baseLots: Math.max(0.01, roundBuilderInput(sourceBaseLots * s, 2)),
   };
 
-  // F&O has whole-unit sizing. Scale the baseline quantity/lots with the same
-  // factor so the risk-per-unit relationship follows the active strategy as
-  // closely as the integer-unit rules permit.
+  // F&O has whole-unit sizing. Keep its quantity/lots rules, while base risk
+  // is also quantized to the same 2-decimal percentage precision.
   if (useFno) {
     if (next.fnoSegment === "intraday") {
       next.fnoQuantity = Math.max(1, Math.round((Number(engineCfg.fnoQuantity) || 1) * s));
@@ -1910,8 +1923,11 @@ function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, t
 
     // Auto-calculated source settings. Both values use the same scale factor,
     // preserving the source risk-per-lot and therefore the source price move.
-    autoBaseRiskPct: Number(sourceRiskForBuilder(engineCfg, calibrated.scale).riskPct) || 0,
-    autoBaseLots: Number(sourceRiskForBuilder(engineCfg, calibrated.scale).baseLots) || 0,
+    // These displayed Auto values are the SAME numeric values used by the
+    // candidate Trade Log. No hidden extra precision is allowed here; this
+    // keeps Builder -> Single Run copy/paste numerically identical.
+    autoBaseRiskPct: Number(scaledCfg.riskPct) || 0,
+    autoBaseLots: Number(scaledCfg.baseLots) || 0,
     autoStrategyCfg: scaledCfg,
 
     totalAllocatedRiskPct: initialCapital > 0 ? (totalAllocatedRisk / initialCapital) * 100 : 0,
@@ -2150,7 +2166,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                         : `${Number(autoCandidate.autoStrategyCfg?.fnoLots || strategyCfg.fnoLots)} lot`)
                     : "—")
                 : (autoCandidate
-                    ? Number(autoCandidate.autoBaseLots || 0).toFixed(4)
+                    ? Number(autoCandidate.autoBaseLots || 0).toFixed(2)
                     : "—")}
             </div>
           </Field>
@@ -2188,8 +2204,8 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
           {isFno ? `${strategyCfg.fnoBroker} · ${strategyCfg.fnoSegment}` : (strategyCfg.feeMode === "turnover" ? "Fee on Turnover" : "Fee / Lot")}
         </div>
         <div className="grid grid-cols-2 gap-2.5">
-          <Field label="Entry Fee"><div className="text-xs font-mono text-zinc-200 py-2.5">{isFno ? "Broker config" : (strategyCfg.feeMode === "turnover" ? fmtPct(strategyCfg.entryFeeTurnoverPct) : fmtMoney(strategyCfg.feeBaseEntry))}</div></Field>
-          <Field label="Exit Fee"><div className="text-xs font-mono text-zinc-200 py-2.5">{isFno ? "Broker config" : (strategyCfg.feeMode === "turnover" ? fmtPct(strategyCfg.exitFeeTurnoverPct) : fmtMoney(strategyCfg.feeBaseExit))}</div></Field>
+          <Field label="Entry Fee"><div className="text-xs font-mono text-zinc-200 py-2.5">{isFno ? "Broker config" : (strategyCfg.feeMode === "turnover" ? fmtPct3(strategyCfg.entryFeeTurnoverPct) : fmtMoney(strategyCfg.feeBaseEntry))}</div></Field>
+          <Field label="Exit Fee"><div className="text-xs font-mono text-zinc-200 py-2.5">{isFno ? "Broker config" : (strategyCfg.feeMode === "turnover" ? fmtPct3(strategyCfg.exitFeeTurnoverPct) : fmtMoney(strategyCfg.feeBaseExit))}</div></Field>
         </div>
         <div className="grid grid-cols-2 gap-2.5">
           <Field label="Entry Spread"><div className="text-xs font-mono text-zinc-200 py-2.5">{fmtMoney(isFno ? strategyCfg.fnoEntrySpread : strategyCfg.entrySpread)}</div></Field>
