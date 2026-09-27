@@ -2745,7 +2745,7 @@ export default function RiskSimulator() {
   // never overwrite the user's last configuration/result for either strategy tab.
   const strategyWorkspaceRef = useRef({
     single: {
-      cfg: null,
+      cfg: { ...DEFAULTS },
       result: null,
       cleanCfg: null,
       activeRunLabel: null,
@@ -2753,7 +2753,7 @@ export default function RiskSimulator() {
       selectedBatchRunIdx: null,
     },
     fno: {
-      cfg: null,
+      cfg: { ...DEFAULTS },
       result: null,
       cleanCfg: null,
       activeRunLabel: null,
@@ -2762,29 +2762,106 @@ export default function RiskSimulator() {
     },
   });
 
-  const saveStrategyWorkspace = useCallback(
-    (workspaceMode = mode) => {
-      if (workspaceMode !== "single" && workspaceMode !== "fno") return;
+  // While Single Run / Day-F&O is the active tab, continuously persist its
+  // current configuration + visible result into that mode's private workspace.
+  // Builder and Sweep can then freely use the shared React state without ever
+  // overwriting the last Single/F&O workspace. The restore guard prevents the
+  // first render after a tab switch from saving the Builder state into the
+  // destination workspace before the requested snapshot has been restored.
+  const restoringStrategyWorkspaceRef = useRef(false);
 
-      strategyWorkspaceRef.current[workspaceMode] = {
-        cfg: { ...cfg },
-        result,
-        cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
-        activeRunLabel,
-        batchResult,
-        selectedBatchRunIdx,
-      };
-    },
-    [mode, cfg, result, activeRunLabel, batchResult, selectedBatchRunIdx]
-  );
+  // Builder gets its own completely independent workspace as well. This is
+  // separate from the Single/F&O strategy snapshots so a Builder combination
+  // selected in the Trade Log cannot be replaced by a strategy result while
+  // the user briefly visits Single Run or Day / F&O and then returns to Builder.
+  const builderWorkspaceRef = useRef(null);
+  const restoringBuilderWorkspaceRef = useRef(false);
+
+  useEffect(() => {
+    if (mode !== "single" && mode !== "fno") return;
+
+    if (restoringStrategyWorkspaceRef.current) {
+      restoringStrategyWorkspaceRef.current = false;
+    }
+
+    strategyWorkspaceRef.current[mode] = {
+      ...strategyWorkspaceRef.current[mode],
+      cfg: { ...cfg },
+      result,
+      cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
+      activeRunLabel,
+      batchResult,
+      selectedBatchRunIdx,
+    };
+  }, [mode, cfg, result, activeRunLabel, batchResult, selectedBatchRunIdx]);
+
+  // Persist the complete Builder workspace separately from Single/F&O.
+  // The workspace includes the selected combination, Builder matrix result,
+  // visible Trade Log/result and the exact calibrated config used by that
+  // combination. The restore guard prevents the incoming Single/F&O state
+  // from being captured as Builder state during the tab switch itself.
+  useEffect(() => {
+    if (mode !== "builder") return;
+
+    if (restoringBuilderWorkspaceRef.current) {
+      restoringBuilderWorkspaceRef.current = false;
+      return;
+    }
+
+    builderWorkspaceRef.current = {
+      cfg: { ...cfg },
+      result,
+      builderResult,
+      builderSelectedKey,
+      activeRunLabel,
+      batchResult,
+      selectedBatchRunIdx,
+      cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
+      baseMode: strategyBaseMode,
+    };
+  }, [
+    mode,
+    cfg,
+    result,
+    builderResult,
+    builderSelectedKey,
+    activeRunLabel,
+    batchResult,
+    selectedBatchRunIdx,
+    strategyBaseMode,
+  ]);
 
   // Switching tabs restores the last workspace belonging to that strategy.
   // This is especially important after Builder: Builder's selected combination
-  // may be the current result, but it is not the user's Single/F&O workspace.
+  // may be the current result, but it must remain available when the user
+  // comes back to Builder after visiting Single/F&O.
   const handleModeChange = useCallback(
     (nextMode) => {
+      // Before leaving Builder, take an explicit snapshot at the exact tab
+      // click. This guarantees the currently selected Builder scenario,
+      // Trade Log, matrix and calibrated config are preserved even when the
+      // user switches tabs immediately after selecting/editing a combination.
+      if (mode === "builder") {
+        builderWorkspaceRef.current = {
+          cfg: { ...cfg },
+          result,
+          builderResult,
+          builderSelectedKey,
+          activeRunLabel,
+          batchResult,
+          selectedBatchRunIdx,
+          cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
+          baseMode: strategyBaseMode,
+        };
+      }
+
+      // Before leaving Single/F&O, take one explicit snapshot as well. The
+      // effect above normally keeps this current, but this makes the tab click
+      // itself a guaranteed save point even when the user switches immediately
+      // after editing a field.
       if (mode === "single" || mode === "fno") {
         strategyWorkspaceRef.current[mode] = {
+          ...strategyWorkspaceRef.current[mode],
           cfg: { ...cfg },
           result,
           cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
@@ -2794,41 +2871,89 @@ export default function RiskSimulator() {
         };
       }
 
-      setMode(nextMode);
-
       if (nextMode === "single" || nextMode === "fno") {
         const workspace = strategyWorkspaceRef.current[nextMode];
+        restoringStrategyWorkspaceRef.current = true;
 
-        if (workspace?.cfg) {
-          setCfg(workspace.cfg);
-          setResult(workspace.result);
-          setSweep(null);
-          setBatchResult(workspace.batchResult);
-          setSelectedBatchRunIdx(workspace.selectedBatchRunIdx);
-          setActiveRunLabel(workspace.activeRunLabel);
+        // Restore the destination strategy BEFORE changing the visible mode.
+        // This is the key isolation: Builder's currently selected combination
+        // never becomes the result/config shown when returning to Single/F&O.
+        setCfg(workspace?.cfg ? { ...workspace.cfg } : { ...DEFAULTS });
+        setResult(workspace?.result || null);
+        setSweep(null);
+        setBatchResult(workspace?.batchResult || null);
+        setSelectedBatchRunIdx(workspace?.selectedBatchRunIdx ?? null);
+        setActiveRunLabel(workspace?.activeRunLabel ?? null);
+        setBuilderSelectedKey(null);
 
-          lastCleanCfgRef.current =
-            workspace.cleanCfg || cleanConfig(workspace.cfg);
-          lastRunModeRef.current = nextMode;
-        } else {
-          // First visit to this strategy tab: keep the current shared config,
-          // but clear Builder/Sweep output so the tab starts on its own surface.
-          setSweep(null);
-          setBatchResult(null);
-          setSelectedBatchRunIdx(null);
-          setActiveRunLabel(null);
-          lastCleanCfgRef.current = null;
-          lastRunModeRef.current = nextMode;
-        }
+        const restoredCfg = workspace?.cfg ? { ...workspace.cfg } : { ...DEFAULTS };
+        lastCleanCfgRef.current =
+          workspace?.cleanCfg ? { ...workspace.cleanCfg } : cleanConfig(restoredCfg);
+        lastRunModeRef.current = nextMode;
 
         setSweepBaseMode(nextMode);
         setStrategyBaseMode(nextMode);
+        setMode(nextMode);
+        return;
       }
 
       if (nextMode === "builder") {
-        setCfg((c) => ({ ...c, builderInitialCapital: c.initialCapital }));
-        setBuilderSelectedKey(null);
+        // Save the currently visible Builder state before leaving it, then
+        // restore that exact Builder workspace when returning later.
+        if (mode === "builder") {
+          builderWorkspaceRef.current = {
+            cfg: { ...cfg },
+            result,
+            builderResult,
+            builderSelectedKey,
+            activeRunLabel,
+            batchResult,
+            selectedBatchRunIdx,
+            cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
+            baseMode: strategyBaseMode,
+          };
+        }
+
+        const workspace = builderWorkspaceRef.current;
+        restoringBuilderWorkspaceRef.current = true;
+
+        if (workspace) {
+          // Restore Builder's own config/result/selection as one atomic
+          // workspace switch. Nothing from Single/F&O is allowed to leak in.
+          setCfg(workspace.cfg ? { ...workspace.cfg } : { ...DEFAULTS });
+          setResult(workspace.result || null);
+          setBuilderResult(workspace.builderResult || null);
+          setBuilderSelectedKey(workspace.builderSelectedKey ?? null);
+          setActiveRunLabel(workspace.activeRunLabel ?? null);
+          setBatchResult(workspace.batchResult || null);
+          setSelectedBatchRunIdx(workspace.selectedBatchRunIdx ?? null);
+
+          const restoredBuilderCfg = workspace.cfg ? { ...workspace.cfg } : { ...DEFAULTS };
+          lastCleanCfgRef.current = workspace.cleanCfg
+            ? { ...workspace.cleanCfg }
+            : (workspace.result ? cleanConfig(restoredBuilderCfg) : null);
+          lastRunModeRef.current = workspace.baseMode === "fno" ? "fno" : "single";
+          setStrategyBaseMode(workspace.baseMode === "fno" ? "fno" : "single");
+          setSweepBaseMode(workspace.baseMode === "fno" ? "fno" : "single");
+        } else {
+          // First visit to Builder: keep the current strategy configuration
+          // as its base, but do not show the Single/F&O Trade Log as Builder's
+          // own result. Builder starts blank until a combination is built.
+          setCfg((c) => ({ ...c, builderInitialCapital: c.initialCapital }));
+          setResult(null);
+          setBuilderResult(null);
+          setBuilderSelectedKey(null);
+          setActiveRunLabel(null);
+          setBatchResult(null);
+          setSelectedBatchRunIdx(null);
+          lastCleanCfgRef.current = null;
+        }
+
+        setMode("builder");
+        return;
       }
+
+      setMode(nextMode);
     },
     [
       mode,
@@ -2837,6 +2962,9 @@ export default function RiskSimulator() {
       activeRunLabel,
       batchResult,
       selectedBatchRunIdx,
+      builderResult,
+      builderSelectedKey,
+      strategyBaseMode,
     ]
   );
 
@@ -2870,8 +2998,20 @@ export default function RiskSimulator() {
     setResult({ ...runResult, winLossSeq: candidate.sequenceArray });
     lastCleanCfgRef.current = runCfg;
     lastRunModeRef.current = baseMode;
-    setActiveRunLabel(`Combination · ${candidate.actualWinRate.toFixed(0)}% WR · ${candidate.tradeCount} trades`);
-  }, [cfg]);
+    const nextLabel = `Combination · ${candidate.actualWinRate.toFixed(0)}% WR · ${candidate.tradeCount} trades`;
+    setActiveRunLabel(nextLabel);
+    builderWorkspaceRef.current = {
+      cfg: { ...cfg },
+      result: { ...runResult, winLossSeq: candidate.sequenceArray },
+      builderResult,
+      builderSelectedKey: candidate.key,
+      activeRunLabel: nextLabel,
+      batchResult: null,
+      selectedBatchRunIdx: null,
+      cleanCfg: { ...runCfg },
+      baseMode,
+    };
+  }, [cfg, builderResult]);
 
   // Builder Combination drag reorder: moving one W/L chip to another
   // position changes only the order, not the number of wins/losses. The exact
@@ -2910,9 +3050,21 @@ export default function RiskSimulator() {
     setResult({ ...editedCandidate.result, winLossSeq: seq });
     lastCleanCfgRef.current = editedCandidate.autoStrategyCfg || builderResult.strategyCfg;
     lastRunModeRef.current = builderResult.baseMode;
-    setActiveRunLabel(`Combination · ${formatBuilderWinRate(editedCandidate.actualWinRate)} WR · ${editedCandidate.tradeCount} trades · sequence reordered`);
+    const nextLabel = `Combination · ${formatBuilderWinRate(editedCandidate.actualWinRate)} WR · ${editedCandidate.tradeCount} trades · sequence reordered`;
+    setActiveRunLabel(nextLabel);
     setSelectedBatchRunIdx(null);
-  }, [builderResult]);
+    builderWorkspaceRef.current = {
+      cfg: { ...cfg },
+      result: { ...editedCandidate.result, winLossSeq: seq },
+      builderResult: nextBuilder,
+      builderSelectedKey: editedCandidate.key,
+      activeRunLabel: nextLabel,
+      batchResult: null,
+      selectedBatchRunIdx: null,
+      cleanCfg: { ...(editedCandidate.autoStrategyCfg || builderResult.strategyCfg) },
+      baseMode: builderResult.baseMode,
+    };
+  }, [builderResult, cfg]);
 
   const handleBuilderRun = useCallback(() => {
     if (builderBuilding) return;
@@ -2960,6 +3112,17 @@ export default function RiskSimulator() {
           lastCleanCfgRef.current = built.strategyCfg;
           lastRunModeRef.current = built.baseMode;
           setActiveRunLabel(null);
+          builderWorkspaceRef.current = {
+            cfg: { ...normalized },
+            result: null,
+            builderResult: built,
+            builderSelectedKey: null,
+            activeRunLabel: null,
+            batchResult: null,
+            selectedBatchRunIdx: null,
+            cleanCfg: { ...built.strategyCfg },
+            baseMode: built.baseMode,
+          };
         }
       } finally {
         if (buildId === builderBuildIdRef.current) setBuilderBuilding(false);
@@ -3266,10 +3429,22 @@ export default function RiskSimulator() {
       setResult({ ...editedCandidate.result, winLossSeq: seq });
       lastCleanCfgRef.current = editedCandidate.autoStrategyCfg || builderResult.strategyCfg;
       lastRunModeRef.current = builderResult.baseMode;
-      setActiveRunLabel(`Combination · ${formatBuilderWinRate(editedCandidate.actualWinRate)} WR · ${editedCandidate.tradeCount} trades · edited sequence`);
+      const nextLabel = `Combination · ${formatBuilderWinRate(editedCandidate.actualWinRate)} WR · ${editedCandidate.tradeCount} trades · edited sequence`;
+      setActiveRunLabel(nextLabel);
       setSelectedBatchRunIdx(null);
+      builderWorkspaceRef.current = {
+        cfg: { ...cfg },
+        result: { ...editedCandidate.result, winLossSeq: seq },
+        builderResult: nextBuilder,
+        builderSelectedKey: editedCandidate.key,
+        activeRunLabel: nextLabel,
+        batchResult: null,
+        selectedBatchRunIdx: null,
+        cleanCfg: { ...(editedCandidate.autoStrategyCfg || builderResult.strategyCfg) },
+        baseMode: builderResult.baseMode,
+      };
     },
-    [result, builderResult, builderSelectedKey]
+    [result, builderResult, builderSelectedKey, cfg]
   );
 
   // Moves the trade at fromIdx to toIdx within the underlying win/loss
