@@ -67,7 +67,7 @@ const DEFAULTS = {
   exitSpread: 0.2,
   winRate: 40,
   numTrades: 10,
-  sweepStep: 10,
+  sweepStep: 5,
   sweepRuns: 100,
   batchCount: "",
   // --- Day / F&O mode (Indian market) ---
@@ -118,6 +118,9 @@ const DEFAULTS = {
   builderTotalRiskPct: 5,
   builderMinTrades: 5,
   builderMaxTrades: 10,
+  // Builder sequence evaluation count. 100,000 is the hard maximum; the UI
+  // automatically shows the smaller of this cap and the mathematically possible total.
+  builderSequenceLimit: 100000,
 };
 
 // ---- Broker + segment statutory charge rates (as % — divide by 100 to use) ----
@@ -935,6 +938,11 @@ function cleanConfig(cfg) {
       cfg.fnoLeverage === "" || cfg.fnoLeverage === null || cfg.fnoLeverage === undefined
         ? ""
         : Math.min(100, Math.max(0, Number(cfg.fnoLeverage) || 0)),
+    builderInitialCapital: Math.max(0, Number(cfg.builderInitialCapital) || 0),
+    builderTotalRiskPct: Math.max(0, Number(cfg.builderTotalRiskPct) || 0),
+    builderMinTrades: Math.max(1, Math.round(Number(cfg.builderMinTrades) || 1)),
+    builderMaxTrades: Math.max(1, Math.round(Number(cfg.builderMaxTrades) || 1)),
+    builderSequenceLimit: Math.min(100000, Math.max(1, Math.round(Number(cfg.builderSequenceLimit) || 100000))),
   };
 }
 
@@ -984,6 +992,7 @@ function builderInputFields(cfg) {
     builderTotalRiskPct: cfg?.builderTotalRiskPct,
     builderMinTrades: cfg?.builderMinTrades,
     builderMaxTrades: cfg?.builderMaxTrades,
+    builderSequenceLimit: cfg?.builderSequenceLimit,
   };
 }
 
@@ -1787,15 +1796,13 @@ function formatLosingRateRanges(points) {
 }
 
 const BUILDER_SAFE_LIMITS = {
-  exactSequenceEvaluations: 60000,
+  maxSequenceEvaluations: 100000,
   maxGroupsSampled: 1200,
-  maxSequencesPerGroupSampled: 6,
   maxStoredCandidatesPerGroup: 12,
-  maxTotalSequenceEvaluationsSampled: 6000,
   maxSampledTradeCounts: 48,
 };
 
-function estimateTotalBinarySequences(minTrades, maxTrades, cap = BUILDER_SAFE_LIMITS.exactSequenceEvaluations) {
+function estimateTotalBinarySequences(minTrades, maxTrades, cap = BUILDER_SAFE_LIMITS.maxSequenceEvaluations) {
   let total = 0;
   for (let n = minTrades; n <= maxTrades; n++) {
     if (n >= 53) return cap + 1;
@@ -2218,11 +2225,40 @@ function runStrategyBuilder(rawCfg) {
   const useFno = baseMode === "fno";
   const engineCfg = cleanConfig({ ...rawCfg, initialCapital });
 
-  const estimatedSequenceCount = estimateTotalBinarySequences(minTrades, maxTrades);
-  const exactMode = estimatedSequenceCount <= BUILDER_SAFE_LIMITS.exactSequenceEvaluations && (maxTrades - minTrades + 1) <= 20;
-  const sourceTradeCounts = exactMode
-    ? Array.from({ length: maxTrades - minTrades + 1 }, (_, i) => minTrades + i)
-    : uniqueBuilderTradeCounts(minTrades, maxTrades);
+  const userSequenceLimit = Math.min(
+    BUILDER_SAFE_LIMITS.maxSequenceEvaluations,
+    Math.max(1, Math.round(Number(rawCfg.builderSequenceLimit) || BUILDER_SAFE_LIMITS.maxSequenceEvaluations))
+  );
+
+  // We only need the exact total up to the hard cap. If the true total is
+  // larger, the estimator returns cap+1 and the UI represents it as "100,000+".
+  const estimatedSequenceCount = estimateTotalBinarySequences(
+    minTrades,
+    maxTrades,
+    BUILDER_SAFE_LIMITS.maxSequenceEvaluations
+  );
+  const totalSequenceCountKnown =
+    estimatedSequenceCount <= BUILDER_SAFE_LIMITS.maxSequenceEvaluations
+      ? estimatedSequenceCount
+      : null;
+  const effectiveSequenceLimit = Math.min(
+    userSequenceLimit,
+    totalSequenceCountKnown ?? BUILDER_SAFE_LIMITS.maxSequenceEvaluations
+  );
+
+  // Three modes:
+  // 1) exact: all mathematically possible sequences fit within the user's limit.
+  // 2) limited: the total is known and the user intentionally requested fewer
+  //    sequences than the full set; enumerate deterministically until the limit.
+  // 3) sampled: the true total exceeds the 100k hard cap; use representative
+  //    deterministic samples so large ranges remain usable.
+  const exactMode = totalSequenceCountKnown !== null && effectiveSequenceLimit >= totalSequenceCountKnown;
+  const limitedMode = totalSequenceCountKnown !== null && effectiveSequenceLimit < totalSequenceCountKnown;
+  const sampledMode = totalSequenceCountKnown === null;
+
+  const sourceTradeCounts = sampledMode
+    ? uniqueBuilderTradeCounts(minTrades, maxTrades)
+    : Array.from({ length: maxTrades - minTrades + 1 }, (_, i) => minTrades + i);
 
   const rateGroups = new Map();
   for (const n of sourceTradeCounts) {
@@ -2238,11 +2274,11 @@ function runStrategyBuilder(rawCfg) {
   }
 
   let groups = [...rateGroups.values()].sort((a, b) => a.targetWinRate - b.targetWinRate);
-  if (!exactMode && groups.length > BUILDER_SAFE_LIMITS.maxGroupsSampled) {
+  if (sampledMode && groups.length > BUILDER_SAFE_LIMITS.maxGroupsSampled) {
     const sampled = [];
     const seen = new Set();
     for (let i = 0; i < BUILDER_SAFE_LIMITS.maxGroupsSampled; i++) {
-      const idx = Math.round((i * (groups.length - 1)) / (BUILDER_SAFE_LIMITS.maxGroupsSampled - 1));
+      const idx = Math.round((i * (groups.length - 1)) / Math.max(1, BUILDER_SAFE_LIMITS.maxGroupsSampled - 1));
       if (!seen.has(idx)) { seen.add(idx); sampled.push(groups[idx]); }
     }
     groups = sampled;
@@ -2250,65 +2286,78 @@ function runStrategyBuilder(rawCfg) {
 
   const points = [];
   let sequenceEvaluations = 0;
-  let skippedEvaluationCount = 0;
-  // Keep total simulation work roughly bounded by CPU effort, not by the
-  // requested trade-count range. A 10,000-trade sample should therefore use
-  // fewer sequences than a 100-trade sample instead of freezing the browser.
-  const globalSampleBudget = Math.max(
-    1,
-    Math.min(
-      BUILDER_SAFE_LIMITS.maxTotalSequenceEvaluationsSampled,
-      Math.floor(12000000 / Math.max(1, maxTrades))
-    )
-  );
-  if (!exactMode && groups.length > globalSampleBudget) {
-    const sampled = [];
-    const seen = new Set();
-    for (let i = 0; i < globalSampleBudget; i++) {
-      const idx = Math.round((i * (groups.length - 1)) / Math.max(1, globalSampleBudget - 1));
-      if (!seen.has(idx)) { seen.add(idx); sampled.push(groups[idx]); }
-    }
-    groups = sampled;
-  }
+
+  const evaluateCandidate = (group, sequence) => {
+    if (sequenceEvaluations >= effectiveSequenceLimit) return false;
+    const candidate = evaluateBuilderSequence(
+      engineCfg,
+      sequence,
+      totalRiskAmount,
+      useFno,
+      group.targetWinRate
+    );
+    sequenceEvaluations += 1;
+    if (!candidate) return true;
+    return candidate;
+  };
 
   for (const group of groups) {
+    if (sequenceEvaluations >= effectiveSequenceLimit) break;
+
     const candidates = [];
     const winningCandidates = [];
     let winningCountExact = 0;
     let groupEvaluations = 0;
 
-    for (const { n, wins } of group.ratios) {
-      if (exactMode) {
+    if (!sampledMode) {
+      // Exact/limited mode: deterministically enumerate every sequence (or stop
+      // at the user's custom sequence limit). This makes 5–10 = 2,016 and a
+      // user override of 2,000 = exactly 2,000 evaluated sequences.
+      for (const { n, wins } of group.ratios) {
+        if (sequenceEvaluations >= effectiveSequenceLimit) break;
         const stopRef = { stop: false };
         forEachWinLossSequence(n, wins, (sequence) => {
-          if (sequenceEvaluations >= BUILDER_SAFE_LIMITS.exactSequenceEvaluations) { stopRef.stop = true; return; }
-          const candidate = evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, group.targetWinRate);
-          sequenceEvaluations += 1;
+          if (sequenceEvaluations >= effectiveSequenceLimit) {
+            stopRef.stop = true;
+            return;
+          }
+          const candidate = evaluateCandidate(group, sequence);
           groupEvaluations += 1;
-          if (!candidate) return;
+          if (!candidate || typeof candidate === "boolean") return;
           addTopBuilderCandidate(candidates, candidate);
           if (candidate.returnPct > 0) {
             winningCountExact += 1;
             addTopBuilderCandidate(winningCandidates, candidate);
           }
         }, stopRef);
-      } else {
-        const perGroup = Math.min(
-          BUILDER_SAFE_LIMITS.maxSequencesPerGroupSampled,
-          Math.max(1, Math.floor(globalSampleBudget / Math.max(1, groups.length)))
-        );
-        const sampleModes = ["front", "back", "alternating", "random", "random", "random"];
+      }
+    } else {
+      // Large ranges: distribute the user's sequence budget across the
+      // available win-rate/ratio groups rather than the old fixed "6 per group".
+      // This allows the new hard cap of 100,000 to be used meaningfully.
+      const remainingGroups = Math.max(1, groups.length);
+      const remainingBudget = Math.max(0, effectiveSequenceLimit - sequenceEvaluations);
+      const groupBudget = Math.max(1, Math.ceil(remainingBudget / remainingGroups));
+      const ratioCount = Math.max(1, group.ratios.length);
+      const perRatio = Math.max(1, Math.ceil(groupBudget / ratioCount));
+
+      for (const { n, wins } of group.ratios) {
+        if (sequenceEvaluations >= effectiveSequenceLimit) break;
+
         const seen = new Set();
-        for (let i = 0; i < perGroup; i++) {
-          if (sequenceEvaluations >= globalSampleBudget) { skippedEvaluationCount += 1; break; }
-          const seq = makeBuilderSampleSequence(n, wins, sampleModes[i], builderSampleSeed(n, wins, i + group.key.length * 17));
+        const sampleModes = ["front", "back", "alternating"];
+        for (let i = 0; i < perRatio && sequenceEvaluations < effectiveSequenceLimit; i++) {
+          const mode = i < sampleModes.length ? sampleModes[i] : "random";
+          const seed = builderSampleSeed(n, wins, i + group.key.length * 17 + sequenceEvaluations * 31);
+          const seq = makeBuilderSampleSequence(n, wins, mode, seed);
           const key = seq.map((x) => (x ? "W" : "L")).join("");
           if (seen.has(key)) continue;
           seen.add(key);
-          const candidate = evaluateBuilderSequence(engineCfg, seq, totalRiskAmount, useFno, group.targetWinRate);
-          sequenceEvaluations += 1;
+
+          const candidate = evaluateCandidate(group, seq);
           groupEvaluations += 1;
-          if (candidate) addTopBuilderCandidate(candidates, candidate);
+          if (!candidate || typeof candidate === "boolean") continue;
+          addTopBuilderCandidate(candidates, candidate);
         }
       }
     }
@@ -2325,34 +2374,46 @@ function runStrategyBuilder(rawCfg) {
         status: "Losing Range",
         reason: exactMode
           ? `No complete combination fits the ${totalRiskPct}% all-in Builder risk budget and active safety stops.`
+          : limitedMode
+          ? `Sequence limit reached before a complete profitable combination was found inside the ${totalRiskPct}% all-in Builder risk budget and active safety stops.`
           : `No sampled combination fit the ${totalRiskPct}% all-in Builder risk budget and active safety stops.`,
         candidate: null,
         alternatives: [],
         allCombinations: [],
         winningCombinations: [],
-        winningCombinationCount: exactMode ? winningCountExact : 0,
+        winningCombinationCount: !sampledMode ? winningCountExact : 0,
         evaluatedSequenceCount: groupEvaluations,
-        sampled: !exactMode,
+        sampled: sampledMode,
       });
       continue;
     }
 
-    const winningCombinations = exactMode ? winningCandidates : candidates.filter((c) => c.returnPct > 0);
+    const winningCombinations = exactMode || limitedMode
+      ? winningCandidates
+      : candidates.filter((c) => c.returnPct > 0);
     const candidate = candidates[0];
     points.push({
       targetWinRate: group.targetWinRate,
       fractionKey: group.key,
       status: candidate.returnPct > 0 ? "Profitable" : "Losing Range",
       reason: candidate.returnPct > 0
-        ? (exactMode ? "Best-return complete combination found inside the all-in Builder risk budget and active safety stops." : "Best sampled combination found inside the all-in Builder risk budget and active safety stops.")
-        : (exactMode ? "Complete combinations exist, but this win rate remains unprofitable inside the all-in Builder risk budget and active safety stops." : "Sampled complete combinations did not produce a profitable result inside the all-in Builder risk budget and active safety stops."),
+        ? (exactMode
+          ? "Best-return complete combination found inside the all-in Builder risk budget and active safety stops."
+          : limitedMode
+          ? "Best-return combination found inside the user-selected sequence evaluation limit and all-in Builder risk budget."
+          : "Best sampled combination found inside the all-in Builder risk budget and active safety stops.")
+        : (exactMode
+          ? "Complete combinations exist, but this win rate remains unprofitable inside the all-in Builder risk budget and active safety stops."
+          : limitedMode
+          ? "Evaluated combinations did not produce a profitable result inside the user-selected sequence evaluation limit."
+          : "Sampled complete combinations did not produce a profitable result inside the all-in Builder risk budget and active safety stops."),
       candidate,
       alternatives: candidates.slice(1, 4),
       allCombinations: candidates,
       winningCombinations,
-      winningCombinationCount: exactMode ? winningCountExact : winningCombinations.length,
+      winningCombinationCount: !sampledMode ? winningCountExact : winningCombinations.length,
       evaluatedSequenceCount: groupEvaluations,
-      sampled: !exactMode,
+      sampled: sampledMode,
     });
   }
 
@@ -2374,11 +2435,16 @@ function runStrategyBuilder(rawCfg) {
     profitableCount: points.filter((p) => p.candidate?.returnPct > 0).length,
     losingCount: points.filter((p) => !p.candidate || p.candidate.returnPct <= 0).length,
     bestReturnPoint: null,
-    searchMode: exactMode ? "exact" : "sampled",
+    searchMode: exactMode ? "exact" : limitedMode ? "limited" : "sampled",
     estimatedSequenceCount,
+    totalSequenceCount: totalSequenceCountKnown,
+    sequenceLimit: effectiveSequenceLimit,
     evaluatedSequenceCount: sequenceEvaluations,
-    skippedEvaluationCount,
+    skippedEvaluationCount: totalSequenceCountKnown !== null
+      ? Math.max(0, totalSequenceCountKnown - sequenceEvaluations)
+      : Math.max(0, effectiveSequenceLimit - sequenceEvaluations),
     sampledTradeCounts: sourceTradeCounts,
+    maxSequenceEvaluations: BUILDER_SAFE_LIMITS.maxSequenceEvaluations,
     maxStoredCandidatesPerGroup: BUILDER_SAFE_LIMITS.maxStoredCandidatesPerGroup,
   };
 
@@ -2405,6 +2471,39 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
             <NumInput value={cfg.builderMaxTrades} onChange={onChange("builderMaxTrades")} step="1" min="1" color="indigo" />
           </Field>
         </div>
+
+        {(() => {
+          const minT = Math.max(1, Math.round(Number(cfg.builderMinTrades) || 1));
+          const maxT = Math.max(minT, Math.round(Number(cfg.builderMaxTrades) || minT));
+          const totalCap = 100000;
+          const total = estimateTotalBinarySequences(minT, maxT, totalCap);
+          const totalKnown = total <= totalCap;
+          const totalLabel = totalKnown ? total.toLocaleString("en-IN") : `${totalCap.toLocaleString("en-IN")}+`;
+          const storedLimit = Math.min(totalCap, Math.max(1, Math.round(Number(cfg.builderSequenceLimit) || totalCap)));
+          const effectiveLimit = totalKnown ? Math.min(total, storedLimit) : storedLimit;
+          return (
+            <div className="mt-2.5 rounded-lg border border-blue-500/20 bg-blue-500/[0.04] px-3 py-2.5">
+              <div className="flex items-center justify-between gap-3 mb-2">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Sequence Evaluations</div>
+                <div className="text-[10px] font-mono text-zinc-400">Total possible: {totalLabel}</div>
+              </div>
+              <NumInput
+                value={effectiveLimit}
+                onChange={(e) => {
+                  const v = Math.min(totalCap, Math.max(1, Math.round(Number(e.target.value) || 1)));
+                  onChange("builderSequenceLimit")({ target: { value: v } });
+                }}
+                step="1"
+                min="1"
+                max={totalCap}
+                color="blue"
+              />
+              <div className="mt-1 text-[9px] leading-relaxed text-zinc-600">
+                Default = run all possible sequences up to {totalCap.toLocaleString("en-IN")}. You can lower the evaluation count manually.
+              </div>
+            </div>
+          );
+        })()}
       </div>
 
       <div className="mb-5">
@@ -2648,13 +2747,21 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           <div className="text-[10px] text-zinc-600 mt-1">
             {builder.searchMode === "exact"
               ? `Exact sequence search · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} sequences evaluated`
+              : builder.searchMode === "limited"
+              ? `Limited sequence search · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} of ${builder.totalSequenceCount?.toLocaleString("en-IN") || "—"} sequences evaluated`
               : `Large range safety mode · sampled representative sequences · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} evaluations`}
           </div>
         </div>
         <div className="text-right font-mono text-[10px] text-zinc-500">
           {builder.rrMode === "range"
             ? `RR ${Number(builder.rrMin || 0).toFixed(2)}–${Number(builder.rrMax || 0).toFixed(2)}`
-            : `RR ${Number(builder.rr || 0).toFixed(2)}`} · {builder.exactWinRateCount} WR points · {builder.searchMode === "exact" ? "Exact search" : "Fast sampled search"}
+            : `RR ${Number(builder.rr || 0).toFixed(2)}`} · {builder.exactWinRateCount} WR points · {
+              builder.searchMode === "exact"
+                ? "Exact search"
+                : builder.searchMode === "limited"
+                ? "User-limited search"
+                : "Fast sampled search"
+            }
         </div>
       </div>
 
@@ -2771,7 +2878,7 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
             <div className="text-[13px] font-semibold text-zinc-200">Winning Combination Scenarios</div>
             {winningScenariosOpen && (
               <div className="text-[10px] text-zinc-600 mt-1">
-                {formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} {builder.searchMode === "exact" ? "stored" : "sampled"} profitable scenario{winningScenarios.length === 1 ? "" : "s"} · Click any bar to open that exact Trade Log.
+                {formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} {builder.searchMode === "sampled" ? "sampled" : "stored"} profitable scenario{winningScenarios.length === 1 ? "" : "s"} · Click any bar to open that exact Trade Log.
               </div>
             )}
           </button>
@@ -3203,6 +3310,7 @@ export default function RiskSimulator() {
               builderTotalRiskPct: Number(currentSourceCfg.builderTotalRiskPct) || 5,
               builderMinTrades: Number(currentSourceCfg.builderMinTrades) || 5,
               builderMaxTrades: Number(currentSourceCfg.builderMaxTrades) || 10,
+              builderSequenceLimit: BUILDER_SAFE_LIMITS.maxSequenceEvaluations,
             };
         const mergedBuilderCfg = {
           ...currentSourceCfg,
@@ -3373,6 +3481,10 @@ export default function RiskSimulator() {
       // Builder maximum, and Max Trades is automatically kept >= Min Trades.
       builderMinTrades: Math.max(1, Math.round(Number(cfg.builderMinTrades) || 1)),
       builderMaxTrades: Math.max(1, Math.round(Number(cfg.builderMaxTrades) || 1)),
+      builderSequenceLimit: Math.min(
+        BUILDER_SAFE_LIMITS.maxSequenceEvaluations,
+        Math.max(1, Math.round(Number(cfg.builderSequenceLimit) || BUILDER_SAFE_LIMITS.maxSequenceEvaluations))
+      ),
       builderBaseMode: strategyBaseMode,
     };
     if (normalized.builderMaxTrades < normalized.builderMinTrades) {
@@ -5049,5 +5161,4 @@ export default function RiskSimulator() {
 
       {mode !== "builder" && <DraggableRunButton onRun={handleRun} />}
     </div>
-  );
-}
+  );}
