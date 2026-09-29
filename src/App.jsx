@@ -34,6 +34,11 @@ const DEFAULTS = {
   baseLots: 0.1,
   riskPct: 0.3,
   rr: 2.5,
+  // Reward:Risk model: "fixed" preserves the existing behavior; "range"
+  // samples a bounded, center-weighted RR independently for each trade.
+  rrMode: "fixed",
+  rrMin: 0,
+  rrMax: 2,
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
@@ -241,6 +246,45 @@ function fmtPct3(v) {
 }
 
 
+function hashStringToUint32(value) {
+  const text = String(value ?? "");
+  let h = 2166136261;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+// Practical bounded RR model for Range mode. A triangular distribution keeps
+// most winning outcomes near the middle of the chosen range while still
+// allowing the configured min/max to occur. This avoids the unrealistic
+// assumption that every RR inside the range is equally likely.
+function sampleTriangularRR(min, max, rng = Math.random) {
+  const lo = Math.max(0, Number(min) || 0);
+  const hi = Math.max(lo, Number(max) || 0);
+  if (hi <= lo + 1e-12) return lo;
+  const mode = lo + (hi - lo) * 0.5;
+  const u = Math.min(1 - Number.EPSILON, Math.max(Number.EPSILON, rng()));
+  const split = (mode - lo) / (hi - lo);
+  if (u <= split) {
+    return lo + Math.sqrt(u * (hi - lo) * (mode - lo));
+  }
+  return hi - Math.sqrt((1 - u) * (hi - lo) * (hi - mode));
+}
+
+function sampleTradeRR(cfg, rng = Math.random) {
+  if (cfg.rrMode !== "range") return Math.max(0, Number(cfg.rr) || 0);
+  return sampleTriangularRR(cfg.rrMin, cfg.rrMax, rng);
+}
+
+function getSimulationRng(cfg) {
+  return Number.isFinite(Number(cfg?._rrSeed))
+    ? mulberry32(Number(cfg._rrSeed) >>> 0)
+    : Math.random;
+}
+
+
 function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   const BASE_RISK_AMT = cfg.initialCapital * (cfg.riskPct / 100);
   const LOT_VALUE = BASE_RISK_AMT / cfg.baseLots;
@@ -272,6 +316,7 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   let stopReason = null;
 
   const numTrades = Math.min(cfg.numTrades, winLossSeq.length);
+  const rrRng = getSimulationRng(cfg);
 
   for (let i = 1; i <= numTrades; i++) {
     let riskAmt;
@@ -343,7 +388,9 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
    
     const entryPrice = price + (cfg.entrySpread || 0);
     const isWin = !!winLossSeq[i - 1];
-    const grossPL = isWin ? riskAmt * cfg.rr : -riskAmt;
+    // Draw one RR realization per trade in Range mode. Losses remain -1R.
+    const tradeRR = sampleTradeRR(cfg, rrRng);
+    const grossPL = isWin ? riskAmt * tradeRR : -riskAmt;
 
     
     const priceChange = lots !== 0 ? grossPL / lots : 0;
@@ -376,6 +423,7 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     trades.push({
       n: i,
       win: isWin,
+      rr: isWin ? tradeRR : -1,
       risk: riskAmt,
       riskAllocationReset: allocationReset.resetApplied,
       lots,
@@ -533,6 +581,7 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   let stopReason = null;
 
   const numTrades = Math.min(cfg.numTrades, winLossSeq.length);
+  const rrRng = getSimulationRng(cfg);
 
   for (let i = 1; i <= numTrades; i++) {
     let targetRiskAmt;
@@ -608,7 +657,8 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
 
     const entryPrice = price + (cfg.fnoEntrySpread || 0);
     const isWin = !!winLossSeq[i - 1];
-    const grossPL = isWin ? riskAmt * cfg.rr : -riskAmt;
+    const tradeRR = sampleTradeRR(cfg, rrRng);
+    const grossPL = isWin ? riskAmt * tradeRR : -riskAmt;
 
     const priceChange = quantity !== 0 ? grossPL / quantity : 0;
     const trueExitPrice = price + priceChange; // clean market move, no spread
@@ -648,6 +698,7 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     trades.push({
       n: i,
       win: isWin,
+      rr: isWin ? tradeRR : -1,
       risk: riskAmt,
       riskAllocationReset: allocationReset.resetApplied,
       lots: units,
@@ -834,6 +885,9 @@ function cleanConfig(cfg) {
     baseLots: Number(cfg.baseLots) || 0,
     riskPct: Number(cfg.riskPct) || 0,
     rr: Number(cfg.rr) || 0,
+    rrMode: cfg.rrMode === "range" ? "range" : "fixed",
+    rrMin: Math.max(0, Number(cfg.rrMin) || 0),
+    rrMax: Math.max(Math.max(0, Number(cfg.rrMin) || 0), Number(cfg.rrMax) || 0),
     feeMode: cfg.feeMode === "turnover" ? "turnover" : "perLot",
     feeBaseEntry: Number(cfg.feeBaseEntry) || 0,
     feeBaseExit: Number(cfg.feeBaseExit) || 0,
@@ -881,6 +935,55 @@ function cleanConfig(cfg) {
       cfg.fnoLeverage === "" || cfg.fnoLeverage === null || cfg.fnoLeverage === undefined
         ? ""
         : Math.min(100, Math.max(0, Number(cfg.fnoLeverage) || 0)),
+  };
+}
+
+// Returns only the strategy-facing configuration fields. Builder controls are
+// deliberately excluded because Builder keeps its own capital/risk/trade-range
+// settings, while RR mode/range, costs, risk cascade, F&O settings, etc. should
+// always follow the currently selected Single Run / Day-F&O base configuration.
+// Only strategy-driving fields participate in the Builder workspace identity.
+// Builder-only controls, sweep/batch controls, and transient Builder metadata
+// must never make an unchanged strategy look "new".
+const BUILDER_STRATEGY_KEYS = Object.keys(DEFAULTS).filter(
+  (key) =>
+    !key.startsWith("builder") &&
+    key !== "sweepStep" &&
+    key !== "sweepRuns" &&
+    key !== "batchCount"
+);
+
+function normalizeBuilderSignatureValue(value) {
+  if (value === null || value === undefined) return null;
+  if (value === "") return "";
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) {
+    return Number(value);
+  }
+  return value;
+}
+
+function builderSourceConfig(cfg) {
+  const source = {};
+  for (const key of BUILDER_STRATEGY_KEYS) {
+    source[key] = normalizeBuilderSignatureValue(cfg?.[key]);
+  }
+  return source;
+}
+
+function builderSourceSignature(cfg, baseMode) {
+  return JSON.stringify({
+    baseMode: baseMode === "fno" ? "fno" : "single",
+    source: builderSourceConfig(cfg),
+  });
+}
+
+function builderInputFields(cfg) {
+  return {
+    builderInitialCapital: cfg?.builderInitialCapital,
+    builderTotalRiskPct: cfg?.builderTotalRiskPct,
+    builderMinTrades: cfg?.builderMinTrades,
+    builderMaxTrades: cfg?.builderMaxTrades,
   };
 }
 
@@ -1683,17 +1786,35 @@ function formatLosingRateRanges(points) {
   });
 }
 
-function buildAllWinLossSequences(n, wins) {
-  const out = [];
+const BUILDER_SAFE_LIMITS = {
+  exactSequenceEvaluations: 60000,
+  maxGroupsSampled: 1200,
+  maxSequencesPerGroupSampled: 6,
+  maxStoredCandidatesPerGroup: 12,
+  maxTotalSequenceEvaluationsSampled: 6000,
+  maxSampledTradeCounts: 48,
+};
+
+function estimateTotalBinarySequences(minTrades, maxTrades, cap = BUILDER_SAFE_LIMITS.exactSequenceEvaluations) {
+  let total = 0;
+  for (let n = minTrades; n <= maxTrades; n++) {
+    if (n >= 53) return cap + 1;
+    total += 2 ** n;
+    if (total > cap) return total;
+  }
+  return total;
+}
+
+function forEachWinLossSequence(n, wins, visitor, stopRef = null) {
   const seq = Array(n).fill(false);
   const visit = (pos, remainingWins) => {
+    if (stopRef?.stop) return;
     if (pos === n) {
-      if (remainingWins === 0) out.push(seq.slice());
+      if (remainingWins === 0) visitor(seq.slice());
       return;
     }
     const left = n - pos;
     if (remainingWins > left) return;
-
     if (remainingWins > 0) {
       seq[pos] = true;
       visit(pos + 1, remainingWins - 1);
@@ -1704,7 +1825,74 @@ function buildAllWinLossSequences(n, wins) {
     }
   };
   visit(0, Math.max(0, Math.min(n, wins)));
-  return out;
+}
+
+function builderSampleSeed(n, wins, salt = 0) {
+  let x = (n * 374761393 + wins * 668265263 + salt * 69069) >>> 0;
+  x ^= x >>> 13;
+  x = Math.imul(x, 1274126177) >>> 0;
+  x ^= x >>> 16;
+  return x >>> 0;
+}
+
+function mulberry32(seed) {
+  return () => {
+    let t = (seed += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function makeBuilderSampleSequence(n, wins, mode = "random", seed = 1) {
+  const safeWins = Math.max(0, Math.min(n, Math.round(wins)));
+  const seq = Array(n).fill(false);
+  if (mode === "front") {
+    for (let i = 0; i < safeWins; i++) seq[i] = true;
+    return seq;
+  }
+  if (mode === "back") {
+    for (let i = n - safeWins; i < n; i++) if (i >= 0) seq[i] = true;
+    return seq;
+  }
+  if (mode === "alternating") {
+    if (safeWins === 0) return seq;
+    const spacing = n / safeWins;
+    for (let w = 0; w < safeWins; w++) {
+      const idx = Math.min(n - 1, Math.floor(w * spacing + spacing / 2));
+      seq[idx] = true;
+    }
+    let placed = seq.reduce((c, x) => c + (x ? 1 : 0), 0);
+    for (let i = 0; placed < safeWins && i < n; i++) {
+      if (!seq[i]) { seq[i] = true; placed += 1; }
+    }
+    return seq;
+  }
+  for (let i = 0; i < safeWins; i++) seq[i] = true;
+  const rng = mulberry32(seed);
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [seq[i], seq[j]] = [seq[j], seq[i]];
+  }
+  return seq;
+}
+
+function uniqueBuilderTradeCounts(minTrades, maxTrades, maxCount = BUILDER_SAFE_LIMITS.maxSampledTradeCounts) {
+  const values = new Set([minTrades, maxTrades]);
+  const span = Math.max(0, maxTrades - minTrades);
+  const count = Math.min(maxCount, span + 1);
+  if (count > 1) {
+    for (let i = 0; i < count; i++) values.add(Math.round(minTrades + (span * i) / (count - 1)));
+  }
+  return [...values].sort((a, b) => a - b);
+}
+
+function addTopBuilderCandidate(candidates, candidate, maxKeep = BUILDER_SAFE_LIMITS.maxStoredCandidatesPerGroup) {
+  candidates.push(candidate);
+  if (candidates.length > maxKeep * 2) {
+    candidates.sort(compareBuilderCandidates);
+    candidates.length = maxKeep;
+  }
 }
 
 
@@ -1880,8 +2068,13 @@ function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, t
   const n = sequence.length;
   const wins = sequence.filter(Boolean).length;
 
+  const rrSeed = hashStringToUint32(
+    `builder-rr|${targetWinRate ?? "actual"}|${sequence.length}|${sequence.map((x) => (x ? "W" : "L")).join("")}`
+  );
+  const builderEngineCfg = { ...engineCfg, _rrSeed: rrSeed };
+
   const calibrated = calibrateBuilderRiskPlan(
-    engineCfg,
+    builderEngineCfg,
     sequence,
     totalRiskAmount,
     useFno
@@ -2023,86 +2216,143 @@ function runStrategyBuilder(rawCfg) {
   const totalRiskAmount = initialCapital * (totalRiskPct / 100);
   const baseMode = rawCfg.builderBaseMode === "fno" ? "fno" : "single";
   const useFno = baseMode === "fno";
+  const engineCfg = cleanConfig({ ...rawCfg, initialCapital });
 
-  const engineCfg = cleanConfig({
-    ...rawCfg,
-    initialCapital,
-  });
+  const estimatedSequenceCount = estimateTotalBinarySequences(minTrades, maxTrades);
+  const exactMode = estimatedSequenceCount <= BUILDER_SAFE_LIMITS.exactSequenceEvaluations && (maxTrades - minTrades + 1) <= 20;
+  const sourceTradeCounts = exactMode
+    ? Array.from({ length: maxTrades - minTrades + 1 }, (_, i) => minTrades + i)
+    : uniqueBuilderTradeCounts(minTrades, maxTrades);
 
-  // Group every mathematically possible W/L ratio inside the user-selected
-  // custom trade range (minimum 1, no fixed maximum) by its reduced fraction.
-  // This means 50% from 6, 8 and 10 trades is one matrix row, while 33.33%,
-  // 37.50%, 42.86%, etc. are also tested automatically.
   const rateGroups = new Map();
-  for (let n = minTrades; n <= maxTrades; n++) {
+  for (const n of sourceTradeCounts) {
     for (let wins = 0; wins <= n; wins++) {
       const divisor = gcd(wins, n);
       const reducedNum = wins / divisor;
       const reducedDen = n / divisor;
       const rateKey = `${reducedNum}/${reducedDen}`;
       const targetWinRate = (wins / n) * 100;
-      if (!rateGroups.has(rateKey)) {
-        rateGroups.set(rateKey, {
-          key: rateKey,
-          targetWinRate,
-          ratios: [],
-        });
-      }
+      if (!rateGroups.has(rateKey)) rateGroups.set(rateKey, { key: rateKey, targetWinRate, ratios: [] });
       rateGroups.get(rateKey).ratios.push({ n, wins });
     }
   }
 
-  const groups = [...rateGroups.values()].sort((a, b) => a.targetWinRate - b.targetWinRate);
+  let groups = [...rateGroups.values()].sort((a, b) => a.targetWinRate - b.targetWinRate);
+  if (!exactMode && groups.length > BUILDER_SAFE_LIMITS.maxGroupsSampled) {
+    const sampled = [];
+    const seen = new Set();
+    for (let i = 0; i < BUILDER_SAFE_LIMITS.maxGroupsSampled; i++) {
+      const idx = Math.round((i * (groups.length - 1)) / (BUILDER_SAFE_LIMITS.maxGroupsSampled - 1));
+      if (!seen.has(idx)) { seen.add(idx); sampled.push(groups[idx]); }
+    }
+    groups = sampled;
+  }
+
   const points = [];
+  let sequenceEvaluations = 0;
+  let skippedEvaluationCount = 0;
+  // Keep total simulation work roughly bounded by CPU effort, not by the
+  // requested trade-count range. A 10,000-trade sample should therefore use
+  // fewer sequences than a 100-trade sample instead of freezing the browser.
+  const globalSampleBudget = Math.max(
+    1,
+    Math.min(
+      BUILDER_SAFE_LIMITS.maxTotalSequenceEvaluationsSampled,
+      Math.floor(12000000 / Math.max(1, maxTrades))
+    )
+  );
+  if (!exactMode && groups.length > globalSampleBudget) {
+    const sampled = [];
+    const seen = new Set();
+    for (let i = 0; i < globalSampleBudget; i++) {
+      const idx = Math.round((i * (groups.length - 1)) / Math.max(1, globalSampleBudget - 1));
+      if (!seen.has(idx)) { seen.add(idx); sampled.push(groups[idx]); }
+    }
+    groups = sampled;
+  }
 
   for (const group of groups) {
     const candidates = [];
+    const winningCandidates = [];
+    let winningCountExact = 0;
+    let groupEvaluations = 0;
 
     for (const { n, wins } of group.ratios) {
-      const sequences = buildAllWinLossSequences(n, wins);
-      for (const sequence of sequences) {
-        const candidate = evaluateBuilderSequence(
-          engineCfg,
-          sequence,
-          totalRiskAmount,
-          useFno,
-          group.targetWinRate
+      if (exactMode) {
+        const stopRef = { stop: false };
+        forEachWinLossSequence(n, wins, (sequence) => {
+          if (sequenceEvaluations >= BUILDER_SAFE_LIMITS.exactSequenceEvaluations) { stopRef.stop = true; return; }
+          const candidate = evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, group.targetWinRate);
+          sequenceEvaluations += 1;
+          groupEvaluations += 1;
+          if (!candidate) return;
+          addTopBuilderCandidate(candidates, candidate);
+          if (candidate.returnPct > 0) {
+            winningCountExact += 1;
+            addTopBuilderCandidate(winningCandidates, candidate);
+          }
+        }, stopRef);
+      } else {
+        const perGroup = Math.min(
+          BUILDER_SAFE_LIMITS.maxSequencesPerGroupSampled,
+          Math.max(1, Math.floor(globalSampleBudget / Math.max(1, groups.length)))
         );
-        if (candidate) candidates.push(candidate);
+        const sampleModes = ["front", "back", "alternating", "random", "random", "random"];
+        const seen = new Set();
+        for (let i = 0; i < perGroup; i++) {
+          if (sequenceEvaluations >= globalSampleBudget) { skippedEvaluationCount += 1; break; }
+          const seq = makeBuilderSampleSequence(n, wins, sampleModes[i], builderSampleSeed(n, wins, i + group.key.length * 17));
+          const key = seq.map((x) => (x ? "W" : "L")).join("");
+          if (seen.has(key)) continue;
+          seen.add(key);
+          const candidate = evaluateBuilderSequence(engineCfg, seq, totalRiskAmount, useFno, group.targetWinRate);
+          sequenceEvaluations += 1;
+          groupEvaluations += 1;
+          if (candidate) addTopBuilderCandidate(candidates, candidate);
+        }
       }
     }
 
     candidates.sort(compareBuilderCandidates);
+    candidates.length = Math.min(candidates.length, BUILDER_SAFE_LIMITS.maxStoredCandidatesPerGroup);
+    winningCandidates.sort(compareBuilderCandidates);
+    winningCandidates.length = Math.min(winningCandidates.length, BUILDER_SAFE_LIMITS.maxStoredCandidatesPerGroup);
 
     if (!candidates.length) {
       points.push({
         targetWinRate: group.targetWinRate,
         fractionKey: group.key,
         status: "Losing Range",
-        reason: `No complete combination fits the ${totalRiskPct}% all-in Builder risk budget and active safety stops.`,
+        reason: exactMode
+          ? `No complete combination fits the ${totalRiskPct}% all-in Builder risk budget and active safety stops.`
+          : `No sampled combination fit the ${totalRiskPct}% all-in Builder risk budget and active safety stops.`,
         candidate: null,
         alternatives: [],
         allCombinations: [],
         winningCombinations: [],
-        winningCombinationCount: 0,
+        winningCombinationCount: exactMode ? winningCountExact : 0,
+        evaluatedSequenceCount: groupEvaluations,
+        sampled: !exactMode,
       });
       continue;
     }
 
-    const winningCombinations = candidates.filter((c) => c.returnPct > 0);
+    const winningCombinations = exactMode ? winningCandidates : candidates.filter((c) => c.returnPct > 0);
     const candidate = candidates[0];
     points.push({
       targetWinRate: group.targetWinRate,
       fractionKey: group.key,
       status: candidate.returnPct > 0 ? "Profitable" : "Losing Range",
       reason: candidate.returnPct > 0
-        ? "Best-return complete combination found inside the all-in Builder risk budget and active safety stops."
-        : "Complete combinations exist, but this win rate remains unprofitable inside the all-in Builder risk budget and active safety stops.",
+        ? (exactMode ? "Best-return complete combination found inside the all-in Builder risk budget and active safety stops." : "Best sampled combination found inside the all-in Builder risk budget and active safety stops.")
+        : (exactMode ? "Complete combinations exist, but this win rate remains unprofitable inside the all-in Builder risk budget and active safety stops." : "Sampled complete combinations did not produce a profitable result inside the all-in Builder risk budget and active safety stops."),
       candidate,
       alternatives: candidates.slice(1, 4),
       allCombinations: candidates,
       winningCombinations,
-      winningCombinationCount: winningCombinations.length,
+      winningCombinationCount: exactMode ? winningCountExact : winningCombinations.length,
+      evaluatedSequenceCount: groupEvaluations,
+      sampled: !exactMode,
     });
   }
 
@@ -2115,12 +2365,21 @@ function runStrategyBuilder(rawCfg) {
     exactWinRateCount: groups.length,
     baseMode,
     rr: engineCfg.rr,
+    rrMode: engineCfg.rrMode,
+    rrMin: engineCfg.rrMin,
+    rrMax: engineCfg.rrMax,
     strategyCfg: engineCfg,
     points,
     validCount: points.filter((p) => p.candidate).length,
     profitableCount: points.filter((p) => p.candidate?.returnPct > 0).length,
     losingCount: points.filter((p) => !p.candidate || p.candidate.returnPct <= 0).length,
     bestReturnPoint: null,
+    searchMode: exactMode ? "exact" : "sampled",
+    estimatedSequenceCount,
+    evaluatedSequenceCount: sequenceEvaluations,
+    skippedEvaluationCount,
+    sampledTradeCounts: sourceTradeCounts,
+    maxStoredCandidatesPerGroup: BUILDER_SAFE_LIMITS.maxStoredCandidatesPerGroup,
   };
 
   return deriveBuilderState(builder, points);
@@ -2176,7 +2435,11 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
             <div className="text-xs font-mono text-emerald-300 py-2.5">{autoCandidate ? fmtPct(autoCandidate.autoBaseRiskPct) : "—"}</div>
           </Field>
           <Field label="Reward:Risk">
-            <div className="text-xs font-mono text-zinc-200 py-2.5">{Number(strategyCfg.rr || 0).toFixed(2)}</div>
+            <div className="text-xs font-mono text-zinc-200 py-2.5">
+              {strategyCfg.rrMode === "range"
+                ? `${Number(strategyCfg.rrMin || 0).toFixed(2)}–${Number(strategyCfg.rrMax || 0).toFixed(2)}R range`
+                : Number(strategyCfg.rr || 0).toFixed(2)}
+            </div>
           </Field>
         </div>
       </div>
@@ -2236,6 +2499,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
         <div className="text-[10px] uppercase tracking-wider text-amber-300/80 font-semibold">Active Configuration</div>
         <div className="text-[10px] leading-relaxed text-zinc-500 mt-1.5">
           Builder uses the current {isFno ? "Day / F&amp;O" : "Single Run"} configuration for RR, risk allocation, costs and safety stops, while auto-scaling Base Risk and size to the Builder downside cap.
+          {strategyCfg.rrMode === "range" ? " Range mode uses deterministic seeded RR draws per combination so Builder comparisons remain reproducible." : ""}
         </div>
       </div>
     </div>
@@ -2381,8 +2645,17 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           <div className="text-[11px] text-zinc-500 mt-1">
             {builder.baseMode === "fno" ? "Day / F&amp;O" : "Single Run"} configuration · {fmtMoney(builder.totalRiskAmount)} total risk budget · {builder.minTrades}–{builder.maxTrades} trades
           </div>
+          <div className="text-[10px] text-zinc-600 mt-1">
+            {builder.searchMode === "exact"
+              ? `Exact sequence search · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} sequences evaluated`
+              : `Large range safety mode · sampled representative sequences · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} evaluations`}
+          </div>
         </div>
-        <div className="text-right font-mono text-[10px] text-zinc-500">RR {builder.rr.toFixed(2)} · {builder.exactWinRateCount} exact WR points</div>
+        <div className="text-right font-mono text-[10px] text-zinc-500">
+          {builder.rrMode === "range"
+            ? `RR ${Number(builder.rrMin || 0).toFixed(2)}–${Number(builder.rrMax || 0).toFixed(2)}`
+            : `RR ${Number(builder.rr || 0).toFixed(2)}`} · {builder.exactWinRateCount} WR points · {builder.searchMode === "exact" ? "Exact search" : "Fast sampled search"}
+        </div>
       </div>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3">
@@ -2497,7 +2770,9 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           >
             <div className="text-[13px] font-semibold text-zinc-200">Winning Combination Scenarios</div>
             {winningScenariosOpen && (
-              <div className="text-[10px] text-zinc-600 mt-1">{formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} profitable combination{winningScenarios.length === 1 ? "" : "s"} · Click any bar to open that exact Trade Log.</div>
+              <div className="text-[10px] text-zinc-600 mt-1">
+                {formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} {builder.searchMode === "exact" ? "stored" : "sampled"} profitable scenario{winningScenarios.length === 1 ? "" : "s"} · Click any bar to open that exact Trade Log.
+              </div>
             )}
           </button>
           <span className="flex items-center gap-2">
@@ -2655,6 +2930,7 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                 <th className="text-left px-3 py-2 font-medium">No</th>
                 <th className="text-left px-3 py-2 font-medium">Result</th>
                 <th className="text-right px-3 py-2 font-medium">Risk</th>
+                <th className="text-right px-3 py-2 font-medium">RR</th>
                 <th className="text-right px-3 py-2 font-medium">Lots</th>
                 <th className="text-right px-3 py-2 font-medium">Gross P/L</th>
                 <th className="text-right px-3 py-2 font-medium">Fee</th>
@@ -2690,6 +2966,7 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                     {t.win ? "WIN" : "LOSS"}
                   </td>
                   <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)} {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}</td>
+                  <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                   <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                   <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmtMoney(t.grossPL)}</td>
                   <td className="px-3 py-1.5 text-right text-[#C4B4FF]">{fmtMoney(t.fee)}</td>
@@ -2818,6 +3095,7 @@ export default function RiskSimulator() {
       selectedBatchRunIdx,
       cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
       baseMode: strategyBaseMode,
+      sourceSignature: builderSourceSignature(cfg, strategyBaseMode),
     };
   }, [
     mode,
@@ -2832,15 +3110,12 @@ export default function RiskSimulator() {
   ]);
 
   // Switching tabs restores the last workspace belonging to that strategy.
-  // This is especially important after Builder: Builder's selected combination
-  // may be the current result, but it must remain available when the user
-  // comes back to Builder after visiting Single/F&O.
+  // Builder is a separate workspace, but its STRATEGY configuration must always
+  // follow the currently selected Single Run / Day-F&O base. Builder-only inputs
+  // (risk budget + trade range) are preserved separately.
   const handleModeChange = useCallback(
     (nextMode) => {
-      // Before leaving Builder, take an explicit snapshot at the exact tab
-      // click. This guarantees the currently selected Builder scenario,
-      // Trade Log, matrix and calibrated config are preserved even when the
-      // user switches tabs immediately after selecting/editing a combination.
+      // Explicitly save the workspace we are leaving at the exact click.
       if (mode === "builder") {
         builderWorkspaceRef.current = {
           cfg: { ...cfg },
@@ -2852,13 +3127,10 @@ export default function RiskSimulator() {
           selectedBatchRunIdx,
           cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
           baseMode: strategyBaseMode,
+          sourceSignature: builderSourceSignature(cfg, strategyBaseMode),
         };
       }
 
-      // Before leaving Single/F&O, take one explicit snapshot as well. The
-      // effect above normally keeps this current, but this makes the tab click
-      // itself a guaranteed save point even when the user switches immediately
-      // after editing a field.
       if (mode === "single" || mode === "fno") {
         strategyWorkspaceRef.current[mode] = {
           ...strategyWorkspaceRef.current[mode],
@@ -2871,13 +3143,12 @@ export default function RiskSimulator() {
         };
       }
 
+      // Returning to Single/F&O restores that strategy's own workspace and
+      // never lets a Builder combination become its visible Trade Log/result.
       if (nextMode === "single" || nextMode === "fno") {
         const workspace = strategyWorkspaceRef.current[nextMode];
         restoringStrategyWorkspaceRef.current = true;
 
-        // Restore the destination strategy BEFORE changing the visible mode.
-        // This is the key isolation: Builder's currently selected combination
-        // never becomes the result/config shown when returning to Single/F&O.
         setCfg(workspace?.cfg ? { ...workspace.cfg } : { ...DEFAULTS });
         setResult(workspace?.result || null);
         setSweep(null);
@@ -2898,48 +3169,71 @@ export default function RiskSimulator() {
       }
 
       if (nextMode === "builder") {
-        // Save the currently visible Builder state before leaving it, then
-        // restore that exact Builder workspace when returning later.
-        if (mode === "builder") {
-          builderWorkspaceRef.current = {
-            cfg: { ...cfg },
-            result,
-            builderResult,
-            builderSelectedKey,
-            activeRunLabel,
-            batchResult,
-            selectedBatchRunIdx,
-            cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
-            baseMode: strategyBaseMode,
-          };
+        const strategyBase = nextMode === "builder"
+          ? (mode === "fno" ? "fno" : mode === "single" ? "single" : strategyBaseMode)
+          : strategyBaseMode;
+        const currentSourceCfg =
+          mode === "single" || mode === "fno"
+            ? { ...cfg }
+            : {
+                ...cfg,
+                ...(strategyWorkspaceRef.current[strategyBase]?.cfg || {}),
+              };
+        const sourceSig = builderSourceSignature(currentSourceCfg, strategyBase);
+        const workspace = builderWorkspaceRef.current;
+        const workspaceSourceSig = workspace
+          ? (
+              workspace.sourceSignature ||
+              builderSourceSignature(workspace.cfg || {}, workspace.baseMode || strategyBase)
+            )
+          : null;
+        const workspaceMatchesSource =
+          !!workspace &&
+          (workspace.baseMode || strategyBase) === strategyBase &&
+          workspaceSourceSig === sourceSig;
+
+        // Always start Builder from the CURRENT strategy configuration. Keep
+        // only Builder-specific controls from the previous Builder workspace.
+        // This fixes the RR Fixed/Range sync issue (and also keeps all other
+        // strategy settings current).
+        const preservedBuilderInputs = workspace
+          ? builderInputFields(workspace.cfg || {})
+          : {
+              builderInitialCapital: Number(currentSourceCfg.initialCapital) || 0,
+              builderTotalRiskPct: Number(currentSourceCfg.builderTotalRiskPct) || 5,
+              builderMinTrades: Number(currentSourceCfg.builderMinTrades) || 5,
+              builderMaxTrades: Number(currentSourceCfg.builderMaxTrades) || 10,
+            };
+        const mergedBuilderCfg = {
+          ...currentSourceCfg,
+          ...preservedBuilderInputs,
+        };
+        if (!workspace) {
+          mergedBuilderCfg.builderInitialCapital = Number(currentSourceCfg.initialCapital) || 0;
         }
 
-        const workspace = builderWorkspaceRef.current;
         restoringBuilderWorkspaceRef.current = true;
+        setCfg(mergedBuilderCfg);
+        setStrategyBaseMode(strategyBase);
+        setSweepBaseMode(strategyBase);
+        lastRunModeRef.current = strategyBase;
 
-        if (workspace) {
-          // Restore Builder's own config/result/selection as one atomic
-          // workspace switch. Nothing from Single/F&O is allowed to leak in.
-          setCfg(workspace.cfg ? { ...workspace.cfg } : { ...DEFAULTS });
+        if (workspaceMatchesSource) {
+          // Same underlying strategy: restore the exact previously selected
+          // Builder combination/Trade Log.
           setResult(workspace.result || null);
           setBuilderResult(workspace.builderResult || null);
           setBuilderSelectedKey(workspace.builderSelectedKey ?? null);
           setActiveRunLabel(workspace.activeRunLabel ?? null);
           setBatchResult(workspace.batchResult || null);
           setSelectedBatchRunIdx(workspace.selectedBatchRunIdx ?? null);
-
-          const restoredBuilderCfg = workspace.cfg ? { ...workspace.cfg } : { ...DEFAULTS };
           lastCleanCfgRef.current = workspace.cleanCfg
             ? { ...workspace.cleanCfg }
-            : (workspace.result ? cleanConfig(restoredBuilderCfg) : null);
-          lastRunModeRef.current = workspace.baseMode === "fno" ? "fno" : "single";
-          setStrategyBaseMode(workspace.baseMode === "fno" ? "fno" : "single");
-          setSweepBaseMode(workspace.baseMode === "fno" ? "fno" : "single");
+            : (workspace.result ? cleanConfig({ ...mergedBuilderCfg, initialCapital: workspace.cfg?.builderInitialCapital ?? mergedBuilderCfg.builderInitialCapital }) : null);
         } else {
-          // First visit to Builder: keep the current strategy configuration
-          // as its base, but do not show the Single/F&O Trade Log as Builder's
-          // own result. Builder starts blank until a combination is built.
-          setCfg((c) => ({ ...c, builderInitialCapital: c.initialCapital }));
+          // Underlying strategy changed (including RR mode/range): old Builder
+          // output is no longer valid, so preserve Builder inputs but require a
+          // rebuild against the new strategy configuration.
           setResult(null);
           setBuilderResult(null);
           setBuilderSelectedKey(null);
@@ -3010,6 +3304,7 @@ export default function RiskSimulator() {
       selectedBatchRunIdx: null,
       cleanCfg: { ...runCfg },
       baseMode,
+      sourceSignature: builderSourceSignature(cfg, baseMode),
     };
   }, [cfg, builderResult]);
 
@@ -3063,6 +3358,7 @@ export default function RiskSimulator() {
       selectedBatchRunIdx: null,
       cleanCfg: { ...(editedCandidate.autoStrategyCfg || builderResult.strategyCfg) },
       baseMode: builderResult.baseMode,
+      sourceSignature: builderSourceSignature(cfg, builderResult.baseMode),
     };
   }, [builderResult, cfg]);
 
@@ -3122,6 +3418,7 @@ export default function RiskSimulator() {
             selectedBatchRunIdx: null,
             cleanCfg: { ...built.strategyCfg },
             baseMode: built.baseMode,
+            sourceSignature: builderSourceSignature(normalized, built.baseMode),
           };
         }
       } finally {
@@ -3442,6 +3739,7 @@ export default function RiskSimulator() {
         selectedBatchRunIdx: null,
         cleanCfg: { ...(editedCandidate.autoStrategyCfg || builderResult.strategyCfg) },
         baseMode: builderResult.baseMode,
+        sourceSignature: builderSourceSignature(cfg, builderResult.baseMode),
       };
     },
     [result, builderResult, builderSelectedKey, cfg]
@@ -3746,9 +4044,45 @@ export default function RiskSimulator() {
                     </Field>
                   </div>
                 )}
-                <Field label="Reward:Risk">
-                  <NumInput value={cfg.rr} onChange={setField("rr")} step="0.1" color="blue" />
-                </Field>
+                <div className="mb-3">
+                  <div className="flex items-baseline justify-between mb-1.5">
+                    <label className="text-xs text-zinc-400">Reward:Risk Model</label>
+                    <span className="text-[10px] text-zinc-600">winning trades</span>
+                  </div>
+                  <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1 mb-2.5">
+                    {["fixed", "range"].map((rm) => (
+                      <button
+                        key={rm}
+                        type="button"
+                        onClick={() => setCfg((c) => ({ ...c, rrMode: rm }))}
+                        className={`flex-1 py-1.5 rounded-md text-xs font-mono transition-colors ${
+                          cfg.rrMode === rm ? "bg-blue-500/20 text-blue-300" : "text-zinc-500"
+                        }`}
+                      >
+                        {rm === "fixed" ? "Fixed" : "Range"}
+                      </button>
+                    ))}
+                  </div>
+                  {cfg.rrMode === "range" ? (
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <Field label="Min RR">
+                        <NumInput value={cfg.rrMin} onChange={setField("rrMin")} step="0.1" min="0" color="blue" />
+                      </Field>
+                      <Field label="Max RR">
+                        <NumInput value={cfg.rrMax} onChange={setField("rrMax")} step="0.1" min="0" color="blue" />
+                      </Field>
+                    </div>
+                  ) : (
+                    <Field label="Reward:Risk">
+                      <NumInput value={cfg.rr} onChange={setField("rr")} step="0.1" min="0" color="blue" />
+                    </Field>
+                  )}
+                  {cfg.rrMode === "range" && (
+                    <div className="text-[10px] text-zinc-600 leading-relaxed -mt-1">
+                      Each trade receives a bounded random RR. Middle-of-range outcomes are more common than the extremes.
+                    </div>
+                  )}
+                </div>
               </div>
 
               <div className="mb-5">
@@ -4157,6 +4491,7 @@ export default function RiskSimulator() {
                           <th className="text-left px-3 py-2 font-medium">No</th>
                           <th className="text-left px-3 py-2 font-medium">Result</th>
                           <th className="text-right px-3 py-2 font-medium">Risk</th>
+                          <th className="text-right px-3 py-2 font-medium">RR</th>
                           <th className="text-right px-3 py-2 font-medium">Lots</th>
                           <th className="text-right px-3 py-2 font-medium">Gross P/L</th>
                           <th className="text-right px-3 py-2 font-medium">Fee</th>
@@ -4200,6 +4535,7 @@ export default function RiskSimulator() {
                               {t.win ? "WIN" : "LOSS"}
                             </td>
                             <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)} {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300" title="Risk Allocation Reset">RESET</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                             <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>
                               {fmtMoney(t.grossPL)}
@@ -4387,6 +4723,7 @@ export default function RiskSimulator() {
                           <th className="text-left px-3 py-2 font-medium">No</th>
                           <th className="text-left px-3 py-2 font-medium">Result</th>
                           <th className="text-right px-3 py-2 font-medium">Risk</th>
+                          <th className="text-right px-3 py-2 font-medium">RR</th>
                           <th className="text-right px-3 py-2 font-medium">{isFnoIntraday ? "Shares" : "Lots"}</th>
                           <th className="text-right px-3 py-2 font-medium">Qty</th>
                           <th className="text-right px-3 py-2 font-medium">Gross P/L</th>
@@ -4431,6 +4768,7 @@ export default function RiskSimulator() {
                               {t.win ? "WIN" : "LOSS"}
                             </td>
                             <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)}</td>
+                            <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots}</td>
                             <td className="px-3 py-1.5 text-right">{t.quantity}</td>
                             <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>
