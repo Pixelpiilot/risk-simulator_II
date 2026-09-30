@@ -33,7 +33,7 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2.5,
+  rr: 2,
   // Reward:Risk model: "fixed" preserves the existing behavior; "range"
   // samples a bounded, center-weighted RR independently for each trade.
   rrMode: "fixed",
@@ -42,13 +42,13 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2600,
+  currentPrice: 2650,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
   cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 65,
-  lossRiskPct: 18,
+  winRiskPct: 70,
+  lossRiskPct: 20,
   lossRiskAdjustPct: -1,
   perTradeCapPct: 70,
   overallCapPct: 30,
@@ -67,8 +67,8 @@ const DEFAULTS = {
   exitSpread: 0.2,
   winRate: 40,
   numTrades: 10,
-  sweepStep: 5,
-  sweepRuns: 100,
+  sweepStep: 10,
+  sweepRuns: 500,
   batchCount: "",
   // --- Day / F&O mode (Indian market) ---
   // Segment decides the sizing unit + statutory-charge rates: "intraday" (cash
