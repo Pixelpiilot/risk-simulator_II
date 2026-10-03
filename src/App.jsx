@@ -121,6 +121,21 @@ const DEFAULTS = {
   // Builder sequence evaluation count. 100,000 is the hard maximum; the UI
   // automatically shows the smaller of this cap and the mathematically possible total.
   builderSequenceLimit: 100000,
+  // Optional second-stage Builder searches. Each dimension can be enabled
+  // independently. OFF means that dimension follows the existing automatic
+  // Builder calibration behaviour. Range inputs intentionally default to 0
+  // until the user enables the corresponding search.
+  builderSizeRangeSearchEnabled: false,
+  builderRiskRangeSearchEnabled: false,
+  builderBaseLotsMin: 0,
+  builderBaseLotsMax: 0,
+  builderBaseRiskMin: 0,
+  builderBaseRiskMax: 0,
+  // Search resolution when Builder range search is enabled. The grid is
+  // evaluated exactly when its size is practical; larger grids switch to
+  // deterministic coarse-to-fine refinement around the best coarse point.
+  builderBaseLotsStep: 0.01,
+  builderBaseRiskStep: 0.01,
 };
 
 // ---- Broker + segment statutory charge rates (as % — divide by 100 to use) ----
@@ -943,6 +958,14 @@ function cleanConfig(cfg) {
     builderMinTrades: Math.max(1, Math.round(Number(cfg.builderMinTrades) || 1)),
     builderMaxTrades: Math.max(1, Math.round(Number(cfg.builderMaxTrades) || 1)),
     builderSequenceLimit: Math.min(100000, Math.max(1, Math.round(Number(cfg.builderSequenceLimit) || 100000))),
+    builderSizeRangeSearchEnabled: cfg.builderSizeRangeSearchEnabled === true || Number(cfg.builderSizeRangeSearchEnabled) === 1,
+    builderRiskRangeSearchEnabled: cfg.builderRiskRangeSearchEnabled === true || Number(cfg.builderRiskRangeSearchEnabled) === 1,
+    builderBaseLotsMin: Math.max(0, Number(cfg.builderBaseLotsMin) || 0),
+    builderBaseLotsMax: Math.max(0, Number(cfg.builderBaseLotsMax) || 0),
+    builderBaseRiskMin: Math.max(0, Number(cfg.builderBaseRiskMin) || 0),
+    builderBaseRiskMax: Math.max(0, Number(cfg.builderBaseRiskMax) || 0),
+    builderBaseLotsStep: Math.max(0.0001, Number(cfg.builderBaseLotsStep) || 0.01),
+    builderBaseRiskStep: Math.max(0.0001, Number(cfg.builderBaseRiskStep) || 0.01),
   };
 }
 
@@ -993,6 +1016,14 @@ function builderInputFields(cfg) {
     builderMinTrades: cfg?.builderMinTrades,
     builderMaxTrades: cfg?.builderMaxTrades,
     builderSequenceLimit: cfg?.builderSequenceLimit,
+    builderSizeRangeSearchEnabled: cfg?.builderSizeRangeSearchEnabled,
+    builderRiskRangeSearchEnabled: cfg?.builderRiskRangeSearchEnabled,
+    builderBaseLotsMin: cfg?.builderBaseLotsMin,
+    builderBaseLotsMax: cfg?.builderBaseLotsMax,
+    builderBaseRiskMin: cfg?.builderBaseRiskMin,
+    builderBaseRiskMax: cfg?.builderBaseRiskMax,
+    builderBaseLotsStep: cfg?.builderBaseLotsStep,
+    builderBaseRiskStep: cfg?.builderBaseRiskStep,
   };
 }
 
@@ -2070,7 +2101,335 @@ function calibrateBuilderRiskPlan(engineCfg, sequence, totalRiskAmount, useFno) 
   return best;
 }
 
-function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, targetWinRate = null) {
+
+const BUILDER_RANGE_SEARCH_LIMITS = {
+  // Full Cartesian grid is evaluated when it is this small. Above this size,
+  // Builder first scans a deterministic coarse grid, then refines around its
+  // best point using the user's exact step. This keeps the search practical
+  // without falling back to random parameter selection.
+  exactGridCombinations: 500,
+  coarsePointsPerDimension: 21,
+  fineRadiusSteps: 5,
+};
+
+function buildBuilderRangeValues(minValue, maxValue, fallbackValue, stepValue = 0.01, integer = false) {
+  const fallback = Math.max(integer ? 1 : 0.0001, Number(fallbackValue) || (integer ? 1 : 0.0001));
+  const lo = Math.max(integer ? 1 : 0.0001, Number(minValue) || fallback);
+  const hi = Math.max(lo, Number(maxValue) || fallback);
+  const rawStep = Math.max(0.0001, Number(stepValue) || (integer ? 1 : 0.01));
+  const step = integer ? Math.max(1, Math.round(rawStep)) : rawStep;
+
+  if (Math.abs(hi - lo) < 1e-12) return [integer ? Math.round(lo) : roundBuilderInput(lo, 6)];
+
+  const approxCount = Math.floor((hi - lo) / step) + 1;
+  // Keep the exact grid available even for fairly wide practical ranges.
+  // Extremely large grids are handled by deterministic coarse-to-fine search
+  // later, so we can still expose the user's exact min/max/step here.
+  const values = [];
+  for (let i = 0; i < approxCount; i++) {
+    const v = lo + i * step;
+    if (v > hi + step * 1e-9) break;
+    values.push(integer ? Math.round(v) : roundBuilderInput(v, 6));
+  }
+  const normalizedHi = integer ? Math.round(hi) : roundBuilderInput(hi, 6);
+  if (!values.length || Math.abs(values[values.length - 1] - normalizedHi) > Math.max(1e-9, step * 1e-9)) {
+    values.push(normalizedHi);
+  }
+
+  return [...new Set(values.map((v) => Number(v)))];
+}
+
+function resolveBuilderRangeConfig(engineCfg, rawCfg, useFno) {
+  const sourceSize = useFno
+    ? (engineCfg.fnoSegment === "intraday"
+      ? Math.max(1, Math.round(Number(engineCfg.fnoQuantity) || 1))
+      : Math.max(1, Math.round(Number(engineCfg.fnoLots) || 1)))
+    : Math.max(0.01, Number(engineCfg.baseLots) || 0.01);
+  const sourceRisk = Math.max(0.01, Number(engineCfg.riskPct) || 0.01);
+
+  const sizeEnabled = rawCfg.builderSizeRangeSearchEnabled === true || Number(rawCfg.builderSizeRangeSearchEnabled) === 1;
+  const riskEnabled = rawCfg.builderRiskRangeSearchEnabled === true || Number(rawCfg.builderRiskRangeSearchEnabled) === 1;
+
+  const sizeStep = useFno ? Math.max(1, Math.round(Number(rawCfg.builderBaseLotsStep) || 1)) : Math.max(0.0001, Number(rawCfg.builderBaseLotsStep) || 0.01);
+  const riskStep = Math.max(0.0001, Number(rawCfg.builderBaseRiskStep) || 0.01);
+
+  const sizeMin = Math.max(0.01, Number(rawCfg.builderBaseLotsMin) || sourceSize);
+  const sizeMax = Math.max(sizeMin, Number(rawCfg.builderBaseLotsMax) || sourceSize);
+  const riskMin = Math.max(0.01, Number(rawCfg.builderBaseRiskMin) || sourceRisk);
+  const riskMax = Math.max(riskMin, Number(rawCfg.builderBaseRiskMax) || sourceRisk);
+
+  const sizeValues = sizeEnabled
+    ? buildBuilderRangeValues(sizeMin, sizeMax, sourceSize, sizeStep, useFno)
+    : [useFno ? Math.max(1, Math.round(sourceSize)) : sourceSize];
+  const riskValues = riskEnabled
+    ? buildBuilderRangeValues(riskMin, riskMax, sourceRisk, riskStep, false)
+    : [sourceRisk];
+
+  return {
+    sizeEnabled,
+    riskEnabled,
+    sizeMin,
+    sizeMax,
+    riskMin,
+    riskMax,
+    sizeStep,
+    riskStep,
+    sourceSize,
+    sourceRisk,
+    sizeValues,
+    riskValues,
+  };
+}
+
+function pickCoarseRangeValues(values, maxPoints = BUILDER_RANGE_SEARCH_LIMITS.coarsePointsPerDimension) {
+  if (values.length <= maxPoints) return values.slice();
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < maxPoints; i++) {
+    const idx = Math.round((i * (values.length - 1)) / Math.max(1, maxPoints - 1));
+    if (seen.has(idx)) continue;
+    seen.add(idx);
+    out.push(values[idx]);
+  }
+  return out;
+}
+
+function rangeValueIndex(values, value) {
+  if (!values.length) return 0;
+  let bestIdx = 0;
+  let bestDist = Infinity;
+  for (let i = 0; i < values.length; i++) {
+    const d = Math.abs(Number(values[i]) - Number(value));
+    if (d < bestDist) {
+      bestDist = d;
+      bestIdx = i;
+    }
+  }
+  return bestIdx;
+}
+
+function buildFineRangeValues(values, centerValue, radius = BUILDER_RANGE_SEARCH_LIMITS.fineRadiusSteps) {
+  if (!values.length) return [];
+  const centerIdx = rangeValueIndex(values, centerValue);
+  const out = [];
+  const start = Math.max(0, centerIdx - radius);
+  const end = Math.min(values.length - 1, centerIdx + radius);
+  for (let i = start; i <= end; i++) out.push(values[i]);
+  return out;
+}
+
+function evaluateBuilderRangeParameterGrid(engineCfg, sequence, totalRiskAmount, useFno, targetWinRate, rrSeed, range, rawCfg, evaluatePair) {
+  const fullSizeValues = range.sizeEnabled ? range.sizeValues : [range.sourceSize];
+  const fullRiskValues = range.riskEnabled ? range.riskValues : [range.sourceRisk];
+  const fullCombinations = fullSizeValues.length * fullRiskValues.length;
+
+  const runGrid = (sizeValues, riskValues, bestSoFar = null) => {
+    let best = bestSoFar;
+    let count = 0;
+    for (const rawRiskPct of riskValues) {
+      for (const rawSize of sizeValues) {
+        let baseRiskPct = Number(rawRiskPct) || range.sourceRisk;
+        let baseSize = Number(rawSize) || range.sourceSize;
+
+        if (range.sizeEnabled && !range.riskEnabled) {
+          const scale = range.sourceSize > 0 ? baseSize / range.sourceSize : 1;
+          baseRiskPct = Math.max(0.01, roundBuilderInput(range.sourceRisk * scale, 6));
+        } else if (!range.sizeEnabled && range.riskEnabled) {
+          const scale = range.sourceRisk > 0 ? baseRiskPct / range.sourceRisk : 1;
+          baseSize = useFno
+            ? Math.max(1, Math.round(range.sourceSize * scale))
+            : Math.max(0.01, roundBuilderInput(range.sourceSize * scale, 6));
+        }
+
+        const candidate = evaluatePair(baseRiskPct, baseSize, rrSeed, count + 1);
+        count += 1;
+        if (!candidate) continue;
+        if (!best || compareBuilderCandidates(candidate, best) < 0) best = candidate;
+      }
+    }
+    return { best, count };
+  };
+
+  if (fullCombinations <= BUILDER_RANGE_SEARCH_LIMITS.exactGridCombinations) {
+    const exact = runGrid(fullSizeValues, fullRiskValues);
+    return { candidate: exact.best, evaluations: exact.count, mode: "exact-step", fullCombinations };
+  }
+
+  // Deterministic coarse pass over the full range.
+  const coarseSizes = range.sizeEnabled
+    ? pickCoarseRangeValues(fullSizeValues)
+    : [range.sourceSize];
+  const coarseRisks = range.riskEnabled
+    ? pickCoarseRangeValues(fullRiskValues)
+    : [range.sourceRisk];
+  const coarse = runGrid(coarseSizes, coarseRisks);
+
+  if (!coarse.best) {
+    return { candidate: null, evaluations: coarse.count, mode: "coarse-to-fine", fullCombinations };
+  }
+
+  // Refine locally using the exact user step around the best coarse point.
+  const fineSizes = range.sizeEnabled
+    ? buildFineRangeValues(fullSizeValues, coarse.best.autoBaseLots)
+    : [range.sourceSize];
+  const fineRisks = range.riskEnabled
+    ? buildFineRangeValues(fullRiskValues, coarse.best.autoBaseRiskPct)
+    : [range.sourceRisk];
+  const fine = runGrid(fineSizes, fineRisks, coarse.best);
+
+  return {
+    candidate: fine.best,
+    evaluations: coarse.count + fine.count,
+    mode: "coarse-to-fine",
+    fullCombinations,
+  };
+}
+
+function buildBuilderDirectConfig(engineCfg, baseRiskPct, baseSize, useFno) {
+  const next = {
+    ...engineCfg,
+    // Builder range search uses the user's entered absolute values directly;
+    // no source Base Risk/Base Lots scale factor is involved here.
+    riskPct: Math.max(0.01, roundBuilderInput(baseRiskPct, 4)),
+    baseLots: Math.max(0.01, roundBuilderInput(baseSize, 4)),
+  };
+
+  if (useFno) {
+    if (next.fnoSegment === "intraday") {
+      next.fnoQuantity = Math.max(1, Math.round(Number(baseSize) || 1));
+    } else {
+      next.fnoLots = Math.max(1, Math.round(Number(baseSize) || 1));
+    }
+  }
+
+  return next;
+}
+
+function finalizeBuilderSizeCandidate(engineCfg, sequence, totalRiskAmount, useFno, targetWinRate, rrSeed, scaledCfg, rangeEvaluations = 0) {
+  const initialCapital = Math.max(0, Number(engineCfg.initialCapital) || 0);
+  const n = sequence.length;
+  const wins = sequence.filter(Boolean).length;
+  const builderEngineCfg = { ...scaledCfg, _rrSeed: rrSeed };
+  const selected = useFno
+    ? simulateFromSequenceFnO(builderEngineCfg, sequence)
+    : simulateFromSequence(builderEngineCfg, sequence);
+  const allLossSequence = sequence.map(() => false);
+  const allLoss = useFno
+    ? simulateFromSequenceFnO(builderEngineCfg, allLossSequence)
+    : simulateFromSequence(builderEngineCfg, allLossSequence);
+
+  const selectedComplete = selected.trades.length === n && !selected.stopped;
+  const allLossComplete = allLoss.trades.length === n && !allLoss.stopped;
+  if (!selectedComplete || !allLossComplete) return null;
+
+  const allLossValue = Math.max(0, initialCapital - allLoss.finalCapital);
+  const selectedMaxDDValue = Math.max(0, Number(selected.maxDDValue) || 0);
+  const worstCaseLossValue = Math.max(allLossValue, selectedMaxDDValue);
+  const hardBudget = Math.max(0, totalRiskAmount) * (1 - 1e-9);
+  const epsilon = Math.max(1e-12, totalRiskAmount * 1e-12);
+  if (worstCaseLossValue > hardBudget + epsilon) return null;
+
+  const totalAllocatedRisk = selected.trades.reduce(
+    (sum, trade) => sum + Math.max(0, Number(trade.risk) || 0),
+    0
+  );
+  const actualWinRate = n > 0 ? (wins / n) * 100 : 0;
+  const sequenceText = sequence.map((x) => (x ? "W" : "L")).join("");
+  const wr = targetWinRate == null ? actualWinRate : targetWinRate;
+  const autoBaseLots = useFno
+    ? (scaledCfg.fnoSegment === "intraday"
+      ? Number(scaledCfg.fnoQuantity) || 0
+      : Number(scaledCfg.fnoLots) || 0)
+    : Number(scaledCfg.baseLots) || 0;
+
+  return {
+    key: `${wr}-${n}-${sequenceText}`,
+    tradeCount: n,
+    wins,
+    losses: n - wins,
+    actualWinRate,
+    sequence: sequenceText,
+    sequenceArray: sequence,
+    riskPlan: selected.trades.map((trade) => Math.max(0, Number(trade.risk) || 0)),
+    riskScale: null,
+    autoBaseRiskPct: Number(scaledCfg.riskPct) || 0,
+    autoBaseLots,
+    autoStrategyCfg: scaledCfg,
+    totalAllocatedRiskPct: initialCapital > 0 ? (totalAllocatedRisk / initialCapital) * 100 : 0,
+    totalAllocatedRiskAmount: totalAllocatedRisk,
+    worstCaseLossPct: initialCapital > 0 ? (worstCaseLossValue / initialCapital) * 100 : 0,
+    worstCaseLossValue,
+    allLossValue,
+    allLossPct: initialCapital > 0 ? (allLossValue / initialCapital) * 100 : 0,
+    selectedMaxDDValue,
+    result: selected,
+    finalCapital: selected.finalCapital,
+    netPL: selected.netPL,
+    returnPct: initialCapital > 0 ? (selected.netPL / initialCapital) * 100 : 0,
+    maxDD: selected.maxDD,
+    maxDDValue: selected.maxDDValue,
+    rangeEvaluations,
+  };
+}
+
+function evaluateBuilderSequenceInRange(engineCfg, sequence, totalRiskAmount, useFno, targetWinRate = null, rawCfg = {}) {
+  const range = resolveBuilderRangeConfig(engineCfg, rawCfg, useFno);
+  const rrSeed = hashStringToUint32(
+    `builder-rr|${targetWinRate ?? "actual"}|${sequence.length}|${sequence.map((x) => (x ? "W" : "L")).join("")}`
+  );
+
+  const evaluated = evaluateBuilderRangeParameterGrid(
+    engineCfg,
+    sequence,
+    totalRiskAmount,
+    useFno,
+    targetWinRate,
+    rrSeed,
+    range,
+    rawCfg,
+    (baseRiskPct, baseSize, currentRrSeed, evaluationIndex) => {
+      const scaledCfg = buildBuilderDirectConfig(engineCfg, baseRiskPct, baseSize, useFno);
+      return finalizeBuilderSizeCandidate(
+        engineCfg,
+        sequence,
+        totalRiskAmount,
+        useFno,
+        targetWinRate,
+        currentRrSeed,
+        scaledCfg,
+        evaluationIndex
+      );
+    }
+  );
+
+  if (!evaluated.candidate) return { candidate: null, evaluations: evaluated.evaluations, mode: evaluated.mode, fullCombinations: evaluated.fullCombinations };
+  return {
+    candidate: {
+      ...evaluated.candidate,
+      rangeSearchMode: evaluated.mode,
+      rangeGridCombinations: evaluated.fullCombinations,
+    },
+    evaluations: evaluated.evaluations,
+    mode: evaluated.mode,
+    fullCombinations: evaluated.fullCombinations,
+  };
+}
+
+function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, targetWinRate = null, rawCfg = {}) {
+  if (
+    rawCfg.builderSizeRangeSearchEnabled === true || Number(rawCfg.builderSizeRangeSearchEnabled) === 1 ||
+    rawCfg.builderRiskRangeSearchEnabled === true || Number(rawCfg.builderRiskRangeSearchEnabled) === 1
+  ) {
+    return evaluateBuilderSequenceInRange(
+      engineCfg,
+      sequence,
+      totalRiskAmount,
+      useFno,
+      targetWinRate,
+      rawCfg
+    ).candidate;
+  }
+
   const initialCapital = Math.max(0, Number(engineCfg.initialCapital) || 0);
   const n = sequence.length;
   const wins = sequence.filter(Boolean).length;
@@ -2284,18 +2643,46 @@ function runStrategyBuilder(rawCfg) {
     groups = sampled;
   }
 
+  const sizeRangeSearchEnabled = rawCfg.builderSizeRangeSearchEnabled === true || Number(rawCfg.builderSizeRangeSearchEnabled) === 1;
+  const riskRangeSearchEnabled = rawCfg.builderRiskRangeSearchEnabled === true || Number(rawCfg.builderRiskRangeSearchEnabled) === 1;
+  const rangeSearchEnabled = sizeRangeSearchEnabled || riskRangeSearchEnabled;
+  const rangeConfig = resolveBuilderRangeConfig(engineCfg, rawCfg, useFno);
+  const rangeCombinationsPerSequence = rangeSearchEnabled
+    ? rangeConfig.sizeValues.length * rangeConfig.riskValues.length
+    : 0;
+
   const points = [];
   let sequenceEvaluations = 0;
+  let rangeCombinationEvaluations = 0;
+  let rangeExactStepSequences = 0;
+  let rangeCoarseToFineSequences = 0;
 
   const evaluateCandidate = (group, sequence) => {
     if (sequenceEvaluations >= effectiveSequenceLimit) return false;
-    const candidate = evaluateBuilderSequence(
-      engineCfg,
-      sequence,
-      totalRiskAmount,
-      useFno,
-      group.targetWinRate
-    );
+    let candidate;
+    if (rangeSearchEnabled) {
+      const ranged = evaluateBuilderSequenceInRange(
+        engineCfg,
+        sequence,
+        totalRiskAmount,
+        useFno,
+        group.targetWinRate,
+        rawCfg
+      );
+      candidate = ranged.candidate;
+      rangeCombinationEvaluations += ranged.evaluations;
+      if (ranged.mode === "exact-step") rangeExactStepSequences += 1;
+      if (ranged.mode === "coarse-to-fine") rangeCoarseToFineSequences += 1;
+    } else {
+      candidate = evaluateBuilderSequence(
+        engineCfg,
+        sequence,
+        totalRiskAmount,
+        useFno,
+        group.targetWinRate,
+        rawCfg
+      );
+    }
     sequenceEvaluations += 1;
     if (!candidate) return true;
     return candidate;
@@ -2429,6 +2816,20 @@ function runStrategyBuilder(rawCfg) {
     rrMode: engineCfg.rrMode,
     rrMin: engineCfg.rrMin,
     rrMax: engineCfg.rrMax,
+    rangeSearchEnabled,
+    sizeRangeSearchEnabled,
+    riskRangeSearchEnabled,
+    rangeSizeMin: rangeSearchEnabled ? rangeConfig.sizeMin : null,
+    rangeSizeMax: rangeSearchEnabled ? rangeConfig.sizeMax : null,
+    rangeRiskMin: rangeSearchEnabled ? rangeConfig.riskMin : null,
+    rangeRiskMax: rangeSearchEnabled ? rangeConfig.riskMax : null,
+    rangeSizePoints: sizeRangeSearchEnabled ? rangeConfig.sizeValues.length : 0,
+    rangeRiskPoints: riskRangeSearchEnabled ? rangeConfig.riskValues.length : 0,
+    rangeCombinationsPerSequence,
+    rangeCombinationEvaluations,
+    rangeExactStepSequences,
+    rangeCoarseToFineSequences,
+    rangeGridCap: BUILDER_RANGE_SEARCH_LIMITS.exactGridCombinations,
     strategyCfg: engineCfg,
     points,
     validCount: points.filter((p) => p.candidate).length,
@@ -2504,6 +2905,120 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
             </div>
           );
         })()}
+      </div>
+
+      <div className="mb-5">
+        <GroupTitle icon={SlidersHorizontal} color="indigo">Builder Range Search</GroupTitle>
+
+        <button
+          type="button"
+          onClick={() => onChange("builderSizeRangeSearchEnabled")({ target: { value: cfg.builderSizeRangeSearchEnabled ? "0" : "1" } })}
+          className={`w-full flex items-center justify-between rounded-lg border px-3 py-2.5 text-xs transition-colors ${
+            cfg.builderSizeRangeSearchEnabled
+              ? "border-indigo-400/30 bg-indigo-500/10 text-indigo-300"
+              : "border-zinc-800 bg-zinc-900/40 text-zinc-500"
+          }`}
+        >
+          <span className="font-medium">Search Base Lots / Units range</span>
+          <span className={`font-mono text-[10px] ${cfg.builderSizeRangeSearchEnabled ? "text-indigo-300" : "text-zinc-600"}`}>
+            {cfg.builderSizeRangeSearchEnabled ? "ON" : "OFF"}
+          </span>
+        </button>
+
+        {cfg.builderSizeRangeSearchEnabled && (
+          <div className="mt-2.5 rounded-lg border border-indigo-500/20 bg-indigo-500/[0.04] p-3">
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label={isFno ? "Base Lots / Units Min" : "Base Lots Min"}>
+                <NumInput
+                  value={cfg.builderBaseLotsMin}
+                  onChange={onChange("builderBaseLotsMin")}
+                  step="0.01"
+                  min="0"
+                  color="indigo"
+                />
+              </Field>
+              <Field label={isFno ? "Base Lots / Units Max" : "Base Lots Max"}>
+                <NumInput
+                  value={cfg.builderBaseLotsMax}
+                  onChange={onChange("builderBaseLotsMax")}
+                  step="0.01"
+                  min="0"
+                  color="indigo"
+                />
+              </Field>
+              <Field label={isFno ? "Lot / Unit Step" : "Base Lots Step"}>
+                <NumInput
+                  value={cfg.builderBaseLotsStep}
+                  onChange={onChange("builderBaseLotsStep")}
+                  step={isFno ? "1" : "0.01"}
+                  min="0.0001"
+                  color="indigo"
+                />
+              </Field>
+            </div>
+            <div className="mt-2 text-[9px] leading-relaxed text-zinc-600">
+              Enter Min/Max/Step for this dimension. If the full grid is large, Builder uses deterministic coarse-to-fine refinement around the best point.
+            </div>
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={() => onChange("builderRiskRangeSearchEnabled")({ target: { value: cfg.builderRiskRangeSearchEnabled ? "0" : "1" } })}
+          className={`w-full flex items-center justify-between rounded-lg border px-3 py-2.5 text-xs transition-colors mt-2.5 ${
+            cfg.builderRiskRangeSearchEnabled
+              ? "border-teal-400/30 bg-teal-500/10 text-teal-300"
+              : "border-zinc-800 bg-zinc-900/40 text-zinc-500"
+          }`}
+        >
+          <span className="font-medium">Search Base Risk % range</span>
+          <span className={`font-mono text-[10px] ${cfg.builderRiskRangeSearchEnabled ? "text-teal-300" : "text-zinc-600"}`}>
+            {cfg.builderRiskRangeSearchEnabled ? "ON" : "OFF"}
+          </span>
+        </button>
+
+        {cfg.builderRiskRangeSearchEnabled && (
+          <div className="mt-2.5 rounded-lg border border-teal-500/20 bg-teal-500/[0.04] p-3">
+            <div className="grid grid-cols-2 gap-2.5">
+              <Field label="Base Risk % Min">
+                <NumInput
+                  value={cfg.builderBaseRiskMin}
+                  onChange={onChange("builderBaseRiskMin")}
+                  step="0.01"
+                  min="0"
+                  color="teal"
+                />
+              </Field>
+              <Field label="Base Risk % Max">
+                <NumInput
+                  value={cfg.builderBaseRiskMax}
+                  onChange={onChange("builderBaseRiskMax")}
+                  step="0.01"
+                  min="0"
+                  color="teal"
+                />
+              </Field>
+              <Field label="Base Risk % Step">
+                <NumInput
+                  value={cfg.builderBaseRiskStep}
+                  onChange={onChange("builderBaseRiskStep")}
+                  step="0.01"
+                  min="0.0001"
+                  color="teal"
+                />
+              </Field>
+            </div>
+            <div className="mt-2 text-[9px] leading-relaxed text-zinc-600">
+              Enter Min/Max/Step for this dimension. If the full grid is large, Builder uses deterministic coarse-to-fine refinement around the best point.
+            </div>
+          </div>
+        )}
+
+        {(cfg.builderSizeRangeSearchEnabled || cfg.builderRiskRangeSearchEnabled) && (
+          <div className="mt-2 text-[9px] leading-relaxed text-zinc-600">
+            Both ON = independent Base Lots × Base Risk grid. One ON = the enabled dimension is searched while the other follows the existing proportional Builder calibration.
+          </div>
+        )}
       </div>
 
       <div className="mb-5">
@@ -2760,7 +3275,9 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
             {builder.baseMode === "fno" ? "Day / F&amp;O" : "Single Run"} configuration · {fmtMoney(builder.totalRiskAmount)} total risk budget · {builder.minTrades}–{builder.maxTrades} trades
           </div>
           <div className="text-[10px] text-zinc-600 mt-1">
-            {builder.searchMode === "exact"
+            {builder.rangeSearchEnabled
+              ? `${builder.sizeRangeSearchEnabled && builder.riskRangeSearchEnabled ? "Range size + risk search" : builder.sizeRangeSearchEnabled ? "Range size search" : "Range risk search"} · ${builder.rangeCombinationEvaluations.toLocaleString("en-IN")} combinations across ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} scenarios`
+              : builder.searchMode === "exact"
               ? `Exact sequence search · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} sequences evaluated`
               : builder.searchMode === "limited"
               ? `Limited sequence search · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} of ${builder.totalSequenceCount?.toLocaleString("en-IN") || "—"} sequences evaluated`
@@ -2771,7 +3288,9 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           {builder.rrMode === "range"
             ? `RR ${Number(builder.rrMin || 0).toFixed(2)}–${Number(builder.rrMax || 0).toFixed(2)}`
             : `RR ${Number(builder.rr || 0).toFixed(2)}`} · {builder.exactWinRateCount} WR points · {
-              builder.searchMode === "exact"
+              builder.rangeSearchEnabled
+                ? (builder.sizeRangeSearchEnabled && builder.riskRangeSearchEnabled ? "Range size + risk" : builder.sizeRangeSearchEnabled ? "Range size" : "Range risk")
+                : builder.searchMode === "exact"
                 ? "Exact search"
                 : builder.searchMode === "limited"
                 ? "User-limited search"
@@ -3507,6 +4026,12 @@ export default function RiskSimulator() {
         BUILDER_SAFE_LIMITS.maxSequenceEvaluations,
         Math.max(1, Math.round(Number(cfg.builderSequenceLimit) || BUILDER_SAFE_LIMITS.maxSequenceEvaluations))
       ),
+      builderSizeRangeSearchEnabled: cfg.builderSizeRangeSearchEnabled === true || Number(cfg.builderSizeRangeSearchEnabled) === 1,
+      builderRiskRangeSearchEnabled: cfg.builderRiskRangeSearchEnabled === true || Number(cfg.builderRiskRangeSearchEnabled) === 1,
+      builderBaseLotsMin: Math.max(0, Number(cfg.builderBaseLotsMin) || 0),
+      builderBaseLotsMax: Math.max(0, Number(cfg.builderBaseLotsMax) || 0),
+      builderBaseRiskMin: Math.max(0, Number(cfg.builderBaseRiskMin) || 0),
+      builderBaseRiskMax: Math.max(0, Number(cfg.builderBaseRiskMax) || 0),
       builderBaseMode: strategyBaseMode,
     };
     if (normalized.builderMaxTrades < normalized.builderMinTrades) {
