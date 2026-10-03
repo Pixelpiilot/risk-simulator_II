@@ -33,7 +33,7 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2.5,
+  rr: 2,
   // Reward:Risk model: "fixed" preserves the existing behavior; "range"
   // samples a bounded, center-weighted RR independently for each trade.
   rrMode: "fixed",
@@ -42,12 +42,12 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2600,
+  currentPrice: 2650,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
   cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 65,
+  winRiskPct: 70,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
   perTradeCapPct: 70,
@@ -65,9 +65,9 @@ const DEFAULTS = {
   tickValue: 0.1,
   entrySpread: 0,
   exitSpread: 0.2,
-  winRate: 40,
+  winRate: 50,
   numTrades: 10,
-  sweepStep: 5,
+  sweepStep: 10,
   sweepRuns: 100,
   batchCount: "",
   // --- Day / F&O mode (Indian market) ---
@@ -2320,6 +2320,12 @@ function evaluateBuilderTargetSequence(engineCfg, sequence, totalRiskAmount, use
   const hardBudget = Math.max(0, totalRiskAmount) * (1 - 1e-9);
   if (worstCaseLossValue > hardBudget) return null;
 
+  const allWinSequence = sequence.map(() => true);
+  const allWin = useFno
+    ? simulateFromSequenceFnO(scaledCfg, allWinSequence)
+    : simulateFromSequence(scaledCfg, allWinSequence);
+  const allWinValue = allWin.finalCapital - initialCapital;
+
   const actualWinRate = n > 0 ? (wins / n) * 100 : 0;
   const sequenceText = sequence.map((x) => (x ? "W" : "L")).join("");
   const wr = targetWinRate == null ? actualWinRate : targetWinRate;
@@ -2356,6 +2362,7 @@ function evaluateBuilderTargetSequence(engineCfg, sequence, totalRiskAmount, use
     worstCaseLossValue,
     allLossValue: calibrated.metric.allLossValue,
     allLossPct: initialCapital > 0 ? (calibrated.metric.allLossValue / initialCapital) * 100 : 0,
+    allWinValue,
     selectedMaxDDValue: calibrated.metric.selectedMaxDDValue,
     result,
     finalCapital: result.finalCapital,
@@ -2401,6 +2408,12 @@ function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, t
 
   if (worstCaseLossValue > hardBudget) return null;
 
+  const allWinSequence = sequence.map(() => true);
+  const allWin = useFno
+    ? simulateFromSequenceFnO(scaledCfg, allWinSequence)
+    : simulateFromSequence(scaledCfg, allWinSequence);
+  const allWinValue = allWin.finalCapital - initialCapital;
+
   const actualWinRate = n > 0 ? (wins / n) * 100 : 0;
   const sequenceText = sequence.map((x) => (x ? "W" : "L")).join("");
   const wr = targetWinRate == null ? actualWinRate : targetWinRate;
@@ -2433,6 +2446,7 @@ function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, t
     worstCaseLossValue,
     allLossValue: calibrated.metric.allLossValue,
     allLossPct: initialCapital > 0 ? (calibrated.metric.allLossValue / initialCapital) * 100 : 0,
+    allWinValue,
     selectedMaxDDValue: calibrated.metric.selectedMaxDDValue,
     result,
     finalCapital: result.finalCapital,
@@ -2868,7 +2882,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
           return (
             <div className="mt-2.5 rounded-lg border border-blue-500/20 bg-blue-500/[0.04] px-3 py-2.5">
               <div className="flex items-center justify-between gap-3 mb-2">
-                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Sequence Evaluations</div>
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Evaluations</div>
                 <div className="text-[10px] font-mono text-zinc-400">Total possible: {totalLabel}</div>
               </div>
               <NumInput
@@ -2883,7 +2897,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                 color="blue"
               />
               <div className="mt-1 text-[9px] leading-relaxed text-zinc-600">
-                Default = run all possible sequences up to {totalCap.toLocaleString("en-IN")}. You can lower the evaluation count manually.
+                Default: up to {totalCap.toLocaleString("en-IN")} sequences. Lower manually.
               </div>
             </div>
           );
@@ -2982,9 +2996,9 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
         <div className="text-[10px] uppercase tracking-wider text-amber-300/80 font-semibold">Active Configuration</div>
         <div className="text-[10px] leading-relaxed text-zinc-500 mt-1.5">
           {isTargetMode
-            ? `Target mode derives Auto Base Risk ${targetInputMode === "targetPoints" ? "from Target Points" : "from Risk Points"} and calculates Base ${isFno ? "Unit" : "Lots"} from the configured RR while enforcing the Builder downside cap.`
-            : `Builder uses the current ${isFno ? "Day / F&amp;O" : "Single Run"} configuration for RR, risk allocation, costs and safety stops, while auto-scaling Base Risk and size to the Builder downside cap.`}
-          {strategyCfg.rrMode === "range" ? " Range mode uses a deterministic midpoint RR for Target mode." : ""}
+            ? `Target: ${targetInputMode === "targetPoints" ? "Target" : "Risk"} Points → Auto Risk/Lots at RR.`
+            : `Uses current ${isFno ? "F&amp;O" : "Single Run"} settings; auto-sizes to the risk budget.`}
+          {strategyCfg.rrMode === "range" ? " RR Range uses midpoint RR." : ""}
         </div>
       </div>
     </div>
@@ -3078,7 +3092,8 @@ function BuilderScenarioTooltip({ active, payload, label }) {
   const returnPct = Number(item.returnPct) || 0;
   const tradeCount = Number(item.tradeCount) || 0;
   const allocatedRiskPct = Number(item.totalAllocatedRiskPct) || 0;
-  const allLossPct = Number(item.allLossPct ?? item.worstCaseLossPct) || 0;
+  const allLossValue = Number(item.allLossValue) || 0;
+  const allWinValue = Number(item.allWinValue) || 0;
   const maxDD = Number(item.maxDD) || 0;
 
   return (
@@ -3091,7 +3106,7 @@ function BuilderScenarioTooltip({ active, payload, label }) {
         Net Return: {returnPct >= 0 ? "+" : ""}{returnPct.toFixed(2)}
       </div>
       <div className="text-[10px] text-zinc-500 mt-1">
-        Trades {tradeCount} · Risk {allocatedRiskPct.toFixed(2)} · All-Loss {allLossPct.toFixed(2)} · Max DD {maxDD.toFixed(2)}
+        Trades {tradeCount} · Risk {allocatedRiskPct.toFixed(2)} · All-Win {fmtMoney(allWinValue)} · All-Loss {fmtMoney(-Math.abs(allLossValue))} · Max DD {maxDD.toFixed(2)}
       </div>
     </div>
   );
@@ -3130,6 +3145,8 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
     sequence: c.sequence || "",
     tradeCount: Number(c.tradeCount) || 0,
     totalAllocatedRiskPct: Number(c.totalAllocatedRiskPct) || 0,
+    allWinValue: Number(c.allWinValue) || 0,
+    allLossValue: Number(c.allLossValue) || 0,
     allLossPct: Number(c.allLossPct ?? c.worstCaseLossPct) || 0,
     maxDD: Number(c.maxDD) || 0,
     candidate: c,
