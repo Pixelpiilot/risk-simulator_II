@@ -33,7 +33,7 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2,
+  rr: 2.5,
   // Reward:Risk model: "fixed" preserves the existing behavior; "range"
   // samples a bounded, center-weighted RR independently for each trade.
   rrMode: "fixed",
@@ -42,13 +42,13 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2650,
+  currentPrice: 2600,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
   cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 70,
-  lossRiskPct: 20,
+  winRiskPct: 65,
+  lossRiskPct: 18,
   lossRiskAdjustPct: -1,
   perTradeCapPct: 70,
   overallCapPct: 30,
@@ -67,8 +67,8 @@ const DEFAULTS = {
   exitSpread: 0.2,
   winRate: 40,
   numTrades: 10,
-  sweepStep: 10,
-  sweepRuns: 500,
+  sweepStep: 5,
+  sweepRuns: 100,
   batchCount: "",
   // --- Day / F&O mode (Indian market) ---
   // Segment decides the sizing unit + statutory-charge rates: "intraday" (cash
@@ -2605,6 +2605,21 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
   );
 }
 
+
+function TradeResultBadge({ win }) {
+  return (
+    <span
+      className={`inline-flex min-w-[42px] h-5 items-center justify-center rounded-[4px] border px-1.5 text-[9px] font-semibold leading-none select-none transition ${
+        win
+          ? "bg-[#7CCF35]/12 border-[#7CCF35]/35 text-[#7CCF35]"
+          : "bg-[#FF2056]/10 border-[#FF2056]/35 text-[#FF2056]"
+      }`}
+    >
+      {win ? "WIN" : "LOSS"}
+    </span>
+  );
+}
+
 function CombinationBadge({ sequence, compact = false, draggable = false, onMove = null }) {
   const [dragIdx, setDragIdx] = useState(null);
   const [dragOverIdx, setDragOverIdx] = useState(null);
@@ -3069,8 +3084,8 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                 >
                   <td className="px-3 py-1.5 text-zinc-600"><GripVertical size={13} /></td>
                   <td className="px-3 py-1.5 text-zinc-500">{t.n}</td>
-                  <td className={`px-3 py-1.5 border-l-2 ${t.win ? "border-emerald-400 text-emerald-400" : "border-red-400 text-red-400"}`}>
-                    {t.win ? "WIN" : "LOSS"}
+                  <td className="px-3 py-1.5">
+                    <TradeResultBadge win={t.win} />
                   </td>
                   <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)} {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}</td>
                   <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
@@ -4709,11 +4724,9 @@ export default function RiskSimulator() {
                             <td
                               onClick={() => toggleTradeResult(idx)}
                               title="Click to flip this trade's result"
-                              className={`px-3 py-1.5 border-l-2 cursor-pointer select-none hover:brightness-125 transition ${
-                                t.win ? "border-emerald-400 text-emerald-400" : "border-red-400 text-red-400"
-                              }`}
+                              className="px-3 py-1.5 cursor-pointer select-none hover:brightness-125 transition"
                             >
-                              {t.win ? "WIN" : "LOSS"}
+                              <TradeResultBadge win={t.win} />
                             </td>
                             <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)} {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300" title="Risk Allocation Reset">RESET</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
@@ -4965,11 +4978,9 @@ export default function RiskSimulator() {
                             <td
                               onClick={() => toggleTradeResult(idx)}
                               title="Click to flip this trade's result"
-                              className={`px-3 py-1.5 border-l-2 cursor-pointer select-none hover:brightness-125 transition ${
-                                t.win ? "border-emerald-400 text-emerald-400" : "border-red-400 text-red-400"
-                              }`}
+                              className="px-3 py-1.5 cursor-pointer select-none hover:brightness-125 transition"
                             >
-                              {t.win ? "WIN" : "LOSS"}
+                              <TradeResultBadge win={t.win} />
                             </td>
                             <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
