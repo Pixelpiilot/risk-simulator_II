@@ -33,7 +33,7 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2,
+  rr: 2.5,
   // Reward:Risk model: "fixed" preserves the existing behavior; "range"
   // samples a bounded, center-weighted RR independently for each trade.
   rrMode: "fixed",
@@ -42,12 +42,12 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2650,
+  currentPrice: 2600,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
   cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 70,
+  winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
   perTradeCapPct: 70,
@@ -65,9 +65,9 @@ const DEFAULTS = {
   tickValue: 0.1,
   entrySpread: 0,
   exitSpread: 0.2,
-  winRate: 50,
+  winRate: 40,
   numTrades: 10,
-  sweepStep: 10,
+  sweepStep: 5,
   sweepRuns: 100,
   batchCount: "",
   // --- Day / F&O mode (Indian market) ---
@@ -128,6 +128,22 @@ const DEFAULTS = {
   builderMode: "normal",
   builderTargetInputMode: "targetPoints", // "targetPoints" | "riskPoints"
   builderTargetValue: 0,
+
+  // --- Averaging / Pyramiding (Scale-In Lab) ---
+  // Execution overlay on the SAME core engine. Averaging runs only on LOSS
+  // trades; pyramiding runs only on WIN trades.
+  averagingEnabled: false,
+  averagingMaxAdds: 2,
+  averagingSpacingMode: "points",
+  averagingSpacing: 1,
+  averagingSizeMode: "lots",
+  averagingSize: 0.1,
+  pyramidingEnabled: false,
+  pyramidingMaxAdds: 2,
+  pyramidingSpacingMode: "points",
+  pyramidingSpacing: 1,
+  pyramidingSizeMode: "lots",
+  pyramidingSize: 0.1,
 };
 
 // ---- Broker + segment statutory charge rates (as % — divide by 100 to use) ----
@@ -228,6 +244,20 @@ function computeFnoBrokerage(broker, segment, buyValue, sellValue, cfg) {
 // GST is charged only on Brokerage + Exchange/SEBI/IPFT — by law, GST does
 // NOT apply to STT or Stamp Duty (they're government taxes, not a taxable
 // broker service), so those two are excluded from the GST base.
+function computeFnoBrokerageOneLeg(broker, sideValue, cfg) {
+  const value = Math.max(0, Number(sideValue) || 0);
+  if (broker === "custom") {
+    return cfg.fnoFeeMode === "turnover" ? value * (Number(cfg.fnoFeeTurnoverPct) || 0) / 100 : 0;
+  }
+  const type = cfg.fnoBrokerageType;
+  const ratePct = Number(cfg.fnoBrokerageRatePct) || 0;
+  if (type === "turnover") return value * (ratePct / 100);
+  if (type === "flat") return Number(cfg.fnoBrokerageFlatPerOrder) || 0;
+  const min = Number(cfg.fnoBrokerageMin) || 0;
+  const max = Number(cfg.fnoBrokerageMax) || Infinity;
+  return clampVal(value * (ratePct / 100), min, max);
+}
+
 function computeFnoOtherAndGst(segment, buyValue, sellValue, brokerageFee, otherChargesPct, gstPct) {
   const rates = FNO_STATUTORY_RATES[segment] || FNO_STATUTORY_RATES.intraday;
   const defaultTotalPct = combinedStatutoryPct(segment);
@@ -294,6 +324,149 @@ function getSimulationRng(cfg) {
     : Math.random;
 }
 
+
+function normalizeScaleInConfig(cfg) {
+  const normalizeSide = (prefix) => ({
+    enabled: cfg?.[`${prefix}Enabled`] === true,
+    maxAdds: Math.min(20, Math.max(0, Math.round(Number(cfg?.[`${prefix}MaxAdds`]) || 0))),
+    spacingMode: cfg?.[`${prefix}SpacingMode`] === "percent" ? "percent" : "points",
+    spacing: Math.max(0, Number(cfg?.[`${prefix}Spacing`]) || 0),
+    sizeMode: cfg?.[`${prefix}SizeMode`] === "risk" ? "risk" : "lots",
+    size: Math.max(0, Number(cfg?.[`${prefix}Size`]) || 0),
+  });
+  return { averaging: normalizeSide("averaging"), pyramiding: normalizeSide("pyramiding") };
+}
+
+// Deterministic scale-in overlay: the core model still creates the original
+// 1R/target path and final exit. Extra entries are only placed at trigger
+// levels actually crossed by that path. Risk sizing maps back to the same
+// base risk unit; F&O keeps its whole-unit/lot rules.
+function buildScaleInEntries({
+  cfg,
+  isFno,
+  isWin,
+  initialMarketPrice,
+  trueExitPrice,
+  baseQty,
+  baseDisplayUnits,
+  baseRiskAmount,
+  lotSize = 1,
+  leverageFactor = 1,
+  currentCapital,
+}) {
+  const scale = normalizeScaleInConfig(cfg);
+  const plan = isWin ? scale.pyramiding : scale.averaging;
+  const scaleType = isWin ? "PYRAMIDING" : "AVERAGING";
+  const safeBaseQty = Math.max(0, Number(baseQty) || 0);
+  const safeBaseUnits = Math.max(0, Number(baseDisplayUnits) || 0);
+  const stopDistance = baseRiskAmount / Math.max(1e-12, safeBaseQty);
+  const stopPrice = initialMarketPrice - stopDistance; // core engine is long-only
+  const makeBase = () => ({
+    marketPrice: initialMarketPrice,
+    qty: safeBaseQty,
+    displayUnits: safeBaseUnits,
+    scaleType: "BASE",
+  });
+  const baseEntry = makeBase();
+  const baseOnly = (skippedAdds = 0) => ({
+    entries: [baseEntry],
+    totalQty: baseEntry.qty,
+    totalDisplayUnits: baseEntry.displayUnits,
+    positionRisk: baseEntry.qty * Math.max(0, baseEntry.marketPrice - stopPrice),
+    averageEntryPrice: baseEntry.marketPrice,
+    scaleType: "BASE",
+    scaleAdds: 0,
+    skippedAdds,
+    stopPrice,
+  });
+
+  if (!plan.enabled || plan.maxAdds <= 0 || plan.size <= 0 || !(safeBaseQty > 0)) return baseOnly();
+  const pathDistance = Math.abs(trueExitPrice - initialMarketPrice);
+  const spacing = plan.spacingMode === "percent"
+    ? Math.abs(initialMarketPrice) * (plan.spacing / 100)
+    : plan.spacing;
+  if (!(spacing > 0) || !(pathDistance > spacing + 1e-12)) return baseOnly(plan.maxAdds);
+
+  const direction = isWin ? 1 : -1;
+  const riskCap = Math.max(0, Number(currentCapital) || 0) * (Math.max(0, Number(cfg.perTradeCapPct) || 100) / 100);
+  const maxTriggeredAdds = Math.min(plan.maxAdds, Math.max(0, Math.floor((pathDistance - 1e-9) / spacing)));
+  const entries = [baseEntry];
+  let totalQty = baseEntry.qty;
+  let totalDisplayUnits = baseEntry.displayUnits;
+  let acceptedAdds = 0;
+  let skippedAdds = 0;
+
+  const positionRiskFor = (items) => items.reduce(
+    (sum, entry) => sum + entry.qty * Math.max(0, entry.marketPrice - stopPrice),
+    0
+  );
+
+  for (let k = 1; k <= maxTriggeredAdds; k++) {
+    const triggerPrice = initialMarketPrice + direction * spacing * k;
+    if ((isWin && triggerPrice >= trueExitPrice - 1e-9) || (!isWin && triggerPrice <= trueExitPrice + 1e-9)) {
+      skippedAdds += 1;
+      continue;
+    }
+
+    let addDisplayUnits = 0;
+    let addQty = 0;
+    if (plan.sizeMode === "risk") {
+      // Risk-based sizing is tied to the ACTUAL common-stop risk of the
+      // addition at its trigger price. This means averaging can legitimately
+      // add more units at a lower price, while pyramiding adds fewer units as
+      // the entry gets farther from the same stop. That is more practical than
+      // using one fixed base-unit conversion for every scale-in level.
+      const entryRiskPerQty = Math.max(1e-12, triggerPrice - stopPrice);
+      const unitRiskBasis = isFno
+        ? entryRiskPerQty * Math.max(1, Number(lotSize) || 1) * Math.max(1, Number(leverageFactor) || 1)
+        : entryRiskPerQty;
+      if (!(unitRiskBasis > 0)) { skippedAdds += 1; continue; }
+      const rawUnits = plan.size / unitRiskBasis;
+      if (isFno) {
+        const units = Math.max(1, Math.round(rawUnits));
+        addDisplayUnits = units;
+        addQty = units * Math.max(1, Number(lotSize) || 1) * Math.max(1, Number(leverageFactor) || 1);
+      } else {
+        addDisplayUnits = Math.max(0.0000001, rawUnits);
+        addQty = addDisplayUnits;
+      }
+    } else {
+      if (isFno) {
+        const units = Math.max(1, Math.round(plan.size));
+        addDisplayUnits = units;
+        addQty = units * Math.max(1, Number(lotSize) || 1) * Math.max(1, Number(leverageFactor) || 1);
+      } else {
+        addDisplayUnits = Math.max(0.0000001, plan.size);
+        addQty = addDisplayUnits;
+      }
+    }
+
+    if (!(addQty > 0)) { skippedAdds += 1; continue; }
+    const addEntry = { marketPrice: triggerPrice, qty: addQty, displayUnits: addDisplayUnits, scaleType };
+    const proposed = [...entries, addEntry];
+    if (riskCap > 0 && positionRiskFor(proposed) > riskCap + 1e-9) {
+      skippedAdds += 1;
+      break;
+    }
+    entries.push(addEntry);
+    totalQty += addQty;
+    totalDisplayUnits += addDisplayUnits;
+    acceptedAdds += 1;
+  }
+
+  const weightedNotional = entries.reduce((sum, e) => sum + e.marketPrice * e.qty, 0);
+  return {
+    entries,
+    totalQty,
+    totalDisplayUnits,
+    positionRisk: positionRiskFor(entries),
+    averageEntryPrice: totalQty > 0 ? weightedNotional / totalQty : initialMarketPrice,
+    scaleType: acceptedAdds > 0 ? scaleType : "BASE",
+    scaleAdds: acceptedAdds,
+    skippedAdds,
+    stopPrice,
+  };
+}
 
 function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   const BASE_RISK_AMT = cfg.initialCapital * (cfg.riskPct / 100);
@@ -400,31 +573,56 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     const isWin = !!winLossSeq[i - 1];
     // Draw one RR realization per trade in Range mode. Losses remain -1R.
     const tradeRR = sampleTradeRR(cfg, rrRng);
-    const grossPL = isWin ? riskAmt * tradeRR : -riskAmt;
+    const coreGrossPL = isWin ? riskAmt * tradeRR : -riskAmt;
 
-    
-    const priceChange = lots !== 0 ? grossPL / lots : 0;
+    const priceChange = lots !== 0 ? coreGrossPL / lots : 0;
     const trueExitPrice = price + priceChange; // clean market move, no spread
     const exitPrice = trueExitPrice - (cfg.exitSpread || 0);
 
-    
-    let fee;
+    const scaled = buildScaleInEntries({
+      cfg,
+      isFno: false,
+      isWin,
+      initialMarketPrice: price,
+      trueExitPrice,
+      baseQty: lots,
+      baseDisplayUnits: lots,
+      baseRiskAmount: riskAmt,
+      currentCapital: capital,
+    });
+
+    // The core price path remains unchanged. Scaling only changes how much
+    // quantity participated at each crossed trigger, so gross P/L is rebuilt
+    // from the actual entry ladder at the same core exit.
+    const grossPL = scaled.entries.reduce(
+      (sum, entry) => sum + entry.qty * (trueExitPrice - entry.marketPrice),
+      0
+    );
+
+    let fee = 0;
     if (isTurnoverFee) {
-      const entryFee = entryPrice * lots * (cfg.entryFeeTurnoverPct / 100);
-      const exitFee = exitPrice * lots * (cfg.exitFeeTurnoverPct / 100);
-      fee = entryFee + exitFee;
+      for (const entry of scaled.entries) {
+        const execEntry = entry.marketPrice + (cfg.entrySpread || 0);
+        fee += execEntry * entry.qty * (cfg.entryFeeTurnoverPct / 100);
+      }
+      fee += exitPrice * scaled.totalQty * (cfg.exitFeeTurnoverPct / 100);
     } else {
-      fee = lots * feePerLotEntry + lots * feePerLotExit;
+      fee = scaled.totalDisplayUnits * feePerLotEntry + scaled.totalDisplayUnits * feePerLotExit;
     }
 
-    
-    const slip =
-      cfg.slipMode === "ticks"
-        ? lots * cfg.slipTicks * cfg.tickValue
-        : lots * entryPrice * (cfg.slipPct / 100);
-   
+    let slip = 0;
+    for (const entry of scaled.entries) {
+      const execEntry = entry.marketPrice + (cfg.entrySpread || 0);
+      slip += cfg.slipMode === "ticks"
+        ? entry.qty * cfg.slipTicks * cfg.tickValue
+        : entry.qty * execEntry * (cfg.slipPct / 100);
+    }
 
-    const spreadCost = lots * ((cfg.entrySpread || 0) + (cfg.exitSpread || 0));
+    const entrySpreadCost = scaled.entries.reduce(
+      (sum, entry) => sum + entry.qty * (cfg.entrySpread || 0),
+      0
+    );
+    const spreadCost = entrySpreadCost + scaled.totalQty * (cfg.exitSpread || 0);
     const netPL = grossPL - fee - slip - spreadCost;
     capital += netPL;
 
@@ -435,11 +633,18 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       win: isWin,
       rr: isWin ? tradeRR : -1,
       risk: riskAmt,
+      positionRisk: scaled.positionRisk,
       riskAllocationReset: allocationReset.resetApplied,
-      lots,
+      lots: scaled.totalDisplayUnits,
+      scaleType: scaled.scaleType,
+      scaleAdds: scaled.scaleAdds,
+      skippedScaleAdds: scaled.skippedAdds,
+      averageEntryPrice: scaled.averageEntryPrice,
+      baseLots: lots,
       entryPrice,
       price: exitPrice,
       grossPL,
+      coreGrossPL,
       fee,
       slip,
       spreadCost,
@@ -668,38 +873,73 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     const entryPrice = price + (cfg.fnoEntrySpread || 0);
     const isWin = !!winLossSeq[i - 1];
     const tradeRR = sampleTradeRR(cfg, rrRng);
-    const grossPL = isWin ? riskAmt * tradeRR : -riskAmt;
+    const coreGrossPL = isWin ? riskAmt * tradeRR : -riskAmt;
 
-    const priceChange = quantity !== 0 ? grossPL / quantity : 0;
+    const priceChange = quantity !== 0 ? coreGrossPL / quantity : 0;
     const trueExitPrice = price + priceChange; // clean market move, no spread
     const exitPrice = trueExitPrice - (cfg.fnoExitSpread || 0);
 
-    // Turnover = buy value + sell value (both legs of the round trip) — this
-    // is what real brokers' brokerage + Other Charges + GST are computed on.
-    const buyValue = entryPrice * quantity;
-    const sellValue = exitPrice * quantity;
-    const turnover = buyValue + sellValue;
-    const brokerageFee = computeFnoBrokerage(broker, segment, buyValue, sellValue, cfg);
-    // Other Charges combines STT + Exchange + SEBI + IPFT + Stamp Duty into
-    // one editable % of turnover (defaults to the real segment rate — see
-    // combinedStatutoryPct — but is user-editable for every broker); GST is
-    // its own separate % on (brokerage + Other Charges).
-    const { otherCharges, gst } = computeFnoOtherAndGst(
+    const scaled = buildScaleInEntries({
+      cfg,
+      isFno: true,
+      isWin,
+      initialMarketPrice: price,
+      trueExitPrice,
+      baseQty: quantity,
+      baseDisplayUnits: units,
+      baseRiskAmount: riskAmt,
+      lotSize,
+      leverageFactor,
+      currentCapital: capital,
+    });
+
+    const grossPL = scaled.entries.reduce(
+      (sum, entry) => sum + entry.qty * (trueExitPrice - entry.marketPrice),
+      0
+    );
+
+    // Scale-in creates multiple entry orders and one aggregated exit order.
+    // Model brokerage in the same order structure: one charge per entry leg,
+    // then one final exit leg. Turnover/statutory/GST remain based on the true
+    // aggregate traded values; custom fixed brokerage stays one fixed trade fee.
+    let brokerageFee = 0;
+    let slip = 0;
+    let entrySpreadCost = 0;
+    let totalBuyValue = 0;
+    for (const entry of scaled.entries) {
+      const execEntry = entry.marketPrice + (cfg.fnoEntrySpread || 0);
+      const buyValue = execEntry * entry.qty;
+      totalBuyValue += buyValue;
+      if (broker === "custom" && cfg.fnoFeeMode !== "turnover") {
+        // Keep custom fixed-fee behavior identical to the existing core model:
+        // one fixed fee for the overall trade, not one fee per entry order.
+      } else {
+        brokerageFee += computeFnoBrokerageOneLeg(broker, buyValue, cfg);
+      }
+      slip += cfg.slipMode === "ticks"
+        ? entry.qty * cfg.slipTicks * cfg.tickValue
+        : entry.qty * execEntry * (cfg.slipPct / 100);
+      entrySpreadCost += entry.qty * (cfg.fnoEntrySpread || 0);
+    }
+    const totalSellValue = exitPrice * scaled.totalQty;
+    if (broker === "custom" && cfg.fnoFeeMode !== "turnover") {
+      brokerageFee += Number(cfg.fnoFixedFee) || 0;
+    } else {
+      brokerageFee += computeFnoBrokerageOneLeg(broker, totalSellValue, cfg);
+    }
+    const legCharges = computeFnoOtherAndGst(
       segment,
-      buyValue,
-      sellValue,
+      totalBuyValue,
+      totalSellValue,
       brokerageFee,
       cfg.fnoOtherChargesPct,
       cfg.fnoGstPct
     );
+    const otherCharges = legCharges.otherCharges;
+    const gst = legCharges.gst;
+    const totalTurnover = totalBuyValue + totalSellValue;
     const fee = brokerageFee + otherCharges + gst;
-
-    const slip =
-      cfg.slipMode === "ticks"
-        ? quantity * cfg.slipTicks * cfg.tickValue
-        : quantity * entryPrice * (cfg.slipPct / 100);
-    // Exact spread cost — entry and exit spreads charged independently.
-    const spreadCost = quantity * ((cfg.fnoEntrySpread || 0) + (cfg.fnoExitSpread || 0));
+    const spreadCost = entrySpreadCost + scaled.totalQty * (cfg.fnoExitSpread || 0);
     const netPL = grossPL - fee - slip - spreadCost;
     capital += netPL;
 
@@ -710,17 +950,24 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       win: isWin,
       rr: isWin ? tradeRR : -1,
       risk: riskAmt,
+      positionRisk: scaled.positionRisk,
       riskAllocationReset: allocationReset.resetApplied,
-      lots: units,
-      quantity,
+      lots: scaled.totalDisplayUnits,
+      quantity: scaled.totalQty,
+      baseUnits: units,
+      scaleType: scaled.scaleType,
+      scaleAdds: scaled.scaleAdds,
+      skippedScaleAdds: scaled.skippedAdds,
+      averageEntryPrice: scaled.averageEntryPrice,
       entryPrice,
       price: exitPrice,
       grossPL,
+      coreGrossPL,
       fee,
       brokerageFee,
       otherCharges,
       gst,
-      turnover,
+      turnover: totalTurnover,
       slip,
       spreadCost,
       netPL,
@@ -953,6 +1200,18 @@ function cleanConfig(cfg) {
     builderMode: cfg.builderMode === "target" ? "target" : "normal",
     builderTargetInputMode: cfg.builderTargetInputMode === "riskPoints" ? "riskPoints" : "targetPoints",
     builderTargetValue: Math.max(0, Number(cfg.builderTargetValue) || 0),
+    averagingEnabled: cfg.averagingEnabled === true,
+    averagingMaxAdds: Math.min(20, Math.max(0, Math.round(Number(cfg.averagingMaxAdds) || 0))),
+    averagingSpacingMode: cfg.averagingSpacingMode === "percent" ? "percent" : "points",
+    averagingSpacing: Math.max(0, Number(cfg.averagingSpacing) || 0),
+    averagingSizeMode: cfg.averagingSizeMode === "risk" ? "risk" : "lots",
+    averagingSize: Math.max(0, Number(cfg.averagingSize) || 0),
+    pyramidingEnabled: cfg.pyramidingEnabled === true,
+    pyramidingMaxAdds: Math.min(20, Math.max(0, Math.round(Number(cfg.pyramidingMaxAdds) || 0))),
+    pyramidingSpacingMode: cfg.pyramidingSpacingMode === "percent" ? "percent" : "points",
+    pyramidingSpacing: Math.max(0, Number(cfg.pyramidingSpacing) || 0),
+    pyramidingSizeMode: cfg.pyramidingSizeMode === "risk" ? "risk" : "lots",
+    pyramidingSize: Math.max(0, Number(cfg.pyramidingSize) || 0),
   };
 }
 
@@ -2313,7 +2572,7 @@ function evaluateBuilderTargetSequence(engineCfg, sequence, totalRiskAmount, use
   if (result.stopped || calibrated.metric.allLoss.stopped) return null;
 
   const totalAllocatedRisk = result.trades.reduce(
-    (sum, trade) => sum + Math.max(0, Number(trade.risk) || 0),
+    (sum, trade) => sum + Math.max(0, Number(trade.positionRisk ?? trade.risk) || 0),
     0
   );
   const worstCaseLossValue = calibrated.metric.worstValue;
@@ -2399,7 +2658,7 @@ function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, t
   if (result.stopped || calibrated.metric.allLoss.stopped) return null;
 
   const totalAllocatedRisk = result.trades.reduce(
-    (sum, trade) => sum + Math.max(0, Number(trade.risk) || 0),
+    (sum, trade) => sum + Math.max(0, Number(trade.positionRisk ?? trade.risk) || 0),
     0
   );
 
@@ -3540,11 +3799,252 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
     </>
   );
 }
+
+function ScaleModuleToggle({ label, enabled, onClick, color = "indigo", description }) {
+  const tone = color === "amber"
+    ? { active: "bg-amber-500/15 border-amber-500/35 text-amber-300", dot: "bg-amber-400" }
+    : color === "violet"
+    ? { active: "bg-violet-500/15 border-violet-500/35 text-violet-300", dot: "bg-violet-400" }
+    : { active: "bg-indigo-500/15 border-indigo-500/35 text-indigo-300", dot: "bg-indigo-400" };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`w-full text-left rounded-lg border px-3 py-2.5 transition-colors ${enabled ? tone.active : "bg-zinc-900/40 border-zinc-800 text-zinc-500"}`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="flex items-center gap-2 text-[11px] font-medium">
+          <span className={`w-1.5 h-1.5 rounded-full ${enabled ? tone.dot : "bg-zinc-700"}`} />
+          {label}
+        </span>
+        <span className="px-2 py-0.5 rounded text-[9px] font-mono border border-white/[0.06]">{enabled ? "ON" : "OFF"}</span>
+      </div>
+      {description && <div className="text-[9px] text-zinc-500 mt-1.5 leading-relaxed">{description}</div>}
+    </button>
+  );
+}
+
+function ScaleInConfigPanel({
+  cfg,
+  baseMode,
+  modules,
+  onBaseModeChange,
+  onToggleModule,
+  onChange,
+  onRun,
+  builderBuilding,
+}) {
+  const set = (key) => (e) => {
+    const raw = e?.target?.value;
+    const stringKeys = new Set([
+      "averagingSpacingMode",
+      "averagingSizeMode",
+      "pyramidingSpacingMode",
+      "pyramidingSizeMode",
+      "builderMode",
+      "builderTargetInputMode",
+    ]);
+    onChange(key, stringKeys.has(key) ? String(raw ?? "") : raw === "" ? "" : parseFloat(raw));
+  };
+  const scaleSizeLabel = (mode) => mode === "risk" ? "Risk Amount / Add" : (baseMode === "fno" ? (cfg.fnoSegment === "intraday" ? "Shares / Add" : "Lots / Add") : "Lots / Add");
+  const sizeModeLabel = baseMode === "fno" && cfg.fnoSegment === "intraday" ? "Share based" : "Lot based";
+  return (
+    <div className="mt-5 pt-5 border-t border-white/[0.06]">
+      <div className="flex items-center justify-between gap-2 mb-3">
+        <GroupTitle icon={Layers} color="violet">Averaging / Pyramiding</GroupTitle>
+        <span className="text-[9px] font-mono text-zinc-600">same core engine</span>
+      </div>
+
+      <div className="mb-4 p-2.5 rounded-lg border border-violet-500/15 bg-violet-500/5">
+        <div className="text-[10px] leading-relaxed text-zinc-500">
+          <span className="text-zinc-300 font-semibold">Core preserved:</span> same RR, cascade, costs and safety stops. Averaging adds only on LOSS paths; pyramiding adds only on WIN paths. Existing Per-Trade Cap blocks extra entries that would push planned position risk above the cap.
+        </div>
+      </div>
+
+      <div className="mb-4">
+        <div className="text-[11px] font-medium text-zinc-300 mb-2">Base Engine</div>
+        <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1">
+          {[["single","Single Run"],["fno","Day / F&O"]].map(([v,l]) => (
+            <button key={v} type="button" onClick={() => onBaseModeChange(v)} className={`flex-1 py-1.5 rounded-md text-[10px] font-mono ${baseMode === v ? "bg-indigo-500/15 text-indigo-300 border border-indigo-500/20" : "text-zinc-500"}`}>{l}</button>
+          ))}
+        </div>
+        <div className="text-[9px] text-zinc-600 mt-1.5 leading-relaxed">All enabled analyses run on this same engine/configuration.</div>
+      </div>
+
+      <div className="mb-4">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-[11px] font-medium text-amber-300">Averaging</div>
+          <button type="button" onClick={() => onChange("averagingEnabled", !cfg.averagingEnabled)} className={`px-2 py-1 rounded text-[10px] font-mono ${cfg.averagingEnabled ? "bg-amber-500/15 text-amber-300 border border-amber-500/30" : "bg-zinc-800 text-zinc-500 border border-zinc-700/50"}`}>{cfg.averagingEnabled ? "ON" : "OFF"}</button>
+        </div>
+        {cfg.averagingEnabled && (
+          <div className="p-2.5 rounded-lg bg-zinc-950/40 border border-zinc-800">
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Max Adds"><NumInput value={cfg.averagingMaxAdds} onChange={set("averagingMaxAdds")} step="1" min="0" max="20" color="amber" /></Field>
+              <Field label="Spacing"><NumInput value={cfg.averagingSpacing} onChange={set("averagingSpacing")} step="0.1" min="0" color="amber" /></Field>
+            </div>
+            <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1 mb-2.5">
+              {[["points","Points"],["percent","% of price"]].map(([v,l]) => (
+                <button key={v} type="button" onClick={() => onChange("averagingSpacingMode", v)} className={`flex-1 py-1.5 rounded-md text-[10px] font-mono ${cfg.averagingSpacingMode === v ? "bg-amber-500/15 text-amber-300" : "text-zinc-500"}`}>{l}</button>
+              ))}
+            </div>
+            <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1 mb-2.5">
+              {[["lots", "Lot based"],["risk", "Risk based"]].map(([v,l]) => (
+                <button key={v} type="button" onClick={() => onChange("averagingSizeMode", v)} className={`flex-1 py-1.5 rounded-md text-[10px] font-mono ${cfg.averagingSizeMode === v ? "bg-amber-500/15 text-amber-300" : "text-zinc-500"}`}>{l}</button>
+              ))}
+            </div>
+            <Field label={scaleSizeLabel(cfg.averagingSizeMode)}>
+              <NumInput value={cfg.averagingSize} onChange={set("averagingSize")} step={cfg.averagingSizeMode === "risk" ? "0.01" : "0.01"} min="0" color="amber" />
+            </Field>
+            <div className="text-[9px] text-zinc-600 leading-relaxed">Entries trigger from the original entry as the same core loss path moves toward its 1R stop. Risk mode sizes each add to its own stop-risk target.</div>
+          </div>
+        )}
+      </div>
+
+      <div className="mb-4">
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-[11px] font-medium text-emerald-300">Pyramiding</div>
+          <button type="button" onClick={() => onChange("pyramidingEnabled", !cfg.pyramidingEnabled)} className={`px-2 py-1 rounded text-[10px] font-mono ${cfg.pyramidingEnabled ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30" : "bg-zinc-800 text-zinc-500 border border-zinc-700/50"}`}>{cfg.pyramidingEnabled ? "ON" : "OFF"}</button>
+        </div>
+        {cfg.pyramidingEnabled && (
+          <div className="p-2.5 rounded-lg bg-zinc-950/40 border border-zinc-800">
+            <div className="grid grid-cols-2 gap-2">
+              <Field label="Max Adds"><NumInput value={cfg.pyramidingMaxAdds} onChange={set("pyramidingMaxAdds")} step="1" min="0" max="20" color="blue" /></Field>
+              <Field label="Spacing"><NumInput value={cfg.pyramidingSpacing} onChange={set("pyramidingSpacing")} step="0.1" min="0" color="blue" /></Field>
+            </div>
+            <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1 mb-2.5">
+              {[["points","Points"],["percent","% of price"]].map(([v,l]) => (
+                <button key={v} type="button" onClick={() => onChange("pyramidingSpacingMode", v)} className={`flex-1 py-1.5 rounded-md text-[10px] font-mono ${cfg.pyramidingSpacingMode === v ? "bg-emerald-500/15 text-emerald-300" : "text-zinc-500"}`}>{l}</button>
+              ))}
+            </div>
+            <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1 mb-2.5">
+              {[["lots", "Lot based"],["risk", "Risk based"]].map(([v,l]) => (
+                <button key={v} type="button" onClick={() => onChange("pyramidingSizeMode", v)} className={`flex-1 py-1.5 rounded-md text-[10px] font-mono ${cfg.pyramidingSizeMode === v ? "bg-emerald-500/15 text-emerald-300" : "text-zinc-500"}`}>{l}</button>
+              ))}
+            </div>
+            <Field label={scaleSizeLabel(cfg.pyramidingSizeMode)}>
+              <NumInput value={cfg.pyramidingSize} onChange={set("pyramidingSize")} step="0.01" min="0" color="blue" />
+            </Field>
+            <div className="text-[9px] text-zinc-600 leading-relaxed">Entries trigger from the original entry as the same core win path moves toward its target. Risk mode sizes each add to its own stop-risk target.</div>
+          </div>
+        )}
+      </div>
+
+      <div className="mb-4 pt-3 border-t border-zinc-800">
+        <div className="text-[11px] font-medium text-indigo-300 mb-2.5">Analysis Modules</div>
+        <div className="space-y-2">
+          <ScaleModuleToggle label="Win Rate Sweep" enabled={modules.sweep} onClick={() => onToggleModule("sweep")} color="indigo" description="0–100% win-rate sensitivity using the same scale-in engine." />
+          {modules.sweep && (
+            <div className="pl-2.5 pr-1 pb-1">
+              <div className="grid grid-cols-2 gap-2"><Field label="WR Step %"><NumInput value={cfg.sweepStep} onChange={set("sweepStep")} step="1" min="1" max="50" color="indigo" /></Field><Field label="Sample / Point"><NumInput value={cfg.sweepRuns} onChange={set("sweepRuns")} step="10" min="1" max="2000" color="indigo" /></Field></div>
+            </div>
+          )}
+          <ScaleModuleToggle label="Multi Simulation" enabled={modules.multi} onClick={() => onToggleModule("multi")} color="violet" description="Fresh random sequences at the selected win rate to measure consistency." />
+          {modules.multi && (
+            <div className="pl-2.5 pr-1 pb-1"><Field label="Scenarios"><NumInput value={cfg.batchCount} onChange={onChange("batchCount")} step="1" min="1" color="violet" /></Field></div>
+          )}
+          <ScaleModuleToggle label="Builder" enabled={modules.builder} onClick={() => onToggleModule("builder")} color="amber" description="Exact/sampled W/L sequence search under the existing Builder risk budget and safety rules." />
+          {modules.builder && (
+            <div className="pl-2.5 pr-1 pb-1">
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="Builder Capital"><NumInput value={cfg.builderInitialCapital} onChange={set("builderInitialCapital")} step="1" min="0" color="amber" /></Field>
+                <Field label="Risk Budget %"><NumInput value={cfg.builderTotalRiskPct} onChange={set("builderTotalRiskPct")} step="0.1" min="0" color="amber" /></Field>
+                <Field label="Min Trades"><NumInput value={cfg.builderMinTrades} onChange={set("builderMinTrades")} step="1" min="1" color="amber" /></Field>
+                <Field label="Max Trades"><NumInput value={cfg.builderMaxTrades} onChange={set("builderMaxTrades")} step="1" min="1" color="amber" /></Field>
+              </div>
+              <Field label="Evaluations"><NumInput value={cfg.builderSequenceLimit} onChange={set("builderSequenceLimit")} step="1000" min="1" max="100000" color="amber" /></Field>
+              <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1 mb-2.5">
+                {[['normal','Normal'],['target','Target']].map(([v,l]) => <button key={v} type="button" onClick={() => onChange("builderMode",v)} className={`flex-1 py-1.5 rounded-md text-[10px] font-mono ${cfg.builderMode === v ? "bg-amber-500/15 text-amber-300" : "text-zinc-500"}`}>{l}</button>)}
+              </div>
+              {cfg.builderMode === "target" && (
+                <>
+                  <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1 mb-2.5">
+                    {[['targetPoints','Target Points'],['riskPoints','Risk Points']].map(([v,l]) => <button key={v} type="button" onClick={() => onChange("builderTargetInputMode",v)} className={`flex-1 py-1.5 rounded-md text-[10px] font-mono ${cfg.builderTargetInputMode === v ? "bg-amber-500/15 text-amber-300" : "text-zinc-500"}`}>{l}</button>)}
+                  </div>
+                  <Field label={cfg.builderTargetInputMode === "targetPoints" ? "Target Points" : "Risk Points"}><NumInput value={cfg.builderTargetValue} onChange={set("builderTargetValue")} step="0.1" min="0" color="amber" /></Field>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <button type="button" onClick={onRun} disabled={builderBuilding} className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg bg-zinc-100 text-zinc-900 text-[11px] font-semibold hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+        <Play size={12} fill="currentColor" /> RUN ENABLED ANALYSES
+      </button>
+    </div>
+  );
+}
+
+function ScaleSweepResults({ sweep }) {
+  if (!sweep?.points?.length) return <div className={`${CARD} py-12 text-center text-zinc-500 text-xs`}>No sweep result.</div>;
+  const points = sweep.points.map((p) => ({ ...p, wrLabel: `${p.winRate}%`, avgReturnPct: Number(p.avgReturnPct.toFixed(2)), profitableRate: Number(p.profitableRate.toFixed(1)) }));
+  const best = sweep.points.reduce((a,b)=>b.avgReturnPct>a.avgReturnPct?b:a,sweep.points[0]);
+  const worst = sweep.points.reduce((a,b)=>b.avgReturnPct<a.avgReturnPct?b:a,sweep.points[0]);
+  const p0 = sweep.points.find((p)=>p.winRate===0) || sweep.points[0];
+  const p100 = sweep.points.find((p)=>p.winRate===100) || sweep.points[sweep.points.length-1];
+  const rr = Math.abs(p0.avgReturnPct)>0 ? Math.abs(p100.avgReturnPct)/Math.abs(p0.avgReturnPct) : 0;
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3">
+        <StatCell label="Highest Avg Return" value={`${best.winRate}%`} tone="pos" icon={TrendingUp} sub={`${best.avgReturnPct>=0?"+":""}${best.avgReturnPct.toFixed(2)}%`} />
+        <StatCell label="Lowest Avg Return" value={`${worst.winRate}%`} tone={worst.avgReturnPct>=0?"pos":"neg"} icon={worst.avgReturnPct>=0?TrendingUp:TrendingDown} sub={`${worst.avgReturnPct>=0?"+":""}${worst.avgReturnPct.toFixed(2)}%`} />
+        <StatCell label="Sweep RR" value={rr ? rr.toFixed(2) : "0.00"} icon={Percent} valueColor="#DAB2FF" sub={`0% ${p0.avgReturnPct.toFixed(2)} · 100% ${p100.avgReturnPct.toFixed(2)}`} />
+        <StatCell label="Sample / Point" value={sweep.runsPerPoint} icon={Layers} sub={sweep.requestedRunsPerPoint !== sweep.runsPerPoint ? "capped" : "as set"} />
+      </div>
+      <div className={`${CARD} overflow-hidden`}>
+        <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between"><span className="text-[13px] font-semibold text-zinc-200">Avg Return vs Win Rate</span><span className="text-[10px] text-zinc-500">same scale-in rules at every win rate</span></div>
+        <div className="h-64 sm:h-72 px-2 pt-4 pb-2"><ResponsiveContainer width="100%" height="100%"><ComposedChart data={points} margin={{top:8,right:8,bottom:0,left:0}}>
+          <CartesianGrid stroke="#27272a" strokeDasharray="3 3" vertical={false}/>
+          <XAxis dataKey="wrLabel" stroke="#52525b" fontSize={11} tickLine={false} axisLine={false}/>
+          <YAxis yAxisId="left" stroke="#42D3F2" fontSize={11} tickLine={false} axisLine={false} width={52}/>
+          <YAxis yAxisId="right" orientation="right" domain={[0,100]} stroke="#BBF451" fontSize={11} tickLine={false} axisLine={false} width={40} tickFormatter={(v)=>v+"%"}/>
+          <ReferenceLine yAxisId="left" y={0} stroke="#52525b" strokeDasharray="4 4"/>
+          <Tooltip content={<SweepTooltip/>}/>
+          <Area yAxisId="left" type="monotone" dataKey="avgReturnPct" stroke="none" fill="#42D3F2" fillOpacity={0.10} isAnimationActive={false}/>
+          <Line yAxisId="left" type="monotone" dataKey="avgReturnPct" stroke="#42D3F2" strokeWidth={2.2} dot={{r:2.5,fill:"#42D3F2",strokeWidth:0}} activeDot={{r:5,fill:"#42D3F2",stroke:"#0a0b0d",strokeWidth:2}} isAnimationActive={false}/>
+          <Line yAxisId="right" type="monotone" dataKey="profitableRate" stroke="#BBF451" strokeWidth={1.4} strokeDasharray="4 3" dot={false} isAnimationActive={false}/>
+        </ComposedChart></ResponsiveContainer></div>
+      </div>
+      <div className={`${CARD} overflow-hidden`}><div className="max-h-80 overflow-auto"><table className="w-full font-mono text-xs whitespace-nowrap"><thead><tr className="bg-zinc-900 text-zinc-500 text-[10px] uppercase tracking-wide sticky top-0"><th className="text-left px-3 py-2">Win Rate</th><th className="text-right px-3 py-2">Final Capital</th><th className="text-right px-3 py-2">Net P/L</th><th className="text-right px-3 py-2">Max DD</th><th className="text-right px-3 py-2">RR</th><th className="text-right px-3 py-2">Profitable</th></tr></thead><tbody>
+        {sweep.points.map((p)=><tr key={p.winRate} className="border-b border-zinc-800/60"><td className="px-3 py-1.5 text-[#FFDF20]">{p.winRate}%</td><td className="px-3 py-1.5 text-right">{fmtMoney(p.avgFinal)}</td><td className={`px-3 py-1.5 text-right ${p.avgNetPL>=0?"text-emerald-400":"text-red-400"}`}>{fmtMoney(p.avgNetPL)}</td><td className="px-3 py-1.5 text-right text-red-300">{fmtPct(p.avgMaxDD)} ({fmtMoney(p.avgMaxDDValue)})</td><td className="px-3 py-1.5 text-right">{isFinite(p.rewardRiskRatio)?p.rewardRiskRatio.toFixed(2):"∞"}</td><td className="px-3 py-1.5 text-right text-[#A2F4FD]">{p.profitableRate.toFixed(1)}%</td></tr>)}
+      </tbody></table></div></div>
+    </div>
+  );
+}
+
+function ScaleInTradeLog({ result, strategyCfg, baseMode, activeRunLabel }) {
+  if (!result?.trades?.length) return null;
+  const isFno = baseMode === "fno";
+  const scaleTrades = result.trades.filter((t)=>Number(t.scaleAdds||0)>0);
+  const totalAdds = scaleTrades.reduce((s,t)=>s+Number(t.scaleAdds||0),0);
+  const initialCapital = Number(strategyCfg?.initialCapital)||0;
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+        <MiniStat label="Final Capital" value={fmtMoney(result.finalCapital)} />
+        <MiniStat label="Net P/L" value={fmtMoney(result.netPL)} sub={fmtPct(initialCapital ? (result.netPL/initialCapital)*100 : 0)} tone={result.netPL>=0?"pos":"neg"}/>
+        <MiniStat label="Max DD" value={fmtPct(result.maxDD)} sub={`-${fmtMoney(result.maxDDValue)}`} valueColor="#E7180B" subColor="#E7180B"/>
+        <MiniStat label="Scale-In Trades" value={scaleTrades.length} sub={`${totalAdds} total adds`} valueColor="#DAB2FF"/>
+        <MiniStat label="Final Position" value={result.trades[result.trades.length-1].scaleType || "BASE"} sub={`${Number(result.trades[result.trades.length-1].lots||0).toFixed(isFno?0:2)} ${isFno ? "units" : "lots"}`} valueColor="#FEF9C2"/>
+      </div>
+      <TradeAnalyticsSection trades={result.trades} initialCapital={initialCapital} collapsible defaultOpen={true}/>
+      <div className={`${CARD} overflow-hidden`}>
+        <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-2"><span className="text-[13px] font-semibold text-zinc-200">Scale-In Trade Log</span><span className="text-[10px] text-zinc-500">{activeRunLabel || "Core preview"}</span></div>
+        <div className="overflow-x-auto max-h-[620px] overflow-y-auto"><table className="w-full font-mono text-xs whitespace-nowrap"><thead><tr className="bg-zinc-900 text-zinc-500 text-[10px] uppercase tracking-wide sticky top-0 z-10"><th className="text-left px-3 py-2">No</th><th className="text-left px-3 py-2">Result</th><th className="text-right px-3 py-2">Risk</th><th className="text-right px-3 py-2">Position Risk</th><th className="text-right px-3 py-2">RR</th><th className="text-right px-3 py-2">Units/Lots</th><th className="text-right px-3 py-2">Adds</th><th className="text-right px-3 py-2">Avg Entry</th><th className="text-right px-3 py-2">Exit</th><th className="text-right px-3 py-2">Gross P/L</th><th className="text-right px-3 py-2">Fee</th><th className="text-right px-3 py-2">Net P/L</th><th className="text-right px-3 py-2">Capital</th></tr></thead><tbody>
+          {result.trades.map((t)=><tr key={t.n} className="border-b border-zinc-800/60 hover:bg-zinc-800/20"><td className="px-3 py-1.5 text-zinc-500">{t.n}</td><td className="px-3 py-1.5"><TradeResultBadge win={t.win}/></td><td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)}</td><td className="px-3 py-1.5 text-right text-amber-300">{fmtMoney(t.positionRisk ?? t.risk)}</td><td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td><td className="px-3 py-1.5 text-right text-[#FEF9C2]">{Number(t.lots||0).toFixed(isFno?0:2)}</td><td className={`px-3 py-1.5 text-right ${t.scaleAdds?"text-emerald-300":"text-zinc-600"}`}>{t.scaleAdds||0}</td><td className="px-3 py-1.5 text-right text-zinc-300">{fmtMoney(t.averageEntryPrice ?? t.entryPrice)}</td><td className="px-3 py-1.5 text-right text-zinc-300">{fmtMoney(t.price)}</td><td className={`px-3 py-1.5 text-right ${t.grossPL>=0?"text-emerald-400":"text-red-400"}`}>{fmtMoney(t.grossPL)}</td><td className="px-3 py-1.5 text-right text-[#C4B4FF]">{fmtMoney(t.fee)}</td><td className={`px-3 py-1.5 text-right ${t.netPL>=0?"text-emerald-400":"text-red-400"}`}>{fmtMoney(t.netPL)}</td><td className="px-3 py-1.5 text-right text-[#74D4FF]">{fmtMoney(t.capital)}</td></tr>)}
+        </tbody></table></div>
+        {result.trades.some((t)=>Number(t.skippedScaleAdds||0)>0) && <div className="px-4 py-2.5 border-t border-zinc-800 text-[10px] text-zinc-500">Some requested additions were skipped because the price path did not reach the trigger or the existing Per-Trade Cap would have been exceeded.</div>}
+      </div>
+    </div>
+  );
+}
+
 const MODE_LABEL = {
   single: "Single Run",
   sweep: "Win Rate",
   fno: "Day / F&O",
   builder: "Builder",
+  scale: "Avg / Pyramid",
 };
 
 export default function RiskSimulator() {
@@ -3564,6 +4064,18 @@ export default function RiskSimulator() {
   const [builderSelectedKey, setBuilderSelectedKey] = useState(null);
   const [builderBuilding, setBuilderBuilding] = useState(false);
   const builderBuildIdRef = useRef(0);
+  const [scaleBaseMode, setScaleBaseMode] = useState("single");
+  const [scaleAverageResult, setScaleAverageResult] = useState(null);
+  const [scaleResultCfg, setScaleResultCfg] = useState(null);
+  const [scaleSweepResult, setScaleSweepResult] = useState(null);
+  const [scaleBatchResult, setScaleBatchResult] = useState(null);
+  const [scaleSelectedBatchRunIdx, setScaleSelectedBatchRunIdx] = useState(null);
+  const [scaleBuilderResult, setScaleBuilderResult] = useState(null);
+  const [scaleBuilderSelectedKey, setScaleBuilderSelectedKey] = useState(null);
+  const [scaleActiveRunLabel, setScaleActiveRunLabel] = useState(null);
+  const [scaleBuilderBuilding, setScaleBuilderBuilding] = useState(false);
+  const scaleBuilderBuildIdRef = useRef(0);
+  const [scaleModules, setScaleModules] = useState({ sweep: true, multi: true, builder: true });
   const [activeRunLabel, setActiveRunLabel] = useState(null);
   // Lets the user directly inspect any existing Multi Simulation scenario
   // from the Trade Log header (for example, change Scenario : 15 to 75).
@@ -3688,6 +4200,13 @@ export default function RiskSimulator() {
         };
       }
 
+      if (mode === "scale") {
+        strategyWorkspaceRef.current[scaleBaseMode] = {
+          ...strategyWorkspaceRef.current[scaleBaseMode],
+          cfg: { ...cfg },
+        };
+      }
+
       if (mode === "single" || mode === "fno") {
         strategyWorkspaceRef.current[mode] = {
           ...strategyWorkspaceRef.current[mode],
@@ -3724,6 +4243,13 @@ export default function RiskSimulator() {
         setSweepBaseMode(nextMode);
         setStrategyBaseMode(nextMode);
         setMode(nextMode);
+        return;
+      }
+
+      if (nextMode === "scale") {
+        const base = mode === "fno" ? "fno" : mode === "single" ? "single" : mode === "sweep" ? sweepBaseMode : strategyBaseMode;
+        setScaleBaseMode(base === "fno" ? "fno" : "single");
+        setMode("scale");
         return;
       }
 
@@ -3819,6 +4345,7 @@ export default function RiskSimulator() {
       builderResult,
       builderSelectedKey,
       strategyBaseMode,
+      scaleBaseMode,
       scenarioInput,
     ]
   );
@@ -3826,7 +4353,7 @@ export default function RiskSimulator() {
   // The config panel (and, when running a sweep, the sweep engine itself)
   // should reflect Single Run's fields while on that tab, Day/F&O's fields
   // while on that tab, and whichever of the two was set last while on Sweep.
-  const effectiveMode = mode === "sweep" ? sweepBaseMode : mode;
+  const effectiveMode = mode === "sweep" ? sweepBaseMode : mode === "scale" ? scaleBaseMode : mode;
 
   const setField = (key) => (e) => {
     const val = e.target.value;
@@ -4054,6 +4581,284 @@ export default function RiskSimulator() {
       return merged;
     });
   };
+
+
+  const selectScaleBuilderCandidate = useCallback((candidate, built) => {
+    if (!candidate) return;
+    const runCfg = candidate.autoStrategyCfg || built?.strategyCfg || cleanConfig(cfg);
+    setScaleBuilderSelectedKey(candidate.key);
+    setScaleResultCfg(runCfg);
+    setScaleAverageResult({ ...candidate.result, winLossSeq: candidate.sequenceArray });
+    setScaleActiveRunLabel(`Combination · ${formatBuilderWinRate(candidate.actualWinRate)} WR · ${candidate.tradeCount} trades`);
+  }, []);
+
+  const reorderScaleBuilderCombination = useCallback((candidate, fromIdx, toIdx) => {
+    if (!candidate || !scaleBuilderResult || fromIdx === toIdx) return;
+    const seq = [...candidate.sequenceArray];
+    if (fromIdx < 0 || toIdx < 0 || fromIdx >= seq.length || toIdx >= seq.length) return;
+    const [moved] = seq.splice(fromIdx, 1);
+    seq.splice(toIdx, 0, moved);
+    const edited = scaleBuilderResult.builderMode === "target"
+      ? evaluateBuilderTargetSequence(
+          scaleBuilderResult.strategyCfg,
+          seq,
+          scaleBuilderResult.totalRiskAmount,
+          scaleBuilderResult.baseMode === "fno",
+          candidate.actualWinRate,
+          scaleBuilderResult.targetInputMode || "targetPoints",
+          scaleBuilderResult.targetInputValue || 0
+        )
+      : evaluateBuilderSequence(
+          scaleBuilderResult.strategyCfg,
+          seq,
+          scaleBuilderResult.totalRiskAmount,
+          scaleBuilderResult.baseMode === "fno",
+          candidate.actualWinRate
+        );
+    if (!edited) return;
+    const nextBuilder = applyBuilderCandidateEdit(
+      scaleBuilderResult,
+      candidate.actualWinRate,
+      candidate.key,
+      edited
+    );
+    setScaleBuilderResult(nextBuilder);
+    setScaleBuilderSelectedKey(edited.key);
+    setScaleResultCfg(edited.autoStrategyCfg || scaleBuilderResult.strategyCfg);
+    setScaleAverageResult({ ...edited.result, winLossSeq: seq });
+    setScaleActiveRunLabel(`Combination · ${formatBuilderWinRate(edited.actualWinRate)} WR · ${edited.tradeCount} trades · sequence reordered`);
+  }, [scaleBuilderResult]);
+
+  const handleScaleBaseModeChange = useCallback((nextBaseMode) => {
+    const nextMode = nextBaseMode === "fno" ? "fno" : "single";
+    if (nextMode === scaleBaseMode) return;
+
+    // Keep the latest scale configuration (averaging/pyramiding) independent
+    // of the underlying Single/F&O workspace, then load that workspace's
+    // strategy fields. This lets the user compare both engines without losing
+    // the scale-in plan.
+    strategyWorkspaceRef.current[scaleBaseMode] = {
+      ...strategyWorkspaceRef.current[scaleBaseMode],
+      cfg: { ...cfg },
+    };
+    const scaleKeys = [
+      "averagingEnabled", "averagingMaxAdds", "averagingSpacingMode", "averagingSpacing", "averagingSizeMode", "averagingSize",
+      "pyramidingEnabled", "pyramidingMaxAdds", "pyramidingSpacingMode", "pyramidingSpacing", "pyramidingSizeMode", "pyramidingSize",
+    ];
+    const scaleOverlay = Object.fromEntries(scaleKeys.map((k) => [k, cfg[k]]));
+    const workspaceCfg = strategyWorkspaceRef.current[nextMode]?.cfg || DEFAULTS;
+    const nextCfg = { ...workspaceCfg, ...scaleOverlay };
+
+    setScaleBaseMode(nextMode);
+    setScaleAverageResult(null);
+    setScaleResultCfg(null);
+    setScaleSweepResult(null);
+    setScaleBatchResult(null);
+    setScaleSelectedBatchRunIdx(null);
+    setScaleBuilderResult(null);
+    setScaleBuilderSelectedKey(null);
+    setScaleActiveRunLabel(null);
+    setCfg(nextCfg);
+    setSweepBaseMode(nextMode);
+    setStrategyBaseMode(nextMode);
+    lastCleanCfgRef.current = cleanConfig(nextCfg);
+    lastRunModeRef.current = nextMode;
+  }, [cfg, scaleBaseMode]);
+
+  const handleScaleRun = useCallback(() => {
+    const clean = cleanConfig(cfg);
+    const baseMode = scaleBaseMode === "fno" ? "fno" : "single";
+    if (baseMode === "fno") {
+      if (clean.fnoSegment === "intraday") {
+        if (!clean.initialCapital || !clean.fnoQuantity) return;
+      } else if (!clean.initialCapital || !clean.fnoLots || !clean.fnoLotSize) return;
+    } else if (!clean.initialCapital || !clean.baseLots) return;
+
+    setScaleAverageResult(null);
+    setScaleResultCfg(clean);
+    setScaleSweepResult(null);
+    setScaleBatchResult(null);
+    setScaleSelectedBatchRunIdx(null);
+    setScaleBuilderResult(null);
+    setScaleBuilderSelectedKey(null);
+    setScaleActiveRunLabel(null);
+
+    // Preview always uses the same sequence engine as the rest of the app.
+    const previewSeq = buildWinLossSeq(clean.numTrades, clean.winRate);
+    const previewFn = baseMode === "fno" ? simulateFromSequenceFnO : simulateFromSequence;
+    const preview = previewFn(clean, previewSeq);
+    setScaleAverageResult({ ...preview, winLossSeq: previewSeq });
+
+    if (scaleModules.sweep) {
+      const step = Math.min(Math.max(Math.round(Number(clean.sweepStep) || 10), 1), 50);
+      let runsPerPoint = Math.min(Math.max(Math.round(Number(clean.sweepRuns) || 1), 1), 2000);
+      const numPoints = Math.ceil(100 / step) + 1;
+      if (runsPerPoint * numPoints * clean.numTrades > 400000) {
+        runsPerPoint = Math.max(1, Math.floor(400000 / (numPoints * clean.numTrades)));
+      }
+      setScaleSweepResult({
+        points: runWinRateSweep(clean, step, runsPerPoint, baseMode),
+        runsPerPoint,
+        requestedRunsPerPoint: Math.round(Number(clean.sweepRuns) || 1),
+        baseMode,
+      });
+    }
+
+    if (scaleModules.multi) {
+      let n = Math.round(Number(clean.batchCount) || 0);
+      if (n > 0) {
+        n = Math.min(2000, n);
+        if (n * clean.numTrades > 300000) n = Math.max(1, Math.floor(300000 / clean.numTrades));
+        const runFn = baseMode === "fno" ? simulateFromSequenceFnO : simulateFromSequence;
+        const runs = [];
+        for (let i = 0; i < n; i++) {
+          const seq = buildWinLossSeq(clean.numTrades, clean.winRate);
+          runs.push({ index: i + 1, winLossSeq: seq, result: runFn(clean, seq) });
+        }
+        let maxProfitRun = runs[0] || null;
+        let maxLossRun = runs[0] || null;
+        let maxDDRun = runs[0] || null;
+        let profitableCount = 0;
+        runs.forEach((r) => {
+          if (r.result.netPL > 0) profitableCount += 1;
+          if (!maxProfitRun || r.result.netPL > maxProfitRun.result.netPL) maxProfitRun = r;
+          if (!maxLossRun || r.result.netPL < maxLossRun.result.netPL) maxLossRun = r;
+          if (!maxDDRun || r.result.maxDD > maxDDRun.result.maxDD) maxDDRun = r;
+        });
+        const losingCount = runs.length - profitableCount;
+        const profitablePct = runs.length ? (profitableCount / runs.length) * 100 : 0;
+        const netReturns = runs.map((r) => (r.result.netPL / clean.initialCapital) * 100);
+        const meanReturn = netReturns.length ? netReturns.reduce((a, b) => a + b, 0) / netReturns.length : 0;
+        const sdReturn = netReturns.length > 1
+          ? Math.sqrt(netReturns.reduce((s2, x) => s2 + (x - meanReturn) ** 2, 0) / (netReturns.length - 1))
+          : 0;
+        const ci95HalfWidth = netReturns.length > 1 ? 1.96 * sdReturn / Math.sqrt(netReturns.length) : 0;
+        const ruinedCount = runs.filter((r) => r.result.finalCapital <= clean.initialCapital * 0.2 || r.result.maxLossValue <= -clean.initialCapital * 0.8).length;
+        setScaleBatchResult({
+          runs,
+          mode: baseMode,
+          cfg: clean,
+          stats: {
+            total: runs.length,
+            requested: Math.round(Number(clean.batchCount) || 0),
+            profitableCount,
+            losingCount,
+            profitablePct,
+            meanReturn,
+            sdReturn,
+            ci95Low: meanReturn - ci95HalfWidth,
+            ci95High: meanReturn + ci95HalfWidth,
+            riskOfRuinPct: runs.length ? (ruinedCount / runs.length) * 100 : 0,
+            ruinedCount,
+            maxProfitRun,
+            maxLossRun,
+            maxDDRun,
+          },
+        });
+      }
+    }
+
+    if (scaleModules.builder) {
+      const normalized = {
+        ...clean,
+        initialCapital: Math.max(0, Number(clean.builderInitialCapital) || 0),
+        builderInitialCapital: Math.max(0, Number(clean.builderInitialCapital) || 0),
+        builderTotalRiskPct: Math.max(0, Number(clean.builderTotalRiskPct) || 0),
+        builderMinTrades: Math.max(1, Math.round(Number(clean.builderMinTrades) || 1)),
+        builderMaxTrades: Math.max(1, Math.round(Number(clean.builderMaxTrades) || 1)),
+        builderSequenceLimit: Math.min(100000, Math.max(1, Math.round(Number(clean.builderSequenceLimit) || 100000))),
+        builderMode: clean.builderMode === "target" ? "target" : "normal",
+        builderTargetInputMode: clean.builderTargetInputMode === "riskPoints" ? "riskPoints" : "targetPoints",
+        builderTargetValue: Math.max(0, Number(clean.builderTargetValue) || 0),
+        builderBaseMode: baseMode,
+      };
+      if (normalized.builderMaxTrades < normalized.builderMinTrades) normalized.builderMaxTrades = normalized.builderMinTrades;
+      if (normalized.builderMode === "target" && normalized.builderTargetValue <= 0) return;
+      setScaleBuilderBuilding(true);
+      const buildId = ++scaleBuilderBuildIdRef.current;
+      window.setTimeout(() => {
+        if (buildId !== scaleBuilderBuildIdRef.current) return;
+        try {
+          const built = runStrategyBuilder(normalized);
+          if (buildId !== scaleBuilderBuildIdRef.current) return;
+          setScaleBuilderResult(built);
+          const first = built.bestReturnPoint?.candidate || built.points.find((p) => p.candidate)?.candidate || null;
+          if (first) selectScaleBuilderCandidate(first, built);
+        } finally {
+          if (buildId === scaleBuilderBuildIdRef.current) setScaleBuilderBuilding(false);
+        }
+      }, 0);
+    }
+  }, [cfg, scaleBaseMode, scaleModules, selectScaleBuilderCandidate]);
+
+  const handleScaleBatchRun = useCallback(() => {
+    const clean = cleanConfig(cfg);
+    const activeMode = scaleBaseMode === "fno" ? "fno" : "single";
+
+    if (activeMode === "fno") {
+      if (clean.fnoSegment === "intraday") {
+        if (!clean.initialCapital || !clean.fnoQuantity) return;
+      } else if (!clean.initialCapital || !clean.fnoLots || !clean.fnoLotSize) return;
+    } else if (!clean.initialCapital || !clean.baseLots) return;
+
+    let n = Math.round(Number(clean.batchCount) || 0);
+    if (n < 1) return;
+    n = Math.min(2000, n);
+    if (n * clean.numTrades > 300000) n = Math.max(1, Math.floor(300000 / clean.numTrades));
+
+    const runFn = activeMode === "fno" ? simulateFromSequenceFnO : simulateFromSequence;
+    const runs = [];
+    for (let i = 0; i < n; i++) {
+      const seq = buildWinLossSeq(clean.numTrades, clean.winRate);
+      runs.push({ index: i + 1, winLossSeq: seq, result: runFn(clean, seq) });
+    }
+
+    let maxProfitRun = runs[0] || null;
+    let maxLossRun = runs[0] || null;
+    let maxDDRun = runs[0] || null;
+    let profitableCount = 0;
+    runs.forEach((r) => {
+      if (r.result.netPL > 0) profitableCount += 1;
+      if (!maxProfitRun || r.result.netPL > maxProfitRun.result.netPL) maxProfitRun = r;
+      if (!maxLossRun || r.result.netPL < maxLossRun.result.netPL) maxLossRun = r;
+      if (!maxDDRun || r.result.maxDD > maxDDRun.result.maxDD) maxDDRun = r;
+    });
+
+    const losingCount = runs.length - profitableCount;
+    const profitablePct = runs.length ? (profitableCount / runs.length) * 100 : 0;
+    const netReturns = runs.map((r) => (r.result.netPL / clean.initialCapital) * 100);
+    const meanReturn = netReturns.length ? netReturns.reduce((a, b) => a + b, 0) / netReturns.length : 0;
+    const sdReturn = netReturns.length > 1
+      ? Math.sqrt(netReturns.reduce((sum, x) => sum + (x - meanReturn) ** 2, 0) / (netReturns.length - 1))
+      : 0;
+    const ci95HalfWidth = netReturns.length > 1 ? 1.96 * sdReturn / Math.sqrt(netReturns.length) : 0;
+    const ruinedCount = runs.filter((r) => r.result.finalCapital <= clean.initialCapital * 0.2 || r.result.maxLossValue <= -clean.initialCapital * 0.8).length;
+
+    const nextBatchResult = {
+      runs,
+      mode: activeMode,
+      cfg: clean,
+      stats: {
+        total: runs.length,
+        requested: Math.round(Number(clean.batchCount) || 0),
+        profitableCount,
+        losingCount,
+        profitablePct,
+        meanReturn,
+        sdReturn,
+        ci95Low: meanReturn - ci95HalfWidth,
+        ci95High: meanReturn + ci95HalfWidth,
+        riskOfRuinPct: runs.length ? (ruinedCount / runs.length) * 100 : 0,
+        ruinedCount,
+        maxProfitRun,
+        maxLossRun,
+        maxDDRun,
+      },
+    };
+
+    setScaleBatchResult(nextBatchResult);
+    setScaleSelectedBatchRunIdx(null);
+  }, [cfg, scaleBaseMode]);
 
   const handleRun = useCallback(() => {
     const clean = cleanConfig(cfg);
@@ -4565,8 +5370,8 @@ export default function RiskSimulator() {
               </div>
             </div>
           </div>
-          <div className="grid grid-cols-4 sm:flex bg-zinc-900/60 border border-zinc-800 rounded-lg p-1 w-full sm:w-auto">
-            {["single", "sweep", "fno", "builder"].map((m) => (
+          <div className="grid grid-cols-5 sm:flex bg-zinc-900/60 border border-zinc-800 rounded-lg p-1 w-full sm:w-auto">
+            {["single", "sweep", "fno", "builder", "scale"].map((m) => (
               <button
                 key={m}
                 onClick={() => handleModeChange(m)}
@@ -5010,6 +5815,19 @@ export default function RiskSimulator() {
                 )}
               </div>
             </div>
+
+            {mode === "scale" && (
+              <ScaleInConfigPanel
+                cfg={cfg}
+                baseMode={scaleBaseMode}
+                onBaseModeChange={handleScaleBaseModeChange}
+                modules={scaleModules}
+                onToggleModule={(key) => setScaleModules((m) => ({ ...m, [key]: !m[key] }))}
+                onChange={(key, value) => setCfg((c) => ({ ...c, [key]: value }))}
+                onRun={handleScaleRun}
+                builderBuilding={scaleBuilderBuilding}
+              />
+            )}
           </aside>
 
           {/* Results column */}
@@ -5031,6 +5849,60 @@ export default function RiskSimulator() {
                 activeRunLabel={activeRunLabel}
                 onReorder={handleBuilderTradeReorder}
               />
+            )}
+
+            {mode === "scale" && (
+              <>
+                <div className={`${CARD} overflow-hidden`}>
+                  <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-[14px] font-semibold text-zinc-100">Averaging / Pyramiding Analysis</div>
+                      <div className="text-[10px] text-zinc-500 mt-1">Uses the active {scaleBaseMode === "fno" ? "Day / F&O" : "Single Run"} configuration. The core risk, RR, cascade, cost and safety model is unchanged.</div>
+                    </div>
+                    <div className="flex items-center gap-1.5 text-[9px] font-mono">
+                      <span className={`px-2 py-1 rounded border ${cfg.averagingEnabled ? "border-amber-500/30 text-amber-300 bg-amber-500/10" : "border-zinc-800 text-zinc-600"}`}>AVG {cfg.averagingEnabled ? "ON" : "OFF"}</span>
+                      <span className={`px-2 py-1 rounded border ${cfg.pyramidingEnabled ? "border-emerald-500/30 text-emerald-300 bg-emerald-500/10" : "border-zinc-800 text-zinc-600"}`}>PYR {cfg.pyramidingEnabled ? "ON" : "OFF"}</span>
+                    </div>
+                  </div>
+                  <div className="px-4 py-2.5 text-[10px] text-zinc-500 border-b border-zinc-800/60">
+                    Adds are triggered only when the same core market path crosses the configured spacing. Risk-based sizing targets the add's actual risk to the same 1R stop at its trigger price; lot/share based sizing uses exact units per add. F&O remains whole-unit/lot sized, and the existing Per-Trade Cap is the hard guard for total planned position risk.
+                  </div>
+                </div>
+
+                {scaleAverageResult && scaleResultCfg && (
+                  <ScaleInTradeLog result={scaleAverageResult} strategyCfg={scaleResultCfg} baseMode={scaleBaseMode} activeRunLabel={scaleActiveRunLabel} />
+                )}
+
+                {scaleModules.sweep && <ScaleSweepResults sweep={scaleSweepResult} />}
+
+                {scaleModules.multi && (
+                  <BatchRunSection
+                    mode={scaleBaseMode}
+                    cfg={cfg}
+                    batchResult={scaleBatchResult}
+                    onRunBatch={handleScaleBatchRun}
+                    onClearBatch={() => { setScaleBatchResult(null); setScaleSelectedBatchRunIdx(null); }}
+                    onSelectRun={(run) => { setScaleResultCfg(scaleBatchResult?.cfg || cleanConfig(cfg)); setScaleAverageResult({ ...run.result, winLossSeq: run.winLossSeq }); setScaleSelectedBatchRunIdx(run.index); setScaleActiveRunLabel(`Scenario : ${run.index}`); }}
+                    selectedRunIdx={scaleSelectedBatchRunIdx}
+                    onBatchCountChange={setField("batchCount")}
+                  />
+                )}
+
+                {scaleModules.builder && (
+                  <>
+                    {scaleBuilderResult ? (
+                      <BuilderResults
+                        builder={scaleBuilderResult}
+                        selectedKey={scaleBuilderSelectedKey}
+                        onSelectCandidate={(candidate) => selectScaleBuilderCandidate(candidate, scaleBuilderResult)}
+                        onReorderCombination={reorderScaleBuilderCombination}
+                      />
+                    ) : (
+                      <div className={`${CARD} py-12 text-center text-zinc-500 text-xs`}>Builder result will appear after RUN ENABLED ANALYSES.</div>
+                    )}
+                  </>
+                )}
+              </>
             )}
 
             {/* Status bar */}
@@ -5722,7 +6594,7 @@ export default function RiskSimulator() {
         </div>
       </div>
 
-      {mode !== "builder" && <DraggableRunButton onRun={handleRun} />}
+      {mode !== "builder" && <DraggableRunButton onRun={mode === "scale" ? handleScaleRun : handleRun} />}
     </div>
   );
 }
