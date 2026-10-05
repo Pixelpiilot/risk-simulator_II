@@ -33,7 +33,7 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2,
+  rr: 2.5,
   // Reward:Risk model: "fixed" preserves the existing behavior; "range"
   // samples a bounded, center-weighted RR independently for each trade.
   rrMode: "fixed",
@@ -42,12 +42,12 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2650,
+  currentPrice: 2600,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
   cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 70,
+  winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
   perTradeCapPct: 70,
@@ -58,18 +58,17 @@ const DEFAULTS = {
   riskAllocationEnabled: true,
   riskAllocationTriggerPct: 100,
   riskAllocationResetPct: 50,
-  // Risk-of-Ruin uses a fixed internal 80% loss threshold; no user-facing input.
   slipMode: "percent",
   slipPct: 0,
   slipTicks: 1,
   tickValue: 0.1,
   entrySpread: 0,
   exitSpread: 0.2,
-  winRate: 50,
+  winRate: 40,
   numTrades: 10,
-  sweepStep: 10,
+  sweepStep: 5,
   sweepRuns: 100,
-  batchCount: "",
+  batchCount: 200,
   // --- Day / F&O mode (Indian market) ---
   // Segment decides the sizing unit + statutory-charge rates: "intraday" (cash
   // equity — whole SHARE quantity, no lot concept), "options" or "futures"
@@ -1506,6 +1505,222 @@ function MultiSimHistogram({ runs, selectedRunIdx, onSelectRun }) {
   );
 }
 
+
+// Custom tooltip for the cumulative-P/L path chart. The tooltip stays compact
+// and focuses on the selected scenario so large simulation sets remain readable.
+function MultiSimPathsTooltip({ active, payload, label, selectedRunIdx }) {
+  if (!active || !payload || !payload.length) return null;
+  const tradeNo = Number(label) || 0;
+  const selectedKey = selectedRunIdx != null ? `run_${selectedRunIdx}` : null;
+  const selected = selectedKey ? payload.find((p) => p.dataKey === selectedKey) : null;
+
+  return (
+    <div className="bg-zinc-950/95 backdrop-blur-sm border border-zinc-700/80 rounded-xl px-3.5 py-3 shadow-2xl shadow-black/60 font-mono min-w-[185px]">
+      <div className="flex items-center justify-between gap-5 text-[10px] text-zinc-500 mb-2">
+        <span className="uppercase tracking-[0.12em]">Trade {tradeNo}</span>
+        {selectedRunIdx != null && <span className="text-zinc-300">Scenario #{selectedRunIdx}</span>}
+      </div>
+      {selected ? (
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-2">
+            <span
+              className="w-2 h-2 rounded-full flex-none ring-2 ring-black/40"
+              style={{ background: selected.value >= 0 ? "#7CCF35" : "#FF8904" }}
+            />
+            <span className="text-[10px] text-zinc-500 uppercase tracking-wide">Cumulative P/L</span>
+          </div>
+          <div
+            className="text-[15px] font-semibold tabular-nums"
+            style={{ color: selected.value >= 0 ? "#7CCF35" : "#FF8904" }}
+          >
+            {Number(selected.value) >= 0 ? "+" : ""}{fmtMoney(selected.value)}
+          </div>
+        </div>
+      ) : (
+        <div className="text-[10px] leading-relaxed text-zinc-500">
+          Select a scenario from the chart or outcome bars to inspect its exact path.
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Professional cumulative outcome-path view. Every simulation outcome is
+// plotted from Trade 0 to the final trade. Background paths stay subtle so
+// the distribution is readable at 200+ runs, while the selected scenario is
+// sharply highlighted and remains clickable for exact Trade Log inspection.
+function MultiSimPathsChart({ runs, selectedRunIdx, onSelectRun }) {
+  if (!runs || !runs.length) return null;
+
+  const paths = runs.map((run) => {
+    let cumulative = 0;
+    const values = [0];
+    for (const trade of run.result?.trades || []) {
+      cumulative += Number(trade?.netPL) || 0;
+      values.push(cumulative);
+    }
+    return { run, values };
+  });
+
+  const maxTrades = Math.max(0, ...paths.map((p) => p.values.length - 1));
+  const finalValues = paths
+    .map((p) => Number(p.values[p.values.length - 1]) || 0)
+    .sort((a, b) => a - b);
+  const percentile = (arr, p) => {
+    if (!arr.length) return 0;
+    const pos = (arr.length - 1) * p;
+    const lo = Math.floor(pos);
+    const hi = Math.ceil(pos);
+    if (lo === hi) return arr[lo];
+    return arr[lo] + (arr[hi] - arr[lo]) * (pos - lo);
+  };
+  const worst = finalValues[0] || 0;
+  const best = finalValues[finalValues.length - 1] || 0;
+  const median = percentile(finalValues, 0.5);
+  const p10 = percentile(finalValues, 0.1);
+  const p90 = percentile(finalValues, 0.9);
+
+  const data = Array.from({ length: maxTrades + 1 }, (_, tradeNo) => {
+    const row = { trade: tradeNo };
+    paths.forEach(({ run, values }) => {
+      row[`run_${run.index}`] = tradeNo < values.length ? values[tradeNo] : null;
+    });
+    return row;
+  });
+
+  return (
+    <div className={`${CARD} overflow-hidden`}>
+      <div className="px-4 py-3 border-b border-zinc-800/90 bg-gradient-to-b from-zinc-900/45 to-transparent">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-[13px] font-semibold text-zinc-100">
+              <Activity size={14} className="text-zinc-300" />
+              Cumulative P/L Paths
+            </div>
+            <div className="text-[10px] text-zinc-500 mt-1 leading-relaxed">
+              Every simulation outcome · cumulative Net P/L from Trade 0 to {maxTrades}
+            </div>
+          </div>
+          <div className="flex items-center gap-2.5 text-[10px] font-mono flex-none pt-0.5">
+            <span className="flex items-center gap-1.5 text-zinc-500">
+              <span className="w-2 h-2 rounded-full bg-[#7CCF35]" />Profit
+            </span>
+            <span className="flex items-center gap-1.5 text-zinc-500">
+              <span className="w-2 h-2 rounded-full bg-[#FF8904]" />Loss
+            </span>
+            {selectedRunIdx != null && (
+              <span className="hidden sm:inline-flex items-center gap-1.5 text-zinc-300 border-l border-zinc-800 pl-2.5">
+                Selected #{selectedRunIdx}
+              </span>
+            )}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-3">
+          <div className="rounded-lg border border-zinc-800/80 bg-black/20 px-2.5 py-2">
+            <div className="text-[9px] uppercase tracking-wide text-zinc-600">Best Final</div>
+            <div className={`mt-0.5 text-[11px] font-semibold tabular-nums ${best >= 0 ? "text-[#7CCF35]" : "text-[#FF8904]"}`}>
+              {best >= 0 ? "+" : ""}{fmtMoney(best)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-zinc-800/80 bg-black/20 px-2.5 py-2">
+            <div className="text-[9px] uppercase tracking-wide text-zinc-600">Median Final</div>
+            <div className={`mt-0.5 text-[11px] font-semibold tabular-nums ${median >= 0 ? "text-[#7CCF35]" : "text-[#FF8904]"}`}>
+              {median >= 0 ? "+" : ""}{fmtMoney(median)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-zinc-800/80 bg-black/20 px-2.5 py-2">
+            <div className="text-[9px] uppercase tracking-wide text-zinc-600">P10 → P90</div>
+            <div className="mt-0.5 text-[11px] font-semibold tabular-nums text-zinc-300">
+              {p10 >= 0 ? "+" : ""}{fmtMoney(p10)} <span className="text-zinc-600">→</span> {p90 >= 0 ? "+" : ""}{fmtMoney(p90)}
+            </div>
+          </div>
+          <div className="rounded-lg border border-zinc-800/80 bg-black/20 px-2.5 py-2">
+            <div className="text-[9px] uppercase tracking-wide text-zinc-600">Worst Final</div>
+            <div className={`mt-0.5 text-[11px] font-semibold tabular-nums ${worst >= 0 ? "text-[#7CCF35]" : "text-[#FF8904]"}`}>
+              {worst >= 0 ? "+" : ""}{fmtMoney(worst)}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="h-[25rem] sm:h-[31rem] px-2 pt-3 pb-2">
+        <ResponsiveContainer width="100%" height="100%">
+          <ComposedChart data={data} margin={{ top: 8, right: 18, bottom: 4, left: 4 }}>
+            <CartesianGrid stroke="#CAD5E2" strokeOpacity={0.055} strokeDasharray="2 5" vertical={false} />
+            <XAxis
+              dataKey="trade"
+              stroke="#737373"
+              fontSize={10}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={(v) => `T${v}`}
+              interval="preserveStartEnd"
+              padding={{ left: 8, right: 8 }}
+            />
+            <YAxis
+              stroke="#737373"
+              fontSize={10}
+              tickLine={false}
+              axisLine={false}
+              width={68}
+              tickFormatter={(v) => fmtMoney(v)}
+              domain={["auto", "auto"]}
+            />
+            <ReferenceLine y={0} stroke="#71717A" strokeOpacity={0.8} strokeDasharray="5 5" />
+            <Tooltip
+              content={<MultiSimPathsTooltip selectedRunIdx={selectedRunIdx} />}
+              cursor={{ stroke: "#94A3B8", strokeOpacity: 0.22, strokeDasharray: "4 4" }}
+              isAnimationActive={false}
+            />
+            {paths.map(({ run }) => {
+              const selected = selectedRunIdx === run.index;
+              const profitable = run.result.netPL >= 0;
+              const baseColor = profitable ? "#7CCF35" : "#FF8904";
+              return (
+                <Line
+                  key={run.index}
+                  type="monotone"
+                  dataKey={`run_${run.index}`}
+                  name={`Scenario ${run.index}`}
+                  stroke={baseColor}
+                  strokeWidth={selected ? 2.5 : 0.85}
+                  strokeOpacity={selected ? 1 : 0.13}
+                  dot={false}
+                  activeDot={selected ? { r: 4, fill: baseColor, stroke: "#09090B", strokeWidth: 2 } : false}
+                  isAnimationActive={false}
+                  connectNulls={false}
+                  onClick={() => onSelectRun(run)}
+                  style={{ cursor: "pointer" }}
+                />
+              );
+            })}
+            {selectedRunIdx != null && (
+              <ReferenceDot
+                x={maxTrades}
+                y={(() => {
+                  const selectedPath = paths.find((p) => p.run.index === selectedRunIdx);
+                  return selectedPath ? Number(selectedPath.values[selectedPath.values.length - 1]) || 0 : 0;
+                })()}
+                r={4}
+                fill="#DDD6FF"
+                stroke="#09090B"
+                strokeWidth={2}
+              />
+            )}
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+
+      <div className="px-4 py-2.5 border-t border-zinc-800/90 bg-black/10 flex flex-wrap items-center justify-between gap-2 text-[10px] font-mono">
+        <span className="text-zinc-500">{runs.length.toLocaleString("en-IN")} outcomes · {maxTrades} trades · one line per outcome</span>
+        <span className="text-zinc-400">Click a path or outcome bar to inspect that scenario</span>
+      </div>
+    </div>
+  );
+}
+
+
 // Small clickable summary of one batch run, used by BatchRunSection for the
 // Max Profit / Max Loss / Max Drawdown scenario callouts. Clicking loads
 // that exact run's trade sequence into the stats/chart/Trade Log above.
@@ -1550,6 +1765,7 @@ function ScenarioCard({ title, run, tone, valueColor, selected, onClick }) {
 // away once reviewed, since the histogram + scenario cards take real space.
 function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onSelectRun, selectedRunIdx, onBatchCountChange }) {
   const [collapsed, setCollapsed] = useState(false);
+  const [chartMode, setChartMode] = useState("outcomes");
   const activeMode = mode === "fno" ? "fno" : "single";
   const hasMatchingBatch = batchResult && batchResult.mode === activeMode;
   const stats = hasMatchingBatch ? batchResult.stats : null;
@@ -1575,7 +1791,7 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
             value={cfg.batchCount}
             onChange={onBatchCountChange}
             step="1"
-            placeholder="e.g. 100"
+            placeholder="200"
             className="scenario-count-input w-24 bg-black/30 border border-white/[0.08] text-zinc-100 rounded-lg text-[11px] px-2.5 py-1.5 outline-none focus:ring-1 focus:border-indigo-500/70 focus:ring-indigo-500/20 transition-colors font-mono"
           />
           <button
@@ -1624,14 +1840,43 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
                   valueColor="#EC253F"
                 />
                 <MiniStat label="95% Return CI (Normal)" value={`${stats.ci95Low.toFixed(2)}% to ${stats.ci95High.toFixed(2)}%`} valueColor="#A3B3FF" />
-                <MiniStat label="Risk of Ruin" value={fmtPct(stats.riskOfRuinPct)} sub={`${stats.ruinedCount} ruined runs`} tone={stats.riskOfRuinPct > 0 ? "neg" : undefined} />
               </div>
 
-              <MultiSimHistogram
-                runs={batchResult.runs}
-                selectedRunIdx={selectedRunIdx}
-                onSelectRun={onSelectRun}
-              />
+              <div className="flex items-center justify-between gap-3">
+                <div className="text-[10px] uppercase tracking-wide text-zinc-500">Simulation View</div>
+                <div className="inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-zinc-900 border border-zinc-800">
+                  <button
+                    onClick={() => setChartMode("outcomes")}
+                    className={`px-2.5 py-1 rounded-md text-[10px] font-mono transition-colors ${
+                      chartMode === "outcomes" ? "bg-zinc-800 text-zinc-200 border border-zinc-700" : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                    }`}
+                  >
+                    Outcomes
+                  </button>
+                  <button
+                    onClick={() => setChartMode("paths")}
+                    className={`px-2.5 py-1 rounded-md text-[10px] font-mono transition-colors ${
+                      chartMode === "paths" ? "bg-zinc-800 text-zinc-200 border border-zinc-700" : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                    }`}
+                  >
+                    Cumulative path
+                  </button>
+                </div>
+              </div>
+
+              {chartMode === "outcomes" ? (
+                <MultiSimHistogram
+                  runs={batchResult.runs}
+                  selectedRunIdx={selectedRunIdx}
+                  onSelectRun={onSelectRun}
+                />
+              ) : (
+                <MultiSimPathsChart
+                  runs={batchResult.runs}
+                  selectedRunIdx={selectedRunIdx}
+                  onSelectRun={onSelectRun}
+                />
+              )}
 
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <ScenarioCard
@@ -1665,6 +1910,7 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
     </div>
   );
 }
+
 
 // Floating Run button: fixed to the viewport (not the Configuration column)
 // so it stays reachable even after that sidebar is scrolled past, and
@@ -3492,8 +3738,8 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                 <th className="text-right px-3 py-2 font-medium">Net P/L</th>
                 <th className="text-right px-3 py-2 font-medium">Capital</th>
                 <th className="text-right px-3 py-2 font-medium">Cum. P/L</th>
-                <th className="text-right px-3 py-2 font-medium">Price</th>
                 <th className="text-right px-3 py-2 font-medium">Price Chg</th>
+                <th className="text-right px-3 py-2 font-medium">Price</th>
               </tr>
             </thead>
             <tbody>
@@ -3528,8 +3774,8 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                   <td className={`px-3 py-1.5 text-right ${t.netPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmtMoney(t.netPL)}</td>
                   <td className="px-3 py-1.5 text-right text-[#74D4FF]">{fmtMoney(t.capital)}</td>
                   <td className={`px-3 py-1.5 text-right ${t.capital - initialCapital >= 0 ? "text-emerald-400" : "text-red-400"}`} style={t.n === result.peakTradeIndex ? { color: "#7CFC00" } : t.n === result.troughTradeIndex ? { color: "#FF0000" } : undefined}>{fmtMoney(t.capital - initialCapital)}</td>
-                  <td className="px-3 py-1.5 text-right text-zinc-400">{fmtMoney(t.price)}</td>
                   <td className="px-3 py-1.5 text-right" style={{ color: t.price - t.entryPrice >= 0 ? "#05DF72" : "#FF692A" }}>{t.price - t.entryPrice >= 0 ? "+" : ""}{fmtMoney(t.price - t.entryPrice)}</td>
+                  <td className="px-3 py-1.5 text-right text-zinc-400">{fmtMoney(t.price)}</td>
                 </tr>
               ))}
             </tbody>
@@ -4171,11 +4417,6 @@ export default function RiskSimulator() {
       ? Math.sqrt(netReturns.reduce((s2, x) => s2 + (x - meanReturn) ** 2, 0) / (netReturns.length - 1))
       : 0;
     const ci95HalfWidth = netReturns.length > 1 ? 1.96 * sdReturn / Math.sqrt(netReturns.length) : 0;
-    const ruinLossPct = 80;
-    const ruinThresholdCapital = clean.initialCapital * (1 - ruinLossPct / 100);
-    const ruinedCount = runs.filter((r) => r.result.finalCapital <= ruinThresholdCapital || r.result.maxLossValue <= -clean.initialCapital * (ruinLossPct / 100)).length;
-    const riskOfRuinPct = runs.length ? (ruinedCount / runs.length) * 100 : 0;
-
     const nextBatchResult = {
       runs,
       mode: activeMode,
@@ -4190,8 +4431,6 @@ export default function RiskSimulator() {
         sdReturn,
         ci95Low: meanReturn - ci95HalfWidth,
         ci95High: meanReturn + ci95HalfWidth,
-        riskOfRuinPct,
-        ruinedCount,
         maxProfitRun,
         maxLossRun,
         maxDDRun,
@@ -4224,6 +4463,7 @@ export default function RiskSimulator() {
     setSelectedBatchRunIdx(null);
     setScenarioInput("");
   }, []);
+
 
   // Loads one batch run's exact trade sequence + result into the normal
   // result state, so the stats cards, Per-Trade P/L chart and Trade Log
@@ -5156,8 +5396,8 @@ export default function RiskSimulator() {
                           <th className="text-right px-3 py-2 font-medium">Net P/L</th>
                           <th className="text-right px-3 py-2 font-medium">Capital</th>
                           <th className="text-right px-3 py-2 font-medium">Cum. P/L</th>
-                          <th className="text-right px-3 py-2 font-medium">Price</th>
                           <th className="text-right px-3 py-2 font-medium">Price Chg</th>
+                          <th className="text-right px-3 py-2 font-medium">Price</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -5217,7 +5457,6 @@ export default function RiskSimulator() {
                             >
                               {fmtMoney(t.capital - (lastCleanCfgRef.current?.initialCapital ?? cfg.initialCapital))}
                             </td>
-                            <td className="px-3 py-1.5 text-right text-zinc-400">{fmtMoney(t.price)}</td>
                             <td
                               className="px-3 py-1.5 text-right"
                               style={{ color: t.price - t.entryPrice >= 0 ? "#05DF72" : "#FF692A" }}
@@ -5225,6 +5464,7 @@ export default function RiskSimulator() {
                               {t.price - t.entryPrice >= 0 ? "+" : ""}
                               {fmtMoney(t.price - t.entryPrice)}
                             </td>
+                            <td className="px-3 py-1.5 text-right text-zinc-400">{fmtMoney(t.price)}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -5410,8 +5650,8 @@ export default function RiskSimulator() {
                           <th className="text-right px-3 py-2 font-medium">Net P/L</th>
                           <th className="text-right px-3 py-2 font-medium">Capital</th>
                           <th className="text-right px-3 py-2 font-medium">Cum. P/L</th>
-                          <th className="text-right px-3 py-2 font-medium">Price</th>
                           <th className="text-right px-3 py-2 font-medium">Price Chg</th>
+                          <th className="text-right px-3 py-2 font-medium">Price</th>
                         </tr>
                       </thead>
                       <tbody>
@@ -5472,7 +5712,6 @@ export default function RiskSimulator() {
                             >
                               {fmtMoney(t.capital - (lastCleanCfgRef.current?.initialCapital ?? cfg.initialCapital))}
                             </td>
-                            <td className="px-3 py-1.5 text-right text-zinc-400">{fmtMoney(t.price)}</td>
                             <td
                               className="px-3 py-1.5 text-right"
                               style={{ color: t.price - t.entryPrice >= 0 ? "#05DF72" : "#FF692A" }}
@@ -5480,6 +5719,7 @@ export default function RiskSimulator() {
                               {t.price - t.entryPrice >= 0 ? "+" : ""}
                               {fmtMoney(t.price - t.entryPrice)}
                             </td>
+                            <td className="px-3 py-1.5 text-right text-zinc-400">{fmtMoney(t.price)}</td>
                           </tr>
                         ))}
                       </tbody>
