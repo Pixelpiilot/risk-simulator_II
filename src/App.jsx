@@ -42,12 +42,12 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2700,
+  currentPrice: 2600,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
   cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 70,
+  winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
   perTradeCapPct: 70,
@@ -61,12 +61,12 @@ const DEFAULTS = {
   slipMode: "percent",
   slipPct: 0,
   slipTicks: 1,
-  tickValue: 0.15,
+  tickValue: 0.1,
   entrySpread: 0,
   exitSpread: 0.2,
-  winRate: 50,
+  winRate: 40,
   numTrades: 10,
-  sweepStep: 10,
+  sweepStep: 5,
   sweepRuns: 100,
   batchCount: 200,
   // --- Day / F&O mode (Indian market) ---
@@ -1366,6 +1366,8 @@ function MultiSimTooltip({ active, payload, label }) {
   if (!active || !payload || !payload.length) return null;
   const rows = [];
   const netEntry = payload.find((p) => p.dataKey === "netPL");
+  const point = netEntry?.payload || payload[0]?.payload || {};
+  const sequence = Array.isArray(point.sequence) ? point.sequence : [];
   if (netEntry) {
     rows.push({
       key: "netPL",
@@ -1384,8 +1386,29 @@ function MultiSimTooltip({ active, payload, label }) {
   }
   if (!rows.length) return null;
   return (
-    <div className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2.5 shadow-xl shadow-black/50 font-mono">
-      <div className="text-[10px] text-zinc-500 mb-1.5">Scenario : {label}</div>
+    <div className="min-w-[190px] max-w-[300px] bg-[#27272A] border border-[#57534D] rounded-lg px-3 py-2.5 shadow-xl shadow-black/50 font-mono">
+      <div className="flex items-center justify-between gap-3 mb-2">
+        <div className="text-[10px] text-zinc-300">Scenario : {label}</div>
+        <div className="text-[9px] text-zinc-500">{sequence.length} trades</div>
+      </div>
+      <div className="mb-2.5 rounded-md border border-[#57534D]/60 bg-black/20 px-2 py-1.5">
+        <div className="text-[9px] uppercase tracking-wide text-zinc-500 mb-1">Trade Sequence</div>
+        <div className="flex flex-wrap gap-1">
+          {sequence.length ? sequence.map((isWin, idx) => (
+            <span
+              key={`${idx}-${isWin ? "W" : "L"}`}
+              className="inline-flex min-w-[18px] h-[18px] items-center justify-center rounded-[3px] border px-1 text-[9px] font-semibold leading-none"
+              style={isWin
+                ? { color: "#7CCF35", borderColor: "rgba(124,207,53,0.30)", background: "rgba(124,207,53,0.10)" }
+                : { color: "#FF692A", borderColor: "rgba(255,105,42,0.30)", background: "rgba(255,105,42,0.10)" }}
+            >
+              {isWin ? "W" : "L"}
+            </span>
+          )) : (
+            <span className="text-[9px] text-zinc-600">No sequence</span>
+          )}
+        </div>
+      </div>
       <div className="space-y-1">
         {rows.map((r) => (
           <div key={r.key} className="flex items-center gap-2 text-xs">
@@ -1418,6 +1441,7 @@ function MultiSimHistogram({ runs, selectedRunIdx, onSelectRun }) {
     index: r.index,
     netPL: r.result.netPL,
     win: r.result.netPL >= 0,
+    sequence: Array.isArray(r.winLossSeq) ? r.winLossSeq : [],
     avgProfitLine: avgProfit,
     avgLossLine: avgLoss,
   }));
