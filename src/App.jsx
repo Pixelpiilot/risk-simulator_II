@@ -33,7 +33,7 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2,
+  rr: 2.5,
   // Reward:Risk model: "fixed" preserves the existing behavior; "range"
   // samples a bounded, center-weighted RR independently for each trade.
   rrMode: "fixed",
@@ -64,7 +64,7 @@ const DEFAULTS = {
   tickValue: 0.15,
   entrySpread: 0,
   exitSpread: 0.2,
-  winRate: 40,
+  winRate: 50,
   numTrades: 10,
   sweepStep: 10,
   sweepRuns: 100,
@@ -3252,6 +3252,98 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
 }
 
 
+function TradeAllocationScale({ trade, fno = false, riskScale, onRiskScaleChange }) {
+  const originalRisk = Math.max(0, Number(trade?.risk) || 0);
+  const originalLots = Math.max(0, Number(trade?.lots) || 0);
+  const originalQty = fno ? Math.max(0, Number(trade?.quantity) || 0) : originalLots;
+  const originalFee = Math.max(0, Number(trade?.fee) || 0);
+
+  const clampPct = (v) => Math.min(100, Math.max(0, Number(v) || 0));
+  const scale = clampPct(riskScale);
+  const nowPct = scale / 100;
+
+  const firstRisk = originalRisk * nowPct;
+  const remainingRisk = originalRisk - firstRisk;
+  const firstLots = originalLots * nowPct;
+  const remainingLots = originalLots - firstLots;
+  const firstQty = originalQty * nowPct;
+  const remainingQty = originalQty - firstQty;
+  const firstFee = originalFee * nowPct;
+  const remainingFee = originalFee - firstFee;
+
+  const valueText = (v) => Number(v).toFixed(2);
+  const unitLabel = fno ? "qty" : "lots";
+
+  const statCard = "min-w-0 rounded-lg bg-[#27272A] border border-[#57534D]/55";
+
+  return (
+    <div className="mt-1.5 rounded-lg border border-[#57534D]/55 bg-[#27272A] px-2.5 py-2 overflow-hidden">
+      <div className="flex items-center justify-between gap-2 mb-1.5">
+        <div className="text-[10px] font-semibold uppercase tracking-[0.14em] text-zinc-100">Trade Allocation</div>
+        <div className="font-mono text-[10px] whitespace-nowrap">
+          <span className="text-[#05DF72]">{scale.toFixed(0)}%</span>
+          <span className="mx-1 text-[#57534D]">/</span>
+          <span className="text-[#FF692A]">{(100 - scale).toFixed(0)}%</span>
+          <span className="ml-1 text-zinc-400">now / reserve</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-[minmax(190px,0.72fr)_minmax(0,1.28fr)] gap-2 items-stretch">
+        <div className="rounded-lg border border-[#57534D]/55 bg-[#27272A] px-2.5 py-2 min-w-0">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-[9px] font-medium uppercase tracking-[0.1em] text-zinc-400">Risk Scale</div>
+            <div className="font-mono text-[11px] font-semibold text-[#42D3F2]">{scale.toFixed(0)}%</div>
+          </div>
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value={scale}
+            onChange={(e) => onRiskScaleChange(clampPct(e.target.value))}
+            className="mt-1.5 w-full h-1 cursor-ew-resize accent-[#42D3F2]"
+            aria-label="Risk and position size scale"
+          />
+          <div className="mt-0.5 flex justify-between text-[8px] font-mono text-zinc-500">
+            <span>0%</span><span>50%</span><span>100%</span>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-4 gap-1.5 min-w-0">
+          <div className={`${statCard} px-2 py-1.5`}>
+            <div className="text-[8px] font-medium uppercase tracking-[0.08em] text-zinc-400">Risk Now</div>
+            <div className="mt-0.5 font-mono text-[11px] font-semibold text-[#05DF72] truncate">{fmtMoney(firstRisk)}</div>
+            <div className="text-[8px] font-mono text-zinc-500 truncate">{fmtMoney(remainingRisk)} reserve</div>
+          </div>
+          <div className={`${statCard} px-2 py-1.5`}>
+            <div className="text-[8px] font-medium uppercase tracking-[0.08em] text-zinc-400">Size Now</div>
+            <div className="mt-0.5 font-mono text-[11px] font-semibold text-[#42D3F2] truncate">{valueText(firstLots)} {unitLabel}</div>
+            <div className="text-[8px] font-mono text-zinc-500 truncate">{valueText(remainingLots)} reserve</div>
+          </div>
+          <div className={`${statCard} px-2 py-1.5`}>
+            <div className="text-[8px] font-medium uppercase tracking-[0.08em] text-zinc-400">Qty Now</div>
+            <div className="mt-0.5 font-mono text-[11px] font-semibold text-[#7CCF35] truncate">{valueText(firstQty)}</div>
+            <div className="text-[8px] font-mono text-zinc-500 truncate">{valueText(remainingQty)} reserve</div>
+          </div>
+          <div className={`${statCard} px-2 py-1.5`}>
+            <div className="text-[8px] font-medium uppercase tracking-[0.08em] text-zinc-400">Fee Now</div>
+            <div className="mt-0.5 font-mono text-[11px] font-semibold text-[#FF692A] truncate">{fmtMoney(firstFee)}</div>
+            <div className="text-[8px] font-mono text-zinc-500 truncate">{fmtMoney(remainingFee)} reserve</div>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-1 text-[8px] font-mono text-zinc-400 truncate">
+        Original: <span className="text-zinc-200">{fmtMoney(originalRisk)}</span> risk
+        <span className="mx-1.5 text-[#57534D]">·</span>
+        <span className="text-zinc-200">{valueText(originalQty)} {unitLabel}</span>
+        <span className="mx-1.5 text-[#57534D]">·</span>
+        <span className="text-zinc-200">{fmtMoney(originalFee)}</span> fee
+      </div>
+    </div>
+  );
+}
+
 function TradeResultBadge({ win }) {
   return (
     <span
@@ -3816,6 +3908,8 @@ export default function RiskSimulator() {
   const [scenarioInput, setScenarioInput] = useState("");
   const [dragIdx, setDragIdx] = useState(null);
   const [dragOverIdx, setDragOverIdx] = useState(null);
+  const [allocationOpenIdx, setAllocationOpenIdx] = useState(null);
+  const [allocationScales, setAllocationScales] = useState({});
   const lastCleanCfgRef = useRef(null);
   const lastRunModeRef = useRef(null);
 
@@ -4718,6 +4812,22 @@ export default function RiskSimulator() {
     setDragOverIdx(null);
   };
 
+  const openTradeAllocation = useCallback((idx) => {
+    setAllocationOpenIdx((current) => (current === idx ? null : idx));
+    setAllocationScales((current) => ({
+      ...current,
+      [idx]: current[idx] || { risk: 100 },
+    }));
+  }, []);
+
+  const updateAllocationScale = useCallback((idx, value) => {
+    const v = Math.min(100, Math.max(0, Number(value) || 0));
+    setAllocationScales((current) => ({
+      ...current,
+      [idx]: { risk: v },
+    }));
+  }, []);
+
   const showPriceCol = mode === "single" && lastCleanCfgRef.current?.feeMode === "turnover";
   const isFnoResult = mode === "fno" && lastRunModeRef.current === "fno";
   const isFnoIntraday = lastCleanCfgRef.current?.fnoSegment === "intraday";
@@ -5373,7 +5483,7 @@ export default function RiskSimulator() {
                     </span>
                     <span className="flex items-center gap-1.5 text-[10px] text-zinc-500">
                       <GripVertical size={12} />
-                      Drag to reorder, click Result to flip &mdash; recalcs automatically
+                      Click a trade to open allocation. Drag to reorder, click Result to flip.
                     </span>
                   </div>
                   <div
@@ -5402,6 +5512,7 @@ export default function RiskSimulator() {
                       </thead>
                       <tbody>
                         {result.trades.map((t, idx) => (
+                          <React.Fragment key={`allocation-${t.n}-${idx}`}>
                           <tr
                             key={t.n}
                             draggable
@@ -5409,7 +5520,8 @@ export default function RiskSimulator() {
                             onDragOver={handleRowDragOver(idx)}
                             onDrop={handleRowDrop(idx)}
                             onDragEnd={handleRowDragEnd}
-                            className={`border-b border-zinc-800/60 hover:bg-zinc-800/20 cursor-grab active:cursor-grabbing transition-colors ${
+                            onClick={() => { if (dragIdx === null) openTradeAllocation(idx); }}
+                            className={`border-b border-zinc-800/60 hover:bg-zinc-800/20 cursor-pointer ${dragIdx !== null ? "cursor-grab active:cursor-grabbing" : ""} transition-colors ${
                               dragIdx === idx ? "opacity-40" : ""
                             } ${
                               dragOverIdx === idx && dragIdx !== idx
@@ -5422,7 +5534,10 @@ export default function RiskSimulator() {
                             </td>
                             <td className="px-3 py-1.5 text-zinc-500">{t.n}</td>
                             <td
-                              onClick={() => toggleTradeResult(idx)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleTradeResult(idx);
+                              }}
                               title="Click to flip this trade's result"
                               className="px-3 py-1.5 cursor-pointer select-none hover:brightness-125 transition"
                             >
@@ -5466,6 +5581,18 @@ export default function RiskSimulator() {
                             </td>
                             <td className="px-3 py-1.5 text-right text-zinc-400">{fmtMoney(t.price)}</td>
                           </tr>
+                          {allocationOpenIdx === idx && (
+                            <tr className="border-b border-zinc-800/60 bg-black/20">
+                              <td colSpan={15} className="px-3 py-3">
+                                <TradeAllocationScale
+                                  trade={t}
+                                  riskScale={allocationScales[idx]?.risk ?? 100}
+                                  onRiskScaleChange={(value) => updateAllocationScale(idx, value)}
+                                />
+                              </td>
+                            </tr>
+                          )}
+                          </React.Fragment>
                         ))}
                       </tbody>
                     </table>
@@ -5626,7 +5753,7 @@ export default function RiskSimulator() {
                     </span>
                     <span className="flex items-center gap-1.5 text-[10px] text-zinc-500">
                       <GripVertical size={12} />
-                      Drag to reorder, click Result to flip &mdash; recalcs automatically
+                      Click a trade to open allocation. Drag to reorder, click Result to flip.
                     </span>
                   </div>
                   <div
@@ -5656,6 +5783,7 @@ export default function RiskSimulator() {
                       </thead>
                       <tbody>
                         {result.trades.map((t, idx) => (
+                          <React.Fragment key={`allocation-fno-${t.n}-${idx}`}>
                           <tr
                             key={t.n}
                             draggable
@@ -5663,7 +5791,8 @@ export default function RiskSimulator() {
                             onDragOver={handleRowDragOver(idx)}
                             onDrop={handleRowDrop(idx)}
                             onDragEnd={handleRowDragEnd}
-                            className={`border-b border-zinc-800/60 hover:bg-zinc-800/20 cursor-grab active:cursor-grabbing transition-colors ${
+                            onClick={() => { if (dragIdx === null) openTradeAllocation(idx); }}
+                            className={`border-b border-zinc-800/60 hover:bg-zinc-800/20 cursor-pointer ${dragIdx !== null ? "cursor-grab active:cursor-grabbing" : ""} transition-colors ${
                               dragIdx === idx ? "opacity-40" : ""
                             } ${
                               dragOverIdx === idx && dragIdx !== idx
@@ -5676,7 +5805,10 @@ export default function RiskSimulator() {
                             </td>
                             <td className="px-3 py-1.5 text-zinc-500">{t.n}</td>
                             <td
-                              onClick={() => toggleTradeResult(idx)}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleTradeResult(idx);
+                              }}
                               title="Click to flip this trade's result"
                               className="px-3 py-1.5 cursor-pointer select-none hover:brightness-125 transition"
                             >
@@ -5721,6 +5853,19 @@ export default function RiskSimulator() {
                             </td>
                             <td className="px-3 py-1.5 text-right text-zinc-400">{fmtMoney(t.price)}</td>
                           </tr>
+                          {allocationOpenIdx === idx && (
+                            <tr className="border-b border-zinc-800/60 bg-black/20">
+                              <td colSpan={16} className="px-3 py-3">
+                                <TradeAllocationScale
+                                  trade={t}
+                                  fno
+                                  riskScale={allocationScales[idx]?.risk ?? 100}
+                                  onRiskScaleChange={(value) => updateAllocationScale(idx, value)}
+                                />
+                              </td>
+                            </tr>
+                          )}
+                          </React.Fragment>
                         ))}
                       </tbody>
                     </table>
