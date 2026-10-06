@@ -42,7 +42,7 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2700,
+  currentPrice: 2600,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
@@ -126,6 +126,15 @@ const DEFAULTS = {
   // Builder sequence evaluation count. 100,000 is the hard maximum; the UI
   // automatically shows the smaller of this cap and the mathematically possible total.
   builderSequenceLimit: 100000,
+  // Optional post-evaluation filter for W/L sequences. It never changes the
+  // underlying simulation; it only keeps evaluated sequences matching the
+  // user's structural loss-streak / final-P&L requirements.
+  builderSequenceFilterEnabled: false,
+  builderSequenceFilterOpen: false,
+  builderSequenceFilterLeadingLosses: 2,
+  builderSequenceFilterMatch: "atLeast", // "atLeast" | "exact"
+  builderSequenceFilterFinalPnl: "green", // "green" | "red" | "any"
+  builderSequenceFilterGreenByTrade: 0, // 0 = no recovery deadline
   // Builder search mode: "normal" keeps the original Builder; "target"
   // derives Auto Base Risk % and Auto Base Lots/Unit from a user-specified
   // target-point or risk-point distance while still respecting the Builder
@@ -1114,6 +1123,12 @@ function cleanConfig(cfg) {
     builderMinTrades: Math.max(1, Math.round(Number(cfg.builderMinTrades) || 1)),
     builderMaxTrades: Math.max(1, Math.round(Number(cfg.builderMaxTrades) || 1)),
     builderSequenceLimit: Math.min(100000, Math.max(1, Math.round(Number(cfg.builderSequenceLimit) || 100000))),
+    builderSequenceFilterEnabled: cfg.builderSequenceFilterEnabled === true,
+    builderSequenceFilterOpen: cfg.builderSequenceFilterOpen === true,
+    builderSequenceFilterLeadingLosses: Math.min(1000, Math.max(1, Math.round(Number(cfg.builderSequenceFilterLeadingLosses) || 1))),
+    builderSequenceFilterMatch: cfg.builderSequenceFilterMatch === "exact" ? "exact" : "atLeast",
+    builderSequenceFilterFinalPnl: ["green", "red", "any"].includes(cfg.builderSequenceFilterFinalPnl) ? cfg.builderSequenceFilterFinalPnl : "green",
+    builderSequenceFilterGreenByTrade: Math.min(1000, Math.max(0, Math.round(Number(cfg.builderSequenceFilterGreenByTrade) || 0))),
     builderMode: cfg.builderMode === "target" ? "target" : "normal",
     builderTargetInputMode: cfg.builderTargetInputMode === "riskPoints" ? "riskPoints" : "targetPoints",
     builderTargetValue: Math.max(0, Number(cfg.builderTargetValue) || 0),
@@ -1166,8 +1181,14 @@ function builderInputFields(cfg) {
     builderTotalRiskPct: cfg?.builderTotalRiskPct,
     builderMinTrades: cfg?.builderMinTrades,
     builderMaxTrades: cfg?.builderMaxTrades,
-    builderSequenceLimit: cfg?.builderSequenceLimit,
-    builderMode: cfg?.builderMode,
+    builderSequenceLimit: cfg?.builderSequenceLimit ?? DEFAULTS.builderSequenceLimit,
+    builderSequenceFilterEnabled: cfg?.builderSequenceFilterEnabled ?? DEFAULTS.builderSequenceFilterEnabled,
+    builderSequenceFilterOpen: cfg?.builderSequenceFilterOpen ?? DEFAULTS.builderSequenceFilterOpen,
+    builderSequenceFilterLeadingLosses: cfg?.builderSequenceFilterLeadingLosses ?? DEFAULTS.builderSequenceFilterLeadingLosses,
+    builderSequenceFilterMatch: cfg?.builderSequenceFilterMatch ?? DEFAULTS.builderSequenceFilterMatch,
+    builderSequenceFilterFinalPnl: cfg?.builderSequenceFilterFinalPnl ?? DEFAULTS.builderSequenceFilterFinalPnl,
+    builderSequenceFilterGreenByTrade: cfg?.builderSequenceFilterGreenByTrade ?? DEFAULTS.builderSequenceFilterGreenByTrade,
+    builderMode: cfg?.builderMode ?? DEFAULTS.builderMode,
     builderTargetInputMode: cfg?.builderTargetInputMode,
     builderTargetValue: cfg?.builderTargetValue,
   };
@@ -2626,47 +2647,47 @@ function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initia
           ) : (
             <>
               <div className={`${compact ? "grid grid-cols-2 sm:grid-cols-4" : "grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8"} gap-px bg-zinc-800`}>
-                <div className="bg-zinc-900 px-3 py-2.5">
-                  <div className="text-[10px] text-zinc-400">Median Recovery</div>
-                  <div className="mt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianRecoveryTrades)}</div>
-                  <div className="text-[9px] text-zinc-500 mt-0.5">{isBreakEven ? "trough → P/L ≥ 0" : "trough → prior peak"}</div>
+                <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
+                  <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Median Recovery</div>
+                  <div className="mt-auto pt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianRecoveryTrades)}</div>
+                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">{isBreakEven ? "trough → P/L ≥ 0" : "trough → prior peak"}</div>
                 </div>
-                <div className="bg-zinc-900 px-3 py-2.5">
-                  <div className="text-[10px] text-zinc-400">P75 Recovery</div>
-                  <div className="mt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.p75RecoveryTrades)}</div>
-                  <div className="text-[9px] text-zinc-500 mt-0.5">upper-middle case</div>
+                <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
+                  <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">P75 Recovery</div>
+                  <div className="mt-auto pt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.p75RecoveryTrades)}</div>
+                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">upper-middle case</div>
                 </div>
-                <div className="bg-zinc-900 px-3 py-2.5">
-                  <div className="text-[10px] text-zinc-400">P90 Recovery</div>
-                  <div className="mt-1 font-mono text-sm text-[#7CCF35]">{timeLabel(recovery.p90RecoveryTrades)}</div>
-                  <div className="text-[9px] text-zinc-500 mt-0.5">90th percentile</div>
+                <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
+                  <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">P90 Recovery</div>
+                  <div className="mt-auto pt-1 font-mono text-sm text-[#7CCF35]">{timeLabel(recovery.p90RecoveryTrades)}</div>
+                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">90th percentile</div>
                 </div>
-                <div className="bg-zinc-900 px-3 py-2.5">
-                  <div className="text-[10px] text-zinc-400">Worst Recovery</div>
-                  <div className="mt-1 font-mono text-sm text-[#FF692A]">{timeLabel(recovery.worstRecoveryTrades)}</div>
-                  <div className="text-[9px] text-zinc-500 mt-0.5">longest recovered case</div>
+                <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
+                  <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Worst Recovery</div>
+                  <div className="mt-auto pt-1 font-mono text-sm text-[#FF692A]">{timeLabel(recovery.worstRecoveryTrades)}</div>
+                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">longest recovered case</div>
                 </div>
                 {!compact && (
                   <>
-                    <div className="bg-zinc-900 px-3 py-2.5">
-                      <div className="text-[10px] text-zinc-400">Median Underwater</div>
-                      <div className="mt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianUnderwaterTrades)}</div>
-                      <div className="text-[9px] text-zinc-500 mt-0.5">{isBreakEven ? "negative → break-even" : "peak → recovery/end"}</div>
+                    <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
+                      <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Median Underwater</div>
+                      <div className="mt-auto pt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianUnderwaterTrades)}</div>
+                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">{isBreakEven ? "negative → break-even" : "peak → recovery/end"}</div>
                     </div>
-                    <div className="bg-zinc-900 px-3 py-2.5">
-                      <div className="text-[10px] text-zinc-400">Worst Underwater</div>
-                      <div className="mt-1 font-mono text-sm text-[#FF692A]">{recovery.worstUnderwaterTrades ? `${recovery.worstUnderwaterTrades} trades` : "—"}</div>
-                      <div className="text-[9px] text-zinc-500 mt-0.5">observed duration</div>
+                    <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
+                      <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Worst Underwater</div>
+                      <div className="mt-auto pt-1 font-mono text-sm text-[#FF692A]">{recovery.worstUnderwaterTrades ? `${recovery.worstUnderwaterTrades} trades` : "—"}</div>
+                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">observed duration</div>
                     </div>
-                    <div className="bg-zinc-900 px-3 py-2.5">
-                      <div className="text-[10px] text-zinc-400">Recovered</div>
-                      <div className="mt-1 font-mono text-sm text-[#7CCF35]">{recoveredCount.toLocaleString("en-IN")}</div>
-                      <div className="text-[9px] text-zinc-500 mt-0.5">{recovery.recoveryPct.toFixed(2)}% of {isBreakEven ? "negative runs" : "DD runs"}</div>
+                    <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
+                      <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Recovered</div>
+                      <div className="mt-auto pt-1 font-mono text-sm text-[#7CCF35]">{recoveredCount.toLocaleString("en-IN")}</div>
+                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">{recovery.recoveryPct.toFixed(2)}% of {isBreakEven ? "negative runs" : "DD runs"}</div>
                     </div>
-                    <div className="bg-zinc-900 px-3 py-2.5">
-                      <div className="text-[10px] text-zinc-400">Unrecovered</div>
-                      <div className="mt-1 font-mono text-sm text-[#FF692A]">{unrecoveredCount.toLocaleString("en-IN")}</div>
-                      <div className="text-[9px] text-zinc-500 mt-0.5">{recovery.unrecoveredPct.toFixed(2)}% of {isBreakEven ? "negative runs" : "DD runs"}</div>
+                    <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
+                      <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Unrecovered</div>
+                      <div className="mt-auto pt-1 font-mono text-sm text-[#FF692A]">{unrecoveredCount.toLocaleString("en-IN")}</div>
+                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">{recovery.unrecoveredPct.toFixed(2)}% of {isBreakEven ? "negative runs" : "DD runs"}</div>
                     </div>
                   </>
                 )}
@@ -4137,6 +4158,73 @@ function applyBuilderCandidateEdit(builder, targetWinRate, oldKey, editedCandida
   return deriveBuilderState(builder, nextPoints);
 }
 
+function normalizeBuilderSequenceFilter(rawCfg = {}) {
+  return {
+    enabled: rawCfg.builderSequenceFilterEnabled === true,
+    leadingLosses: Math.min(1000, Math.max(1, Math.round(Number(rawCfg.builderSequenceFilterLeadingLosses) || 1))),
+    match: rawCfg.builderSequenceFilterMatch === "exact" ? "exact" : "atLeast",
+    finalPnl: ["green", "red", "any"].includes(rawCfg.builderSequenceFilterFinalPnl)
+      ? rawCfg.builderSequenceFilterFinalPnl
+      : "green",
+    greenByTrade: Math.min(1000, Math.max(0, Math.round(Number(rawCfg.builderSequenceFilterGreenByTrade) || 0))),
+  };
+}
+
+function getBuilderSequenceLeadingLosses(sequence) {
+  let count = 0;
+  for (const isWin of sequence || []) {
+    if (isWin) break;
+    count += 1;
+  }
+  return count;
+}
+
+function builderSequenceFilterMatches(candidate, filter) {
+  if (!filter?.enabled) return true;
+  if (!candidate) return false;
+
+  const sequence = Array.isArray(candidate.sequenceArray)
+    ? candidate.sequenceArray
+    : String(candidate.sequence || "").split("").map((ch) => ch === "W");
+
+  const leadingLosses = getBuilderSequenceLeadingLosses(sequence);
+  if (filter.match === "exact" ? leadingLosses !== filter.leadingLosses : leadingLosses < filter.leadingLosses) {
+    return false;
+  }
+
+  const finalPnl = Number(candidate.netPL) || 0;
+  if (filter.finalPnl === "green" && !(finalPnl > 1e-10)) return false;
+  if (filter.finalPnl === "red" && !(finalPnl < -1e-10)) return false;
+
+  // Optional timing condition: by Trade N, realized cumulative Net P/L must
+  // have crossed above zero at least once. This is evaluated from the actual
+  // candidate trade log, so fees/spread/slippage are naturally included.
+  if (filter.greenByTrade > 0) {
+    const trades = candidate.result?.trades || [];
+    const limit = Math.min(filter.greenByTrade, trades.length);
+    let cumulative = 0;
+    let greenReached = false;
+    for (let i = 0; i < limit; i += 1) {
+      cumulative += Number(trades[i]?.netPL) || 0;
+      if (cumulative > 1e-10) {
+        greenReached = true;
+        break;
+      }
+    }
+    if (!greenReached) return false;
+  }
+
+  return true;
+}
+
+function builderSequenceFilterLabel(filter) {
+  if (!filter?.enabled) return "Off";
+  const lead = `${filter.match === "exact" ? "exactly" : "at least"} ${filter.leadingLosses} opening losses`;
+  const final = filter.finalPnl === "green" ? "green close" : filter.finalPnl === "red" ? "red close" : "any close";
+  const timing = filter.greenByTrade > 0 ? ` · green by T${filter.greenByTrade}` : "";
+  return `${lead} · ${final}${timing}`;
+}
+
 function runStrategyBuilder(rawCfg) {
   const initialCapital = Math.max(0, Number(rawCfg.builderInitialCapital) || 0);
   const totalRiskPct = Math.max(0, Number(rawCfg.builderTotalRiskPct) || 0);
@@ -4150,6 +4238,7 @@ function runStrategyBuilder(rawCfg) {
   const builderMode = rawCfg.builderMode === "target" ? "target" : "normal";
   const targetInputMode = rawCfg.builderTargetInputMode === "riskPoints" ? "riskPoints" : "targetPoints";
   const targetInputValue = Math.max(0, Number(rawCfg.builderTargetValue) || 0);
+  const sequenceFilter = normalizeBuilderSequenceFilter(rawCfg);
   const engineCfg = cleanConfig({ ...rawCfg, initialCapital });
 
   const userSequenceLimit = Math.min(
@@ -4235,6 +4324,7 @@ function runStrategyBuilder(rawCfg) {
         );
     sequenceEvaluations += 1;
     if (!candidate) return true;
+    if (!builderSequenceFilterMatches(candidate, sequenceFilter)) return null;
     return candidate;
   };
 
@@ -4244,6 +4334,7 @@ function runStrategyBuilder(rawCfg) {
     const candidates = [];
     const winningCandidates = [];
     let winningCountExact = 0;
+    let filterMatchedCount = 0;
     let groupEvaluations = 0;
 
     if (!sampledMode) {
@@ -4261,6 +4352,7 @@ function runStrategyBuilder(rawCfg) {
           const candidate = evaluateCandidate(group, sequence);
           groupEvaluations += 1;
           if (!candidate || typeof candidate === "boolean") return;
+          filterMatchedCount += 1;
           addTopBuilderCandidate(candidates, candidate);
           if (candidate.returnPct > 0) {
             winningCountExact += 1;
@@ -4294,6 +4386,7 @@ function runStrategyBuilder(rawCfg) {
           const candidate = evaluateCandidate(group, seq);
           groupEvaluations += 1;
           if (!candidate || typeof candidate === "boolean") continue;
+          filterMatchedCount += 1;
           addTopBuilderCandidate(candidates, candidate);
         }
       }
@@ -4308,8 +4401,10 @@ function runStrategyBuilder(rawCfg) {
       points.push({
         targetWinRate: group.targetWinRate,
         fractionKey: group.key,
-        status: "Losing Range",
-        reason: exactMode
+        status: sequenceFilter.enabled ? "No Match" : "Losing Range",
+        reason: sequenceFilter.enabled
+          ? `No evaluated sequence matched the active filter (${builderSequenceFilterLabel(sequenceFilter)}).`
+          : exactMode
           ? `No complete combination fits the ${totalRiskPct}% all-in Builder risk budget and active safety stops.`
           : limitedMode
           ? `Sequence limit reached before a complete profitable combination was found inside the ${totalRiskPct}% all-in Builder risk budget and active safety stops.`
@@ -4319,6 +4414,8 @@ function runStrategyBuilder(rawCfg) {
         allCombinations: [],
         winningCombinations: [],
         winningCombinationCount: !sampledMode ? winningCountExact : 0,
+        filterMatchedCount,
+        filterEnabled: sequenceFilter.enabled,
         evaluatedSequenceCount: groupEvaluations,
         sampled: sampledMode,
       });
@@ -4332,7 +4429,7 @@ function runStrategyBuilder(rawCfg) {
     points.push({
       targetWinRate: group.targetWinRate,
       fractionKey: group.key,
-      status: candidate.returnPct > 0 ? "Profitable" : "Losing Range",
+      status: candidate.returnPct > 0 ? "Profitable" : (sequenceFilter.enabled ? "Matched · Losing" : "Losing Range"),
       reason: candidate.returnPct > 0
         ? (exactMode
           ? "Best-return complete combination found inside the all-in Builder risk budget and active safety stops."
@@ -4349,6 +4446,8 @@ function runStrategyBuilder(rawCfg) {
       allCombinations: candidates,
       winningCombinations,
       winningCombinationCount: !sampledMode ? winningCountExact : winningCombinations.length,
+      filterMatchedCount,
+      filterEnabled: sequenceFilter.enabled,
       evaluatedSequenceCount: groupEvaluations,
       sampled: sampledMode,
     });
@@ -4389,6 +4488,8 @@ function runStrategyBuilder(rawCfg) {
     sampledTradeCounts: sourceTradeCounts,
     maxSequenceEvaluations: BUILDER_SAFE_LIMITS.maxSequenceEvaluations,
     maxStoredCandidatesPerGroup: BUILDER_SAFE_LIMITS.maxStoredCandidatesPerGroup,
+    sequenceFilter,
+    sequenceFilterLabel: builderSequenceFilterLabel(sequenceFilter),
   };
 
   return deriveBuilderState(builder, points);
@@ -4515,6 +4616,73 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
             </div>
           );
         })()}
+      </div>
+
+      <div className="mb-5 min-w-0">
+        <GroupTitle icon={SlidersHorizontal} color="violet">Sequence Filter</GroupTitle>
+        <div className="rounded-lg border border-violet-500/20 bg-violet-500/[0.035] p-3 min-w-0 overflow-hidden">
+          <div className="flex items-center gap-2 min-w-0">
+            <button
+              type="button"
+              onClick={() => onChange("builderSequenceFilterOpen")({ target: { value: !cfg.builderSequenceFilterOpen } })}
+              className="min-w-0 flex-1 flex items-center justify-between gap-2 rounded-lg border border-zinc-700/70 bg-zinc-950/60 px-3 py-2 text-[11px] font-mono text-zinc-200 hover:border-violet-500/40 transition-colors"
+            >
+              <span className="truncate">Filter sequences</span>
+              <span className={`truncate ${cfg.builderSequenceFilterEnabled ? "text-violet-300" : "text-zinc-500"}`}>
+                {cfg.builderSequenceFilterEnabled ? builderSequenceFilterLabel(normalizeBuilderSequenceFilter(cfg)) : "Off"}
+              </span>
+              <ChevronDown size={13} className={`shrink-0 text-zinc-500 transition-transform ${cfg.builderSequenceFilterOpen ? "rotate-180" : ""}`} />
+            </button>
+            <button
+              type="button"
+              onClick={() => onChange("builderSequenceFilterEnabled")({ target: { value: !cfg.builderSequenceFilterEnabled } })}
+              className={`shrink-0 rounded-md border px-2.5 py-1.5 text-[9px] font-mono ${cfg.builderSequenceFilterEnabled ? "bg-violet-500/15 border-violet-500/35 text-violet-200" : "bg-zinc-900/60 border-zinc-800 text-zinc-500"}`}
+            >
+              {cfg.builderSequenceFilterEnabled ? "ON" : "OFF"}
+            </button>
+          </div>
+
+          {cfg.builderSequenceFilterOpen && (
+            <div className="mt-2.5">
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="Opening Losses" hint="leading streak">
+                  <NumInput value={cfg.builderSequenceFilterLeadingLosses} onChange={onChange("builderSequenceFilterLeadingLosses")} step="1" min="1" max="1000" color="violet" />
+                </Field>
+                <Field label="Match">
+                  <div className="min-h-[38px] flex rounded-md border border-zinc-800 bg-zinc-950/50 p-0.5">
+                    {["atLeast", "exact"].map((m) => (
+                      <button key={m} type="button" onClick={() => onChange("builderSequenceFilterMatch")({ target: { value: m } })} className={`flex-1 rounded text-[9px] font-mono ${cfg.builderSequenceFilterMatch === m ? "bg-violet-500/20 text-violet-200" : "text-zinc-500 hover:text-zinc-300"}`}>
+                        {m === "atLeast" ? "At least" : "Exactly"}
+                      </button>
+                    ))}
+                  </div>
+                </Field>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="Final P/L">
+                  <div className="min-h-[38px] flex rounded-md border border-zinc-800 bg-zinc-950/50 p-0.5">
+                    {["green", "any", "red"].map((m) => (
+                      <button key={m} type="button" onClick={() => onChange("builderSequenceFilterFinalPnl")({ target: { value: m } })} className={`flex-1 rounded text-[9px] font-mono capitalize ${cfg.builderSequenceFilterFinalPnl === m ? "bg-violet-500/20 text-violet-200" : "text-zinc-500 hover:text-zinc-300"}`}>
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </Field>
+                <Field label="Green by Trade" hint="0 = no deadline">
+                  <NumInput value={cfg.builderSequenceFilterGreenByTrade} onChange={onChange("builderSequenceFilterGreenByTrade")} step="1" min="0" max="1000" color="violet" />
+                </Field>
+              </div>
+
+              <div className="mt-1 rounded-md border border-violet-500/15 bg-zinc-950/40 px-2.5 py-2 text-[9px] leading-relaxed text-zinc-400 break-words">
+                Use this to find sequences such as: <span className="text-zinc-200">first 3 losses → finish green</span>. Optional Green by Trade requires cumulative realized Net P/L to cross above zero by that trade.
+              </div>
+              {cfg.builderSequenceFilterGreenByTrade > 0 && cfg.builderSequenceFilterGreenByTrade <= cfg.builderSequenceFilterLeadingLosses && (
+                <div className="mt-1.5 text-[9px] font-mono text-[#FF692A]">No sequence can turn green by T{cfg.builderSequenceFilterGreenByTrade} after {cfg.builderSequenceFilterLeadingLosses} opening losses. Increase Green by Trade.</div>
+              )}
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="mb-5">
@@ -4929,6 +5097,9 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
               ? `Limited sequence search · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} of ${builder.totalSequenceCount?.toLocaleString("en-IN") || "—"} sequences evaluated`
               : `Large range safety mode · sampled representative sequences · ${builder.evaluatedSequenceCount.toLocaleString("en-IN")} evaluations`}
           </div>
+          {builder.sequenceFilter?.enabled && (
+            <div className="mt-1 text-[10px] text-violet-300/80 font-mono break-words">Sequence filter · {builder.sequenceFilterLabel}</div>
+          )}
         </div>
         <div className="text-right font-mono text-[10px] text-zinc-500">
           {builder.rrMode === "range"
@@ -5023,6 +5194,9 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
                         {point.winningCombinationCount > 0 && (
                           <span className="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/20 text-[9px] text-emerald-300">{point.winningCombinationCount}</span>
                         )}
+                        {builder.sequenceFilter?.enabled && (Number(point.filterMatchedCount) || 0) > 0 && (
+                          <span className="px-1.5 py-0.5 rounded bg-violet-500/10 border border-violet-500/20 text-[9px] text-violet-300">{Number(point.filterMatchedCount).toLocaleString("en-IN")}</span>
+                        )}
                       </span>
                     </td>
                     <td className="px-3 py-2 text-right">{c ? c.tradeCount : "—"}</td>
@@ -5072,7 +5246,7 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
             <div className="text-[13px] font-semibold text-zinc-200">Winning Combination Scenarios</div>
             {winningScenariosOpen && (
               <div className="text-[10px] text-zinc-600 mt-1">
-                {formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} {builder.searchMode === "sampled" ? "sampled" : "stored"} profitable scenario{winningScenarios.length === 1 ? "" : "s"} · Click any bar to open that exact Trade Log.
+                {formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} {builder.searchMode === "sampled" ? "sampled" : "stored"} profitable scenario{winningScenarios.length === 1 ? "" : "s"}{builder.sequenceFilter?.enabled ? ` · ${Number(activeWinRatePoint?.filterMatchedCount || 0).toLocaleString("en-IN")} filter match${Number(activeWinRatePoint?.filterMatchedCount || 0) === 1 ? "" : "es"}` : ""} · Click any bar to open that exact Trade Log.
               </div>
             )}
           </button>
@@ -5644,8 +5818,10 @@ export default function RiskSimulator() {
       "builderMode",
       "builderTargetInputMode",
       "builderBaseMode",
+      "builderSequenceFilterMatch",
+      "builderSequenceFilterFinalPnl",
     ]);
-    const booleanKeys = new Set(["builderRiskMenuOpen"]);
+    const booleanKeys = new Set(["builderRiskMenuOpen", "builderSequenceFilterEnabled", "builderSequenceFilterOpen"]);
     setCfg((c) => ({
       ...c,
       [key]: booleanKeys.has(key)
@@ -5726,6 +5902,9 @@ export default function RiskSimulator() {
           targetWinRate
         );
     if (!editedCandidate) return;
+    if (builderResult.sequenceFilter?.enabled && !builderSequenceFilterMatches(editedCandidate, builderResult.sequenceFilter)) {
+      return;
+    }
 
     const nextBuilder = applyBuilderCandidateEdit(
       builderResult,
@@ -5780,6 +5959,12 @@ export default function RiskSimulator() {
         BUILDER_SAFE_LIMITS.maxSequenceEvaluations,
         Math.max(1, Math.round(Number(cfg.builderSequenceLimit) || BUILDER_SAFE_LIMITS.maxSequenceEvaluations))
       ),
+      builderSequenceFilterEnabled: cfg.builderSequenceFilterEnabled === true,
+      builderSequenceFilterOpen: cfg.builderSequenceFilterOpen === true,
+      builderSequenceFilterLeadingLosses: Math.min(1000, Math.max(1, Math.round(Number(cfg.builderSequenceFilterLeadingLosses) || 1))),
+      builderSequenceFilterMatch: cfg.builderSequenceFilterMatch === "exact" ? "exact" : "atLeast",
+      builderSequenceFilterFinalPnl: ["green", "red", "any"].includes(cfg.builderSequenceFilterFinalPnl) ? cfg.builderSequenceFilterFinalPnl : "green",
+      builderSequenceFilterGreenByTrade: Math.min(1000, Math.max(0, Math.round(Number(cfg.builderSequenceFilterGreenByTrade) || 0))),
       builderMode: cfg.builderMode === "target" ? "target" : "normal",
       builderTargetInputMode: cfg.builderTargetInputMode === "riskPoints" ? "riskPoints" : "targetPoints",
       builderTargetValue: Math.max(0, Number(cfg.builderTargetValue) || 0),
