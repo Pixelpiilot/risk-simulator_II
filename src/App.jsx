@@ -33,7 +33,7 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2,
+  rr: 2.5,
   // Reward:Risk model: "fixed" preserves the existing behavior; "range"
   // samples a bounded, center-weighted RR independently for each trade.
   rrMode: "fixed",
@@ -42,7 +42,7 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2700,
+  currentPrice: 2600,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
@@ -53,7 +53,7 @@ const DEFAULTS = {
   profitCumulativeLossAdjustPct: -20,
   profitCumulativeFlipEnabled: true,
   profitCumulativeFlipAfterLosses: 5,
-  winRiskPct: 70,
+  winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
   perTradeCapPct: 70,
@@ -67,12 +67,12 @@ const DEFAULTS = {
   slipMode: "percent",
   slipPct: 0,
   slipTicks: 1,
-  tickValue: 0.15,
+  tickValue: 0.1,
   entrySpread: 0,
   exitSpread: 0.2,
-  winRate: 50,
+  winRate: 40,
   numTrades: 10,
-  sweepStep: 10,
+  sweepStep: 5,
   sweepRuns: 100,
   batchCount: 200,
   // --- Day / F&O mode (Indian market) ---
@@ -1004,8 +1004,10 @@ function runWinRateSweep(cfg, step, runsPerPoint, simType = "single") {
     // Reward:Risk realized at this win rate — how much upside (Max Profit)
     // was on offer for each unit of downside (Max DD) actually taken.
     const rewardRiskRatio = avgMaxDDValue !== 0 ? avgMaxProfitValue / avgMaxDDValue : avgMaxProfitValue > 0 ? Infinity : 0;
-    const recoverySummary = summarizeRecoveryAnalyses(
-      results.map((r) => analyzeDrawdownRecovery(r.trades || [], cfg.initialCapital))
+    const recoveryAnalyses = results.map((r) => analyzeDrawdownRecovery(r.trades || [], cfg.initialCapital));
+    const recoverySummary = summarizeRecoveryAnalyses(recoveryAnalyses);
+    const breakEvenSummary = summarizeBreakEvenAnalyses(
+      results.map((r) => analyzeBreakEvenRecovery(r.trades || [], cfg.initialCapital))
     );
 
     points.push({
@@ -1024,9 +1026,17 @@ function runWinRateSweep(cfg, step, runsPerPoint, simType = "single") {
       runs: results.length,
       avgDDRecoveryTrades: recoverySummary.avgRecoveryTrades,
       medianDDRecoveryTrades: recoverySummary.medianRecoveryTrades,
+      p75DDRecoveryTrades: recoverySummary.p75RecoveryTrades,
       p90DDRecoveryTrades: recoverySummary.p90RecoveryTrades,
       worstDDRecoveryTrades: recoverySummary.worstRecoveryTrades,
+      recoveryPct: recoverySummary.recoveryPct,
       unrecoveredMaxDDPct: recoverySummary.unrecoveredPct,
+      medianBreakEvenRecoveryTrades: breakEvenSummary.medianRecoveryTrades,
+      p75BreakEvenRecoveryTrades: breakEvenSummary.p75RecoveryTrades,
+      p90BreakEvenRecoveryTrades: breakEvenSummary.p90RecoveryTrades,
+      worstBreakEvenRecoveryTrades: breakEvenSummary.worstRecoveryTrades,
+      breakEvenRecoveryPct: breakEvenSummary.recoveryPct,
+      unrecoveredBreakEvenPct: breakEvenSummary.unrecoveredPct,
     });
 
     if (winRate >= 100) break;
@@ -2156,7 +2166,11 @@ function analyzeDrawdownRecovery(trades, initialCapital) {
       recoveryIndex,
       recovered,
       recoveryTrades: recovered ? Math.max(0, recoveryIndex - episode.troughIndex) : null,
-      underwaterTrades: recovered ? Math.max(0, recoveryIndex - episode.peakTrade) : null,
+      // For an unrecovered episode, report the observed time underwater up to
+      // the end of the analyzed horizon rather than inventing a recovery time.
+      underwaterTrades: recovered
+        ? Math.max(0, recoveryIndex - episode.peakTrade)
+        : Math.max(0, path.length - 1 - episode.peakTrade),
     };
     episodes.push(out);
     if (!maxDDEpisode || out.maxDDValue > maxDDEpisode.maxDDValue) maxDDEpisode = out;
@@ -2234,6 +2248,197 @@ function analyzeDrawdownRecovery(trades, initialCapital) {
   };
 }
 
+
+// Break-even recovery analytics: measures the time needed to take cumulative
+// realized net P/L from its deepest negative episode back to >= 0 (break-even).
+// This is intentionally separate from equity drawdown recovery: equity can be
+// below a prior high-water mark while cumulative P/L is still positive, and a
+// run can also be net-negative without creating a traditional peak-to-trough DD.
+// The analyzer selects the deepest negative P/L episode per run so aggregate
+// statistics remain one comparable event per run, matching the DD analyzer's
+// "maximum episode per run" convention. Time is executed trades, not clock time.
+function analyzeBreakEvenRecovery(trades, initialCapital) {
+  const startCapital = Number(initialCapital) || 0;
+  const path = [0, ...((trades || []).map((t) => {
+    const capital = Number(t?.capital);
+    return Number.isFinite(capital) ? capital - startCapital : NaN;
+  }))];
+  if (path.length < 2) {
+    return {
+      episodes: [],
+      maxNegativePct: 0,
+      maxNegativeValue: 0,
+      maxNegativeStartTrade: 0,
+      maxNegativeTroughTrade: 0,
+      maxNegativeRecoveryTrade: null,
+      maxNegativeRecoveryTrades: null,
+      maxNegativeUnderwaterTrades: null,
+      maxNegativeRecovered: null,
+      hasNegative: false,
+      recoveredEpisodes: 0,
+      unrecoveredEpisodes: 0,
+    };
+  }
+
+  const EPS = 1e-10;
+  let open = null;
+  const episodes = [];
+  let worstEpisode = null;
+
+  const closeEpisode = (episode, recoveryIndex = null) => {
+    if (!episode) return;
+    const recovered = recoveryIndex !== null;
+    const out = {
+      ...episode,
+      recoveryIndex,
+      recovered,
+      recoveryTrades: recovered ? Math.max(0, recoveryIndex - episode.troughIndex) : null,
+      underwaterTrades: recovered
+        ? Math.max(0, recoveryIndex - episode.startTrade)
+        : Math.max(0, path.length - 1 - episode.startTrade),
+    };
+    episodes.push(out);
+    if (!worstEpisode || out.troughPnl < worstEpisode.troughPnl - EPS) worstEpisode = out;
+  };
+
+  for (let i = 1; i < path.length; i++) {
+    const pnl = path[i];
+    if (!Number.isFinite(pnl)) continue;
+
+    // Break-even is reached when cumulative realized P/L returns to zero or
+    // positive. A positive point therefore closes the negative episode too.
+    if (pnl >= -EPS) {
+      if (open) closeEpisode(open, i);
+      open = null;
+      continue;
+    }
+
+    if (!open) {
+      open = {
+        startTrade: i,
+        troughIndex: i,
+        troughPnl: pnl,
+      };
+    } else if (pnl < open.troughPnl - EPS) {
+      open.troughIndex = i;
+      open.troughPnl = pnl;
+    }
+  }
+
+  if (open) closeEpisode(open, null);
+
+  const recoveredEpisodes = episodes.filter((e) => e.recovered).length;
+  const unrecoveredEpisodes = episodes.length - recoveredEpisodes;
+  const worst = worstEpisode;
+  const maxNegativeValue = worst ? Math.max(0, -worst.troughPnl) : 0;
+  const maxNegativePct = startCapital > 0 ? (maxNegativeValue / startCapital) * 100 : 0;
+
+  return {
+    episodes,
+    maxNegativePct,
+    maxNegativeValue,
+    maxNegativeStartTrade: worst?.startTrade ?? 0,
+    maxNegativeTroughTrade: worst?.troughIndex ?? 0,
+    maxNegativeRecoveryTrade: worst?.recoveryIndex ?? null,
+    maxNegativeRecoveryTrades: worst?.recoveryTrades ?? null,
+    maxNegativeUnderwaterTrades: worst?.underwaterTrades ?? null,
+    maxNegativeRecovered: worst ? !!worst.recovered : null,
+    hasNegative: !!worst,
+    recoveredEpisodes,
+    unrecoveredEpisodes,
+  };
+}
+
+function emptyBreakEvenAccumulator() {
+  return {
+    count: 0,
+    negativeRuns: 0,
+    recoveredCount: 0,
+    unrecoveredCount: 0,
+    recoveryTimes: [],
+    underwaterTimes: [],
+    bucketCounts: Object.fromEntries(RECOVERY_BUCKETS.map((b) => [b.label, 0])),
+    bucketUnrecovered: Object.fromEntries(RECOVERY_BUCKETS.map((b) => [b.label, 0])),
+    bucketRecoveryTimes: Object.fromEntries(RECOVERY_BUCKETS.map((b) => [b.label, []])),
+    bucketUnderwaterTimes: Object.fromEntries(RECOVERY_BUCKETS.map((b) => [b.label, []])),
+  };
+}
+
+function addBreakEvenToAccumulator(acc, analysis) {
+  if (!acc || !analysis) return acc;
+  acc.count += 1;
+  if (!analysis.hasNegative) return acc;
+  acc.negativeRuns += 1;
+  if (analysis.maxNegativeRecovered) acc.recoveredCount += 1;
+  else acc.unrecoveredCount += 1;
+
+  const bucket = recoveryBucketForDD(analysis.maxNegativePct).label;
+  acc.bucketCounts[bucket] = (acc.bucketCounts[bucket] || 0) + 1;
+  if (!analysis.maxNegativeRecovered) acc.bucketUnrecovered[bucket] = (acc.bucketUnrecovered[bucket] || 0) + 1;
+
+  if (analysis.maxNegativeRecoveryTrades != null && Number.isFinite(analysis.maxNegativeRecoveryTrades)) {
+    const t = Math.max(0, Math.round(analysis.maxNegativeRecoveryTrades));
+    acc.recoveryTimes.push(t);
+    acc.bucketRecoveryTimes[bucket].push(t);
+  }
+  if (analysis.maxNegativeUnderwaterTrades != null && Number.isFinite(analysis.maxNegativeUnderwaterTrades)) {
+    const u = Math.max(0, Math.round(analysis.maxNegativeUnderwaterTrades));
+    acc.underwaterTimes.push(u);
+    acc.bucketUnderwaterTimes[bucket].push(u);
+  }
+  return acc;
+}
+
+function finalizeBreakEvenAccumulator(acc) {
+  const count = Math.max(0, Number(acc?.count) || 0);
+  const negativeRuns = Math.max(0, Number(acc?.negativeRuns) || 0);
+  const recoveredCount = Math.max(0, Number(acc?.recoveredCount) || 0);
+  const unrecoveredCount = Math.max(0, Number(acc?.unrecoveredCount) || 0);
+  const recoveryTimes = (acc?.recoveryTimes || []).filter(Number.isFinite);
+  const underwaterTimes = (acc?.underwaterTimes || []).filter(Number.isFinite);
+  return {
+    totalRuns: count,
+    negativeRuns,
+    recoveredRuns: recoveredCount,
+    unrecoveredRuns: unrecoveredCount,
+    recoveryPct: negativeRuns ? (recoveredCount / negativeRuns) * 100 : 0,
+    unrecoveredPct: negativeRuns ? (unrecoveredCount / negativeRuns) * 100 : 0,
+    avgRecoveryTrades: recoveryTimes.length ? recoveryTimes.reduce((a, b) => a + b, 0) / recoveryTimes.length : null,
+    medianRecoveryTrades: recoveryTimes.length ? percentileValue(recoveryTimes, 0.5) : null,
+    p75RecoveryTrades: recoveryTimes.length ? percentileValue(recoveryTimes, 0.75) : null,
+    p90RecoveryTrades: recoveryTimes.length ? percentileValue(recoveryTimes, 0.9) : null,
+    worstRecoveryTrades: recoveryTimes.length ? Math.max(...recoveryTimes) : null,
+    avgUnderwaterTrades: underwaterTimes.length ? underwaterTimes.reduce((a, b) => a + b, 0) / underwaterTimes.length : null,
+    medianUnderwaterTrades: underwaterTimes.length ? percentileValue(underwaterTimes, 0.5) : null,
+    p90UnderwaterTrades: underwaterTimes.length ? percentileValue(underwaterTimes, 0.9) : null,
+    worstUnderwaterTrades: underwaterTimes.length ? Math.max(...underwaterTimes) : null,
+    bucketRows: RECOVERY_BUCKETS.map((b) => {
+      const times = (acc?.bucketRecoveryTimes?.[b.label] || []).filter(Number.isFinite);
+      const uwTimes = (acc?.bucketUnderwaterTimes?.[b.label] || []).filter(Number.isFinite);
+      const bucketCount = Number(acc?.bucketCounts?.[b.label]) || 0;
+      const unrecovered = Number(acc?.bucketUnrecovered?.[b.label]) || 0;
+      return {
+        label: b.label,
+        count: bucketCount,
+        recovered: Math.max(0, bucketCount - unrecovered),
+        unrecovered,
+        median: times.length ? percentileValue(times, 0.5) : null,
+        p75: times.length ? percentileValue(times, 0.75) : null,
+        p90: times.length ? percentileValue(times, 0.9) : null,
+        worst: times.length ? Math.max(...times) : null,
+        medianUnderwater: uwTimes.length ? percentileValue(uwTimes, 0.5) : null,
+        worstUnderwater: uwTimes.length ? Math.max(...uwTimes) : null,
+      };
+    }),
+  };
+}
+
+function summarizeBreakEvenAnalyses(analyses) {
+  const acc = emptyBreakEvenAccumulator();
+  (analyses || []).forEach((a) => addBreakEvenToAccumulator(acc, a));
+  return finalizeBreakEvenAccumulator(acc);
+}
+
 function emptyRecoveryAccumulator() {
   return {
     count: 0,
@@ -2241,9 +2446,11 @@ function emptyRecoveryAccumulator() {
     recoveredCount: 0,
     unrecoveredCount: 0,
     recoveryTimes: [],
+    underwaterTimes: [],
     bucketCounts: Object.fromEntries(RECOVERY_BUCKETS.map((b) => [b.label, 0])),
     bucketUnrecovered: Object.fromEntries(RECOVERY_BUCKETS.map((b) => [b.label, 0])),
     bucketRecoveryTimes: Object.fromEntries(RECOVERY_BUCKETS.map((b) => [b.label, []])),
+    bucketUnderwaterTimes: Object.fromEntries(RECOVERY_BUCKETS.map((b) => [b.label, []])),
     worstRecoveryTrades: 0,
     worstUnderwaterTrades: 0,
   };
@@ -2269,7 +2476,11 @@ function addRecoveryToAccumulator(acc, analysis) {
     acc.worstRecoveryTrades = Math.max(acc.worstRecoveryTrades, t);
   }
   if (analysis.maxDDUnderwaterTrades != null && Number.isFinite(analysis.maxDDUnderwaterTrades)) {
-    acc.worstUnderwaterTrades = Math.max(acc.worstUnderwaterTrades, Math.round(analysis.maxDDUnderwaterTrades));
+    const u = Math.max(0, Math.round(analysis.maxDDUnderwaterTrades));
+    acc.underwaterTimes.push(u);
+    if (!acc.bucketUnderwaterTimes[bucket]) acc.bucketUnderwaterTimes[bucket] = [];
+    acc.bucketUnderwaterTimes[bucket].push(u);
+    acc.worstUnderwaterTrades = Math.max(acc.worstUnderwaterTrades, u);
   }
   return acc;
 }
@@ -2279,28 +2490,40 @@ function finalizeRecoveryAccumulator(acc) {
   const recoveredCount = Math.max(0, Number(acc?.recoveredCount) || 0);
   const unrecoveredCount = Math.max(0, Number(acc?.unrecoveredCount) || 0);
   const recoveryTimes = (acc?.recoveryTimes || []).filter(Number.isFinite);
+  const underwaterTimes = (acc?.underwaterTimes || []).filter(Number.isFinite);
+  const drawdownRuns = Number(acc?.drawdownRuns) || 0;
   return {
     totalRuns: count,
-    drawdownRuns: Number(acc?.drawdownRuns) || 0,
+    drawdownRuns,
     recoveredMaxDDRuns: recoveredCount,
     unrecoveredMaxDDRuns: unrecoveredCount,
-    recoveryPct: (Number(acc?.drawdownRuns) || 0) ? (recoveredCount / Number(acc.drawdownRuns)) * 100 : 0,
-    unrecoveredPct: (Number(acc?.drawdownRuns) || 0) ? (unrecoveredCount / Number(acc.drawdownRuns)) * 100 : 0,
+    recoveryPct: drawdownRuns ? (recoveredCount / drawdownRuns) * 100 : 0,
+    unrecoveredPct: drawdownRuns ? (unrecoveredCount / drawdownRuns) * 100 : 0,
     avgRecoveryTrades: recoveryTimes.length ? recoveryTimes.reduce((a, b) => a + b, 0) / recoveryTimes.length : null,
     medianRecoveryTrades: recoveryTimes.length ? percentileValue(recoveryTimes, 0.5) : null,
+    p75RecoveryTrades: recoveryTimes.length ? percentileValue(recoveryTimes, 0.75) : null,
     p90RecoveryTrades: recoveryTimes.length ? percentileValue(recoveryTimes, 0.9) : null,
     worstRecoveryTrades: recoveryTimes.length ? Math.max(...recoveryTimes) : null,
-    worstUnderwaterTrades: acc?.worstUnderwaterTrades || 0,
+    avgUnderwaterTrades: underwaterTimes.length ? underwaterTimes.reduce((a, b) => a + b, 0) / underwaterTimes.length : null,
+    medianUnderwaterTrades: underwaterTimes.length ? percentileValue(underwaterTimes, 0.5) : null,
+    p90UnderwaterTrades: underwaterTimes.length ? percentileValue(underwaterTimes, 0.9) : null,
+    worstUnderwaterTrades: underwaterTimes.length ? Math.max(...underwaterTimes) : null,
     bucketRows: RECOVERY_BUCKETS.map((b) => {
       const times = (acc?.bucketRecoveryTimes?.[b.label] || []).filter(Number.isFinite);
+      const uwTimes = (acc?.bucketUnderwaterTimes?.[b.label] || []).filter(Number.isFinite);
       const bucketCount = Number(acc?.bucketCounts?.[b.label]) || 0;
       const unrecovered = Number(acc?.bucketUnrecovered?.[b.label]) || 0;
       return {
         label: b.label,
         count: bucketCount,
+        recovered: Math.max(0, bucketCount - unrecovered),
         unrecovered,
         median: times.length ? percentileValue(times, 0.5) : null,
+        p75: times.length ? percentileValue(times, 0.75) : null,
         p90: times.length ? percentileValue(times, 0.9) : null,
+        worst: times.length ? Math.max(...times) : null,
+        medianUnderwater: uwTimes.length ? percentileValue(uwTimes, 0.5) : null,
+        worstUnderwater: uwTimes.length ? Math.max(...uwTimes) : null,
       };
     }),
   };
@@ -2312,149 +2535,315 @@ function summarizeRecoveryAnalyses(analyses) {
   return finalizeRecoveryAccumulator(acc);
 }
 
-function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initialCapital, runs = null, summary = null, compact = false }) {
-  let recovery = summary;
-  if (!recovery && Array.isArray(runs)) {
-    recovery = summarizeRecoveryAnalyses(
+function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initialCapital, runs = null, summary = null, breakEvenSummary = null, compact = false }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [analysisMode, setAnalysisMode] = useState("drawdown");
+
+  let drawdownRecovery = summary;
+  if (!drawdownRecovery && Array.isArray(runs)) {
+    drawdownRecovery = summarizeRecoveryAnalyses(
       runs.map((r) => analyzeDrawdownRecovery(r?.result?.trades || r?.trades || [], initialCapital))
     );
   }
-  if (!recovery && trades?.length) {
-    const single = analyzeDrawdownRecovery(trades, initialCapital);
-    recovery = summarizeRecoveryAnalyses([single]);
+  if (!drawdownRecovery && trades?.length) {
+    drawdownRecovery = summarizeRecoveryAnalyses([
+      analyzeDrawdownRecovery(trades, initialCapital),
+    ]);
   }
-  if (!recovery || !recovery.totalRuns || !recovery.drawdownRuns) return null;
 
+  let breakEvenRecovery = breakEvenSummary || null;
+  if (!breakEvenRecovery && Array.isArray(runs)) {
+    breakEvenRecovery = summarizeBreakEvenAnalyses(
+      runs.map((r) => analyzeBreakEvenRecovery(r?.result?.trades || r?.trades || [], initialCapital))
+    );
+  } else if (!breakEvenRecovery && trades?.length) {
+    breakEvenRecovery = summarizeBreakEvenAnalyses([
+      analyzeBreakEvenRecovery(trades, initialCapital),
+    ]);
+  }
+
+  const recovery = analysisMode === "drawdown" ? drawdownRecovery : breakEvenRecovery;
+  if (!recovery || !recovery.totalRuns) return null;
+
+  const isBreakEven = analysisMode === "breakeven";
+  const episodeCount = isBreakEven ? recovery.negativeRuns : recovery.drawdownRuns;
+  const recoveredCount = isBreakEven ? recovery.recoveredRuns : recovery.recoveredMaxDDRuns;
+  const unrecoveredCount = isBreakEven ? recovery.unrecoveredRuns : recovery.unrecoveredMaxDDRuns;
   const timeLabel = (value) => value == null ? "—" : `${Math.round(value)} trades`;
-  const hasAnyRecovered = recovery.recoveredMaxDDRuns > 0 || recovery.avgRecoveryTrades != null;
+  const hasEpisode = episodeCount > 0;
+  const hasAnyRecovered = recoveredCount > 0 || recovery.avgRecoveryTrades != null;
+  const sectionTitle = isBreakEven ? "Break-even Recovery" : title;
+  const subtitle = isBreakEven
+    ? "Time from the deepest negative cumulative P/L point back to ₹0 or better."
+    : "Peak-to-trough DD recovery from actual equity paths · time is measured in executed trades.";
+  const bucketTitle = isBreakEven
+    ? "Recovery by Deepest Negative P/L Severity"
+    : "Recovery by Maximum Drawdown Severity";
+  const bucketLabel = isBreakEven ? "Worst Neg P/L" : "Max DD";
+
   return (
     <div className={`${CARD} overflow-hidden`}>
-      <div className="px-4 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <div className="text-[13px] font-semibold text-zinc-100">{title}</div>
-          <div className="text-[10px] text-zinc-400 mt-0.5">Peak-to-trough drawdown recovery measured from actual equity paths.</div>
-        </div>
-        <div className="text-[10px] font-mono text-zinc-300">{recovery.totalRuns.toLocaleString("en-IN")} run{recovery.totalRuns === 1 ? "" : "s"}</div>
-      </div>
-
-      <div className={`${compact ? "grid grid-cols-2 sm:grid-cols-4" : "grid grid-cols-2 sm:grid-cols-5"} gap-px bg-zinc-800`}>
-        <div className="bg-zinc-900 px-3 py-2.5">
-          <div className="text-[10px] text-zinc-400">Median Recovery</div>
-          <div className="mt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianRecoveryTrades)}</div>
-          <div className="text-[9px] text-zinc-500 mt-0.5">trough → prior peak</div>
-        </div>
-        <div className="bg-zinc-900 px-3 py-2.5">
-          <div className="text-[10px] text-zinc-400">P90 Recovery</div>
-          <div className="mt-1 font-mono text-sm text-[#7CCF35]">{timeLabel(recovery.p90RecoveryTrades)}</div>
-          <div className="text-[9px] text-zinc-500 mt-0.5">90th percentile</div>
-        </div>
-        <div className="bg-zinc-900 px-3 py-2.5">
-          <div className="text-[10px] text-zinc-400">Worst Recovery</div>
-          <div className="mt-1 font-mono text-sm text-[#FF692A]">{timeLabel(recovery.worstRecoveryTrades)}</div>
-          <div className="text-[9px] text-zinc-500 mt-0.5">longest recovered DD</div>
-        </div>
-        <div className="bg-zinc-900 px-3 py-2.5">
-          <div className="text-[10px] text-zinc-400">Underwater</div>
-          <div className="mt-1 font-mono text-sm text-[#42D3F2]">{recovery.worstUnderwaterTrades ? `${recovery.worstUnderwaterTrades} trades` : "—"}</div>
-          <div className="text-[9px] text-zinc-500 mt-0.5">peak → recovery</div>
-        </div>
-        {!compact && (
-          <div className="bg-zinc-900 px-3 py-2.5">
-            <div className="text-[10px] text-zinc-400">Unrecovered</div>
-            <div className="mt-1 font-mono text-sm text-[#FF692A]">{recovery.unrecoveredMaxDDRuns.toLocaleString("en-IN")}</div>
-            <div className="text-[9px] text-zinc-500 mt-0.5">{recovery.unrecoveredPct.toFixed(2)}% of drawdown runs</div>
+      <div
+        className="w-full px-4 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-2"
+      >
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          className="min-w-0 flex-1 text-left hover:opacity-90 transition-opacity"
+        >
+          <div className="flex flex-wrap items-center gap-2 text-[13px] font-semibold text-zinc-100">
+            <Activity size={14} className="text-[#42D3F2]" />
+            {sectionTitle}
+            <ChevronDown size={14} className={`text-zinc-500 transition-transform ${collapsed ? "" : "rotate-180"}`} />
           </div>
-        )}
-      </div>
-
-      <div className="px-4 py-2.5 border-t border-zinc-800">
-        <div className="text-[10px] uppercase tracking-wide text-zinc-400 mb-2">Recovery by Maximum Drawdown Severity</div>
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[620px] font-mono text-[10px]">
-            <thead>
-              <tr className="text-zinc-500 border-b border-zinc-800">
-                <th className="text-left py-1.5 pr-3">Max DD</th>
-                <th className="text-right py-1.5 px-3">Runs</th>
-                <th className="text-right py-1.5 px-3">Median</th>
-                <th className="text-right py-1.5 px-3">P90</th>
-                <th className="text-right py-1.5 pl-3">Unrecovered</th>
-              </tr>
-            </thead>
-            <tbody>
-              {recovery.bucketRows.map((row) => (
-                <tr key={row.label} className="border-b border-zinc-800/60">
-                  <td className="py-1.5 pr-3 text-zinc-300">{row.label}</td>
-                  <td className="py-1.5 px-3 text-right text-zinc-300">{row.count.toLocaleString("en-IN")}</td>
-                  <td className="py-1.5 px-3 text-right text-[#42D3F2]">{row.median == null ? "—" : `${Math.round(row.median)} t`}</td>
-                  <td className="py-1.5 px-3 text-right text-[#7CCF35]">{row.p90 == null ? "—" : `${Math.round(row.p90)} t`}</td>
-                  <td className="py-1.5 pl-3 text-right text-[#FF692A]">{row.unrecovered.toLocaleString("en-IN")}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="text-[10px] text-zinc-400 mt-0.5">{subtitle}</div>
+        </button>
+        <div className="flex items-center gap-2 flex-none">
+          <div className="flex rounded-md border border-[#57534D] bg-[#27272A] p-0.5">
+            <button
+              type="button"
+              onClick={() => setAnalysisMode("drawdown")}
+              className={`px-2.5 py-1 text-[9px] font-mono rounded transition-colors ${analysisMode === "drawdown" ? "bg-[#57534D] text-zinc-100" : "text-zinc-400 hover:text-zinc-200"}`}
+            >DD Recovery</button>
+            <button
+              type="button"
+              onClick={() => setAnalysisMode("breakeven")}
+              className={`px-2.5 py-1 text-[9px] font-mono rounded transition-colors ${analysisMode === "breakeven" ? "bg-[#57534D] text-zinc-100" : "text-zinc-400 hover:text-zinc-200"}`}
+            >Break-even</button>
+          </div>
+          <span className="text-[10px] font-mono text-zinc-300">{recovery.totalRuns.toLocaleString("en-IN")} run{recovery.totalRuns === 1 ? "" : "s"}</span>
         </div>
       </div>
-      {!hasAnyRecovered && (
-        <div className="px-4 pb-3 text-[9px] text-zinc-500">No drawdown episode recovered to its prior peak within the analyzed horizon.</div>
+
+      {!collapsed && (
+        <>
+          {!hasEpisode ? (
+            <div className="px-4 py-6 text-center text-[10px] text-zinc-400">
+              {isBreakEven
+                ? "No negative cumulative P/L episode detected in the analyzed horizon."
+                : "No drawdown episode detected in the analyzed horizon. Recovery statistics are not applicable."}
+            </div>
+          ) : (
+            <>
+              <div className={`${compact ? "grid grid-cols-2 sm:grid-cols-4" : "grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8"} gap-px bg-zinc-800`}>
+                <div className="bg-zinc-900 px-3 py-2.5">
+                  <div className="text-[10px] text-zinc-400">Median Recovery</div>
+                  <div className="mt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianRecoveryTrades)}</div>
+                  <div className="text-[9px] text-zinc-500 mt-0.5">{isBreakEven ? "trough → P/L ≥ 0" : "trough → prior peak"}</div>
+                </div>
+                <div className="bg-zinc-900 px-3 py-2.5">
+                  <div className="text-[10px] text-zinc-400">P75 Recovery</div>
+                  <div className="mt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.p75RecoveryTrades)}</div>
+                  <div className="text-[9px] text-zinc-500 mt-0.5">upper-middle case</div>
+                </div>
+                <div className="bg-zinc-900 px-3 py-2.5">
+                  <div className="text-[10px] text-zinc-400">P90 Recovery</div>
+                  <div className="mt-1 font-mono text-sm text-[#7CCF35]">{timeLabel(recovery.p90RecoveryTrades)}</div>
+                  <div className="text-[9px] text-zinc-500 mt-0.5">90th percentile</div>
+                </div>
+                <div className="bg-zinc-900 px-3 py-2.5">
+                  <div className="text-[10px] text-zinc-400">Worst Recovery</div>
+                  <div className="mt-1 font-mono text-sm text-[#FF692A]">{timeLabel(recovery.worstRecoveryTrades)}</div>
+                  <div className="text-[9px] text-zinc-500 mt-0.5">longest recovered case</div>
+                </div>
+                {!compact && (
+                  <>
+                    <div className="bg-zinc-900 px-3 py-2.5">
+                      <div className="text-[10px] text-zinc-400">Median Underwater</div>
+                      <div className="mt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianUnderwaterTrades)}</div>
+                      <div className="text-[9px] text-zinc-500 mt-0.5">{isBreakEven ? "negative → break-even" : "peak → recovery/end"}</div>
+                    </div>
+                    <div className="bg-zinc-900 px-3 py-2.5">
+                      <div className="text-[10px] text-zinc-400">Worst Underwater</div>
+                      <div className="mt-1 font-mono text-sm text-[#FF692A]">{recovery.worstUnderwaterTrades ? `${recovery.worstUnderwaterTrades} trades` : "—"}</div>
+                      <div className="text-[9px] text-zinc-500 mt-0.5">observed duration</div>
+                    </div>
+                    <div className="bg-zinc-900 px-3 py-2.5">
+                      <div className="text-[10px] text-zinc-400">Recovered</div>
+                      <div className="mt-1 font-mono text-sm text-[#7CCF35]">{recoveredCount.toLocaleString("en-IN")}</div>
+                      <div className="text-[9px] text-zinc-500 mt-0.5">{recovery.recoveryPct.toFixed(2)}% of {isBreakEven ? "negative runs" : "DD runs"}</div>
+                    </div>
+                    <div className="bg-zinc-900 px-3 py-2.5">
+                      <div className="text-[10px] text-zinc-400">Unrecovered</div>
+                      <div className="mt-1 font-mono text-sm text-[#FF692A]">{unrecoveredCount.toLocaleString("en-IN")}</div>
+                      <div className="text-[9px] text-zinc-500 mt-0.5">{recovery.unrecoveredPct.toFixed(2)}% of {isBreakEven ? "negative runs" : "DD runs"}</div>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="px-4 py-2.5 border-t border-zinc-800">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <div className="text-[10px] uppercase tracking-wide text-zinc-400">{bucketTitle}</div>
+                  <div className="text-[9px] text-zinc-500 font-mono">t = trades · UW = underwater duration</div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[980px] font-mono text-[10px]">
+                    <thead>
+                      <tr className="text-zinc-500 border-b border-zinc-800">
+                        <th className="text-left py-1.5 pr-3">{bucketLabel}</th>
+                        <th className="text-right py-1.5 px-2">Runs</th>
+                        <th className="text-right py-1.5 px-2">Recovered</th>
+                        <th className="text-right py-1.5 px-2">Median</th>
+                        <th className="text-right py-1.5 px-2">P75</th>
+                        <th className="text-right py-1.5 px-2">P90</th>
+                        <th className="text-right py-1.5 px-2">Worst</th>
+                        <th className="text-right py-1.5 px-2">Median UW</th>
+                        <th className="text-right py-1.5 px-2">Worst UW</th>
+                        <th className="text-right py-1.5 pl-2">Unrecovered</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {recovery.bucketRows.map((row) => (
+                        <tr key={row.label} className="border-b border-zinc-800/60">
+                          <td className="py-1.5 pr-3 text-zinc-300">{row.label}</td>
+                          <td className="py-1.5 px-2 text-right text-zinc-300">{row.count.toLocaleString("en-IN")}</td>
+                          <td className="py-1.5 px-2 text-right text-[#7CCF35]">{row.recovered.toLocaleString("en-IN")}</td>
+                          <td className="py-1.5 px-2 text-right text-[#42D3F2]">{row.median == null ? "—" : `${Math.round(row.median)} t`}</td>
+                          <td className="py-1.5 px-2 text-right text-[#42D3F2]">{row.p75 == null ? "—" : `${Math.round(row.p75)} t`}</td>
+                          <td className="py-1.5 px-2 text-right text-[#7CCF35]">{row.p90 == null ? "—" : `${Math.round(row.p90)} t`}</td>
+                          <td className="py-1.5 px-2 text-right text-[#FF692A]">{row.worst == null ? "—" : `${Math.round(row.worst)} t`}</td>
+                          <td className="py-1.5 px-2 text-right text-[#42D3F2]">{row.medianUnderwater == null ? "—" : `${Math.round(row.medianUnderwater)} t`}</td>
+                          <td className="py-1.5 px-2 text-right text-[#FF692A]">{row.worstUnderwater == null ? "—" : `${Math.round(row.worstUnderwater)} t`}</td>
+                          <td className="py-1.5 pl-2 text-right text-[#FF692A]">{row.unrecovered.toLocaleString("en-IN")}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div className="px-4 pb-3 text-[9px] text-zinc-500">
+                {isBreakEven
+                  ? "Break-even recovery uses cumulative realized Net P/L and counts recovery when the path returns to 0 or above. Unrecovered episodes receive no fabricated recovery time."
+                  : "Recovery time excludes unrecovered episodes. Underwater duration is observed from the peak through the recovery trade, or through the end of the analyzed horizon when unrecovered."}
+                {!hasAnyRecovered ? (isBreakEven ? " No negative P/L episode reached break-even within the analyzed horizon." : " No drawdown episode recovered to its prior peak within the analyzed horizon.") : ""}
+              </div>
+            </>
+          )}
+        </>
       )}
     </div>
   );
 }
 
 function RecoveryTimeSweepSection({ points }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const [analysisMode, setAnalysisMode] = useState("drawdown");
   if (!points?.length) return null;
-  const data = points.map((p) => ({
-    winRate: p.winRate,
-    label: `${p.winRate}%`,
-    medianRecovery: p.medianDDRecoveryTrades,
-    p90Recovery: p.p90DDRecoveryTrades,
-  }));
-  const usable = data.some((d) => d.medianRecovery != null || d.p90Recovery != null);
+  const isBreakEven = analysisMode === "breakeven";
+  const data = points.map((p) => {
+    const median = isBreakEven
+      ? (p.medianBreakEvenRecoveryTrades == null ? null : Number(p.medianBreakEvenRecoveryTrades))
+      : (p.medianDDRecoveryTrades == null ? null : Number(p.medianDDRecoveryTrades));
+    const p75 = isBreakEven
+      ? (p.p75BreakEvenRecoveryTrades == null ? null : Number(p.p75BreakEvenRecoveryTrades))
+      : (p.p75DDRecoveryTrades == null ? null : Number(p.p75DDRecoveryTrades));
+    const p90 = isBreakEven
+      ? (p.p90BreakEvenRecoveryTrades == null ? null : Number(p.p90BreakEvenRecoveryTrades))
+      : (p.p90DDRecoveryTrades == null ? null : Number(p.p90DDRecoveryTrades));
+    const worst = isBreakEven
+      ? (p.worstBreakEvenRecoveryTrades == null ? null : Number(p.worstBreakEvenRecoveryTrades))
+      : (p.worstDDRecoveryTrades == null ? null : Number(p.worstDDRecoveryTrades));
+    return {
+      winRate: p.winRate,
+      label: `${p.winRate}%`,
+      medianRecovery: median,
+      p75Recovery: p75,
+      p90Recovery: p90,
+      worstRecovery: worst,
+      recoveryPct: isBreakEven ? (p.breakEvenRecoveryPct == null ? null : Number(p.breakEvenRecoveryPct)) : (p.recoveryPct == null ? null : Number(p.recoveryPct)),
+      unrecoveredPct: isBreakEven ? (p.unrecoveredBreakEvenPct == null ? null : Number(p.unrecoveredBreakEvenPct)) : (p.unrecoveredMaxDDPct == null ? null : Number(p.unrecoveredMaxDDPct)),
+      bandBase: median,
+      bandSpread: median != null && p90 != null ? Math.max(0, p90 - median) : null,
+    };
+  });
+  const usable = data.some((d) => d.medianRecovery != null || d.p90Recovery != null || d.worstRecovery != null);
   if (!usable) return null;
+  const title = isBreakEven ? "Break-even Recovery" : "Drawdown Recovery Time";
+  const subtitle = isBreakEven
+    ? "How long negative cumulative P/L takes to return to break-even at each Win Rate."
+    : "How long the maximum drawdown takes to reclaim the prior peak at each Win Rate.";
+  const yLabel = isBreakEven ? "Trades to P/L ≥ 0" : "Trades to prior peak";
   return (
     <div className={`${CARD} overflow-hidden`}>
-      <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-2">
-        <div>
-          <div className="text-[13px] font-semibold text-zinc-100">Drawdown Recovery Time</div>
-          <div className="text-[10px] text-zinc-400 mt-0.5">Recovery of the maximum drawdown in each Win Rate sample.</div>
+      <div
+        className="w-full px-4 py-3 border-b border-zinc-800 flex flex-wrap items-center justify-between gap-3"
+      >
+        <button
+          type="button"
+          onClick={() => setCollapsed((c) => !c)}
+          className="min-w-0 flex-1 text-left hover:opacity-90 transition-opacity"
+        >
+          <div className="flex flex-wrap items-center gap-2 text-[13px] font-semibold text-zinc-100">
+            <Activity size={14} className="text-[#42D3F2]" />
+            {title}
+            <ChevronDown size={14} className={`text-zinc-500 transition-transform ${collapsed ? "" : "rotate-180"}`} />
+          </div>
+          <div className="text-[10px] text-zinc-400 mt-0.5">{subtitle}</div>
+        </button>
+        <div className="flex items-center gap-2 flex-none">
+          <div className="flex rounded-md border border-[#57534D] bg-[#27272A] p-0.5">
+            <button type="button" onClick={() => setAnalysisMode("drawdown")} className={`px-2.5 py-1 text-[9px] font-mono rounded transition-colors ${analysisMode === "drawdown" ? "bg-[#57534D] text-zinc-100" : "text-zinc-400 hover:text-zinc-200"}`}>DD Recovery</button>
+            <button type="button" onClick={() => setAnalysisMode("breakeven")} className={`px-2.5 py-1 text-[9px] font-mono rounded transition-colors ${analysisMode === "breakeven" ? "bg-[#57534D] text-zinc-100" : "text-zinc-400 hover:text-zinc-200"}`}>Break-even</button>
+          </div>
+          <span className="text-[10px] font-mono text-zinc-500 flex-none">{yLabel}</span>
         </div>
-        <span className="text-[10px] font-mono text-zinc-500">Trades to prior peak</span>
       </div>
-      <div className="h-60 sm:h-72 px-2 pt-4 pb-2">
-        <ResponsiveContainer width="100%" height="100%">
-          <ComposedChart data={data} margin={{ top: 8, right: 16, bottom: 0, left: 0 }}>
-            <CartesianGrid stroke="#57534D" strokeOpacity={0.18} strokeDasharray="3 3" vertical={false} />
-            <XAxis dataKey="label" stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} />
-            <YAxis stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} width={42} allowDecimals={false} />
-            <Tooltip
-              content={({ active, payload, label }) => {
-                if (!active || !payload?.length) return null;
-                const m = payload.find((x) => x.dataKey === "medianRecovery")?.value;
-                const p90 = payload.find((x) => x.dataKey === "p90Recovery")?.value;
-                return (
-                  <div className="bg-[#27272A] border border-[#57534D] rounded-lg px-3 py-2 font-mono shadow-xl shadow-black/50">
-                    <div className="text-[10px] text-zinc-400 mb-1.5">Win Rate {label}</div>
-                    <div className="text-[10px] text-[#42D3F2]">Median: {m == null ? "—" : `${Math.round(m)} trades`}</div>
-                    <div className="text-[10px] text-[#7CCF35]">P90: {p90 == null ? "—" : `${Math.round(p90)} trades`}</div>
-                  </div>
-                );
-              }}
-            />
-            <Line type="monotone" dataKey="medianRecovery" name="Median Recovery" stroke="#42D3F2" strokeWidth={2.5} dot={{ r: 2.5, fill: "#42D3F2", strokeWidth: 0 }} isAnimationActive={false} />
-            <Line type="monotone" dataKey="p90Recovery" name="P90 Recovery" stroke="#7CCF35" strokeWidth={2} strokeDasharray="5 4" dot={false} isAnimationActive={false} />
-          </ComposedChart>
-        </ResponsiveContainer>
-      </div>
+      {!collapsed && (
+        <>
+          <div className="px-4 py-2 border-b border-zinc-800/70 flex flex-wrap items-center gap-x-4 gap-y-1 text-[9px] font-mono text-zinc-400">
+            <span><i className="inline-block w-2 h-2 rounded-full bg-[#42D3F2] mr-1" />Median</span>
+            <span><i className="inline-block w-2 h-2 rounded-full bg-[#7CCF35] mr-1" />P90 upper tail</span>
+            <span className="text-zinc-500">Shaded gap = Median → P90</span>
+          </div>
+          <div className="h-72 sm:h-80 px-2 pt-3 pb-2">
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart data={data} margin={{ top: 10, right: 22, bottom: 4, left: 0 }}>
+                <defs>
+                  <linearGradient id={isBreakEven ? "breakevenBandGradient" : "recoveryBandGradientSweep"} x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stopColor="#7CCF35" stopOpacity={0.14} />
+                    <stop offset="100%" stopColor="#42D3F2" stopOpacity={0.04} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#57534D" strokeOpacity={0.22} strokeDasharray="3 3" vertical={false} />
+                <XAxis dataKey="label" stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} minTickGap={10} />
+                <YAxis stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} width={52} allowDecimals={false} tickFormatter={(v) => `${Math.round(v)}t`} />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (!active || !payload?.length) return null;
+                    const row = payload[0]?.payload;
+                    if (!row) return null;
+                    return (
+                      <div className="bg-[#27272A] border border-[#57534D] rounded-lg px-3 py-2.5 font-mono shadow-xl shadow-black/50 min-w-[180px]">
+                        <div className="text-[10px] text-zinc-300 mb-2">Win Rate {label}</div>
+                        <div className="flex items-center justify-between gap-4 text-[10px]"><span className="text-[#42D3F2]">Median</span><span className="text-zinc-100">{row.medianRecovery == null ? "—" : `${Math.round(row.medianRecovery)} trades`}</span></div>
+                        <div className="flex items-center justify-between gap-4 text-[10px] mt-1"><span className="text-[#42D3F2]">P75</span><span className="text-zinc-100">{row.p75Recovery == null ? "—" : `${Math.round(row.p75Recovery)} trades`}</span></div>
+                        <div className="flex items-center justify-between gap-4 text-[10px] mt-1"><span className="text-[#7CCF35]">P90</span><span className="text-zinc-100">{row.p90Recovery == null ? "—" : `${Math.round(row.p90Recovery)} trades`}</span></div>
+                        <div className="flex items-center justify-between gap-4 text-[10px] mt-1"><span className="text-[#FF692A]">Worst</span><span className="text-zinc-100">{row.worstRecovery == null ? "—" : `${Math.round(row.worstRecovery)} trades`}</span></div>
+                        <div className="flex items-center justify-between gap-4 text-[10px] mt-1"><span className="text-zinc-400">Recovered</span><span className="text-zinc-100">{row.recoveryPct == null ? "—" : `${row.recoveryPct.toFixed(1)}%`}</span></div>
+                      </div>
+                    );
+                  }}
+                />
+                <Area type="monotone" dataKey="bandBase" stackId={isBreakEven ? "breakevenBand" : "recoveryBandSweep"} stroke="none" fill="transparent" fillOpacity={0} isAnimationActive={false} connectNulls={false} />
+                <Area type="monotone" dataKey="bandSpread" stackId={isBreakEven ? "breakevenBand" : "recoveryBandSweep"} stroke="none" fill={`url(#${isBreakEven ? "breakevenBandGradient" : "recoveryBandGradientSweep"})`} fillOpacity={1} isAnimationActive={false} connectNulls={false} />
+                <Line type="monotone" dataKey="medianRecovery" name="Median Recovery" stroke="#42D3F2" strokeWidth={2.6} dot={{ r: 2.5, fill: "#42D3F2", strokeWidth: 0 }} activeDot={{ r: 5, fill: "#42D3F2", stroke: "#27272A", strokeWidth: 2 }} isAnimationActive={false} connectNulls={false} />
+                <Line type="monotone" dataKey="p90Recovery" name="P90 Recovery" stroke="#7CCF35" strokeWidth={2} strokeDasharray="5 4" dot={{ r: 1.8, fill: "#7CCF35", strokeWidth: 0 }} activeDot={{ r: 4, fill: "#7CCF35", stroke: "#27272A", strokeWidth: 2 }} isAnimationActive={false} connectNulls={false} />
+                <Line type="monotone" dataKey="worstRecovery" name="Worst Recovery" stroke="#FF692A" strokeWidth={1.2} strokeDasharray="2 4" dot={false} activeDot={{ r: 3.5, fill: "#FF692A", stroke: "#27272A", strokeWidth: 2 }} isAnimationActive={false} connectNulls={false} />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="px-4 pb-3 text-[9px] font-mono text-zinc-500">
+            {isBreakEven
+              ? "Break-even recovery is measured from the deepest negative cumulative Net P/L point to the first trade where cumulative Net P/L returns to 0 or above. Unrecovered points are not assigned a false recovery time."
+              : "Recovery time excludes unrecovered episodes; unrecovered points are shown via recovery rate instead of assigning a false time."}
+          </div>
+        </>
+      )}
     </div>
   );
 }
 
-// -----------------------------------------------------------------------------
-// Bankroll analytics
-// -----------------------------------------------------------------------------
-// Long-horizon bankroll analysis is an analytical layer over the SAME core
-// simulation engines used by Single Run / Day-F&O. It never reimplements P/L,
-// costs, RR, cascade, reset, slippage, spread or safety-stop mechanics.
 function buildBernoulliWinLossSeq(n, winRatePct, rng = Math.random) {
   const p = Math.max(0, Math.min(1, Number(winRatePct) / 100));
   return Array.from({ length: Math.max(1, Math.round(n)) }, () => rng() < p);
@@ -2719,21 +3108,21 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
               <div className="h-80 px-2 pt-4 pb-2">
                 <ResponsiveContainer width="100%" height="100%">
                   <ComposedChart data={result.pathChartData} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
-                    <CartesianGrid stroke="#57534D" strokeOpacity={0.25} strokeDasharray="3 3" vertical={false} />
+                    <CartesianGrid stroke="#57534D" strokeOpacity={0.32} strokeDasharray="3 3" vertical={false} />
                     <XAxis dataKey="trade" stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} interval="preserveStartEnd" />
                     <YAxis stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} width={62} tickFormatter={(v) => fmtMoney(v)} domain={['auto', 'auto']} />
                     <ReferenceLine y={initialCapital} stroke="#57534D" strokeDasharray="4 4" />
                     <Tooltip content={<BankrollPathTooltip initialCapital={initialCapital} />} cursor={{ stroke: '#57534D', strokeWidth: 1 }} />
                     <Area type="monotone" dataKey="bandBase" stackId="capitalBand" stroke="none" fill="transparent" fillOpacity={0} isAnimationActive={false} />
-                    <Area type="monotone" dataKey="bandWidth" stackId="capitalBand" stroke="none" fill="#42D3F2" fillOpacity={0.14} isAnimationActive={false} />
+                    <Area type="monotone" dataKey="bandWidth" stackId="capitalBand" stroke="none" fill="#42D3F2" fillOpacity={0.20} isAnimationActive={false} />
                     {result.pathSeries.map((series, idx) => (
                       <Line
                         key={series.key}
                         type="monotone"
                         dataKey={series.key}
                         stroke={series.selected ? '#42D3F2' : series.final >= initialCapital ? '#7CCF35' : '#FF692A'}
-                        strokeWidth={series.selected ? 2.6 : 1.2}
-                        strokeOpacity={series.selected ? 1 : 0.42}
+                        strokeWidth={series.selected ? 2.8 : 1.45}
+                        strokeOpacity={series.selected ? 1 : 0.68}
                         dot={false}
                         isAnimationActive={false}
                         connectNulls={false}
@@ -2778,6 +3167,7 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
 
           <RecoveryTimeAnalysis
             summary={result.recoverySummary}
+            breakEvenSummary={result.breakEvenRecoverySummary}
             initialCapital={initialCapital}
           />
 
@@ -6039,6 +6429,7 @@ export default function RiskSimulator() {
     let pooledStoppedCount = 0;
     let pooledTradesExecuted = 0;
     const recoveryAccumulator = emptyRecoveryAccumulator();
+    const breakEvenAccumulator = emptyBreakEvenAccumulator();
 
     try {
       for (let cycle = 0; cycle < actualCycles; cycle++) {
@@ -6111,6 +6502,7 @@ export default function RiskSimulator() {
           if (r.result.netPL > 0) pooledProfitableCount += 1;
           if (r.ruined) pooledRuinedCount += 1;
           addRecoveryToAccumulator(recoveryAccumulator, r.recovery);
+          addBreakEvenToAccumulator(breakEvenAccumulator, analyzeBreakEvenRecovery(r.result?.trades || [], bankrollCfg.initialCapital));
           if (r.result.stopped) pooledStoppedCount += 1;
           pooledTradesExecuted += r.result.trades?.length || 0;
         });
@@ -6200,6 +6592,7 @@ export default function RiskSimulator() {
         ruinedCount: pooledRuinedCount,
       };
       const recoverySummary = finalizeRecoveryAccumulator(recoveryAccumulator);
+      const breakEvenRecoverySummary = finalizeBreakEvenAccumulator(breakEvenAccumulator);
 
       const next = {
         sourceCfg: bankrollCfg,
@@ -6215,6 +6608,7 @@ export default function RiskSimulator() {
         pathSeries: representativePathSeries,
         riskSensitivity: sensitivity,
         recoverySummary,
+        breakEvenRecoverySummary,
         finalBins: makeDistributionBins(allFinalValues, 12),
         ddBins: makeDistributionBins(allDrawdowns, 12),
         streakBins: makeDistributionBins(allStreaks, 12),
