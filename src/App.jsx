@@ -5494,15 +5494,6 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
         )}
       </div>
 
-      {selectedRecoveryCandidate?.result?.trades?.length ? (
-        <RecoveryTimeAnalysis
-          title="Scenario Drawdown Recovery"
-          trades={selectedRecoveryCandidate.result.trades}
-          initialCapital={builder.initialCapital}
-          compact
-        />
-      ) : null}
-
       {best && (
         <div className={`${CARD} overflow-hidden`}>
           <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-3">
@@ -7725,11 +7716,6 @@ export default function RiskSimulator() {
                   initialCapital={lastCleanCfgRef.current?.initialCapital ?? cfg.initialCapital}
                 />
 
-                <RecoveryTimeAnalysis
-                  trades={result.trades}
-                  initialCapital={lastCleanCfgRef.current?.initialCapital ?? cfg.initialCapital}
-                />
-
                 <div className={`${CARD} overflow-hidden`}>
                   <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-zinc-800">
                     <span className="flex items-center gap-2 text-[13px] font-semibold text-zinc-200">
@@ -7996,11 +7982,6 @@ export default function RiskSimulator() {
                 </div>
 
                 <TradeAnalyticsSection
-                  trades={result.trades}
-                  initialCapital={lastCleanCfgRef.current?.initialCapital ?? cfg.initialCapital}
-                />
-
-                <RecoveryTimeAnalysis
                   trades={result.trades}
                   initialCapital={lastCleanCfgRef.current?.initialCapital ?? cfg.initialCapital}
                 />
