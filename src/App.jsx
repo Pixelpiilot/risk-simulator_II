@@ -4495,6 +4495,17 @@ function runStrategyBuilder(rawCfg) {
   return deriveBuilderState(builder, points);
 }
 
+function SequenceFilterField({ label, children }) {
+  return (
+    <div className="mb-3 min-w-0">
+      <div className="min-h-[30px] flex items-end mb-1.5">
+        <label className="text-xs text-zinc-400 leading-tight break-words">{label}</label>
+      </div>
+      {children}
+    </div>
+  );
+}
+
 function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, onBuild, hasResult, builderBuilding }) {
   const isFno = baseMode === "fno";
   const isTargetMode = cfg.builderMode === "target";
@@ -4645,10 +4656,10 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
           {cfg.builderSequenceFilterOpen && (
             <div className="mt-2.5">
               <div className="grid grid-cols-2 gap-2">
-                <Field label="Opening Losses" hint="leading streak">
+                <SequenceFilterField label="Opening Losses">
                   <NumInput value={cfg.builderSequenceFilterLeadingLosses} onChange={onChange("builderSequenceFilterLeadingLosses")} step="1" min="1" max="1000" color="violet" />
-                </Field>
-                <Field label="Match">
+                </SequenceFilterField>
+                <SequenceFilterField label="Match">
                   <div className="min-h-[38px] flex rounded-md border border-zinc-800 bg-zinc-950/50 p-0.5">
                     {["atLeast", "exact"].map((m) => (
                       <button key={m} type="button" onClick={() => onChange("builderSequenceFilterMatch")({ target: { value: m } })} className={`flex-1 rounded text-[9px] font-mono ${cfg.builderSequenceFilterMatch === m ? "bg-violet-500/20 text-violet-200" : "text-zinc-500 hover:text-zinc-300"}`}>
@@ -4656,11 +4667,11 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                       </button>
                     ))}
                   </div>
-                </Field>
+                </SequenceFilterField>
               </div>
 
               <div className="grid grid-cols-2 gap-2">
-                <Field label="Final P/L">
+                <SequenceFilterField label="Final P/L">
                   <div className="min-h-[38px] flex rounded-md border border-zinc-800 bg-zinc-950/50 p-0.5">
                     {["green", "any", "red"].map((m) => (
                       <button key={m} type="button" onClick={() => onChange("builderSequenceFilterFinalPnl")({ target: { value: m } })} className={`flex-1 rounded text-[9px] font-mono capitalize ${cfg.builderSequenceFilterFinalPnl === m ? "bg-violet-500/20 text-violet-200" : "text-zinc-500 hover:text-zinc-300"}`}>
@@ -4668,10 +4679,10 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                       </button>
                     ))}
                   </div>
-                </Field>
-                <Field label="Green by Trade" hint="0 = no deadline">
+                </SequenceFilterField>
+                <SequenceFilterField label="Green by Trade">
                   <NumInput value={cfg.builderSequenceFilterGreenByTrade} onChange={onChange("builderSequenceFilterGreenByTrade")} step="1" min="0" max="1000" color="violet" />
-                </Field>
+                </SequenceFilterField>
               </div>
 
               <div className="mt-1 rounded-md border border-violet-500/15 bg-zinc-950/40 px-2.5 py-2 text-[9px] leading-relaxed text-zinc-400 break-words">
