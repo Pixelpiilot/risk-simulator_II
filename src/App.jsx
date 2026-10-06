@@ -72,7 +72,7 @@ const DEFAULTS = {
   exitSpread: 0.2,
   winRate: 50,
   numTrades: 10,
-  sweepStep: 100,
+  sweepStep: 10,
   sweepRuns: 100,
   batchCount: 200,
   // --- Day / F&O mode (Indian market) ---
