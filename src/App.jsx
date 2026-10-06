@@ -64,6 +64,10 @@ const DEFAULTS = {
   riskAllocationEnabled: true,
   riskAllocationTriggerPct: 100,
   riskAllocationResetPct: 50,
+  // Hard peak-to-trough risk envelope shared by all allocation modes.
+  // Builder overrides the amount with its own Total Risk Budget.
+  riskBudgetGuardEnabled: true,
+  riskBudgetPct: 5,
   slipMode: "percent",
   slipPct: 0,
   slipTicks: 1,
@@ -328,6 +332,8 @@ const BUILDER_RISK_ALLOCATION_KEYS = [
   "riskAllocationEnabled",
   "riskAllocationTriggerPct",
   "riskAllocationResetPct",
+  "riskBudgetGuardEnabled",
+  "riskBudgetPct",
 ];
 
 function builderRiskAllocationFields(cfg) {
@@ -490,6 +496,24 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       : applyRiskAllocationReset(cfg, riskAmt);
     riskAmt = allocationReset.riskAmt;
 
+    const riskBudgetGuard = guardSingleRiskToBudget(
+      cfg,
+      riskAmt,
+      capital,
+      peak,
+      price,
+      LOT_VALUE,
+      feePerLotEntry,
+      feePerLotExit,
+      isTurnoverFee
+    );
+    if (riskBudgetGuard.blocked) {
+      stopped = true;
+      stopReason = riskBudgetGuard.reason || `Risk Budget Guard blocked Trade ${i}.`;
+      break;
+    }
+    riskAmt = riskBudgetGuard.riskAmt;
+
     const lots = riskAmt / LOT_VALUE;
 
     if (riskAmt > capital * (cfg.perTradeCapPct / 100)) {
@@ -539,6 +563,9 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       rr: isWin ? tradeRR : -1,
       risk: riskAmt,
       riskAllocationReset: allocationReset.resetApplied,
+      riskBudgetGuardApplied: riskBudgetGuard.applied,
+      riskBudgetTargetRisk: riskBudgetGuard.targetRiskAmt,
+      riskBudgetRemainingBefore: Number.isFinite(riskBudgetGuard.remainingBefore) ? riskBudgetGuard.remainingBefore : null,
       lots,
       entryPrice,
       price: exitPrice,
@@ -666,6 +693,137 @@ function applyRiskAllocationReset(cfg, targetRiskAmt) {
   return { riskAmt: targetRiskAmt, resetApplied: false };
 }
 
+function getRiskBudgetAmount(cfg) {
+  if (Number.isFinite(Number(cfg?._riskBudgetAmountOverride))) {
+    return Math.max(0, Number(cfg._riskBudgetAmountOverride) || 0);
+  }
+  if (cfg?.riskBudgetGuardEnabled === false) return Infinity;
+  const initialCapital = Math.max(0, Number(cfg?.initialCapital) || 0);
+  const pct = Math.max(0, Math.min(100, Number(cfg?.riskBudgetPct) || 0));
+  return initialCapital * (pct / 100);
+}
+
+function getRiskBudgetRemaining(cfg, peak, capital) {
+  const budget = getRiskBudgetAmount(cfg);
+  if (!Number.isFinite(budget)) return Infinity;
+  const floor = peak - budget;
+  return Math.max(0, capital - floor);
+}
+
+function estimateSingleWorstLossForRisk(cfg, riskAmt, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee) {
+  const r = Math.max(0, Number(riskAmt) || 0);
+  if (r <= 0) return 0;
+  const lots = r / Math.max(1e-12, lotValue);
+  if (!Number.isFinite(lots) || lots <= 0) return Infinity;
+  const entryPrice = price + (cfg.entrySpread || 0);
+  const grossPL = -r;
+  const trueExitPrice = price + (grossPL / lots);
+  const exitPrice = trueExitPrice - (cfg.exitSpread || 0);
+  let fee;
+  if (isTurnoverFee) {
+    const entryFee = entryPrice * lots * (cfg.entryFeeTurnoverPct / 100);
+    const exitFee = exitPrice * lots * (cfg.exitFeeTurnoverPct / 100);
+    fee = entryFee + exitFee;
+  } else {
+    fee = lots * feePerLotEntry + lots * feePerLotExit;
+  }
+  const slip = cfg.slipMode === "ticks"
+    ? lots * cfg.slipTicks * cfg.tickValue
+    : lots * entryPrice * (cfg.slipPct / 100);
+  const spreadCost = lots * ((cfg.entrySpread || 0) + (cfg.exitSpread || 0));
+  return Math.max(0, r + fee + slip + spreadCost);
+}
+
+function guardSingleRiskToBudget(cfg, targetRiskAmt, capital, peak, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee) {
+  const budget = getRiskBudgetAmount(cfg);
+  if (!Number.isFinite(budget)) {
+    return { riskAmt: targetRiskAmt, applied: false, blocked: false, targetRiskAmt, remainingBefore: Infinity, reason: null };
+  }
+  const remainingBefore = getRiskBudgetRemaining(cfg, peak, capital);
+  const target = Math.max(0, Number(targetRiskAmt) || 0);
+  const epsilon = Math.max(1e-12, budget * 1e-10);
+  if (remainingBefore <= epsilon) {
+    return { riskAmt: 0, applied: target > 0, blocked: true, targetRiskAmt: target, remainingBefore, reason: "Risk Budget Guard: no peak-to-trough risk budget remains." };
+  }
+  const targetLoss = estimateSingleWorstLossForRisk(cfg, target, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee);
+  if (targetLoss <= remainingBefore + epsilon) {
+    return { riskAmt: target, applied: false, blocked: false, targetRiskAmt: target, remainingBefore, reason: null };
+  }
+  let lo = 0;
+  let hi = target;
+  let best = 0;
+  for (let i = 0; i < 48; i++) {
+    const mid = (lo + hi) / 2;
+    const loss = estimateSingleWorstLossForRisk(cfg, mid, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee);
+    if (loss <= remainingBefore + epsilon) {
+      best = mid;
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  if (best <= epsilon) {
+    return { riskAmt: 0, applied: true, blocked: true, targetRiskAmt: target, remainingBefore, reason: "Risk Budget Guard: requested trade cannot fit inside the remaining peak-to-trough budget after costs." };
+  }
+  return { riskAmt: best, applied: true, blocked: false, targetRiskAmt: target, remainingBefore, reason: "Risk Budget Guard capped this trade to the remaining peak-to-trough budget." };
+}
+
+function estimateFnoWorstLossForUnits(cfg, units, price, unitValue, lotSize, leverageFactor, broker, segment) {
+  const u = Math.max(0, Math.round(Number(units) || 0));
+  if (u <= 0) return 0;
+  const riskAmt = u * unitValue;
+  const quantity = Math.max(1, Math.round(u * lotSize * leverageFactor));
+  const entryPrice = price + (cfg.fnoEntrySpread || 0);
+  const grossPL = -riskAmt;
+  const trueExitPrice = price + (grossPL / quantity);
+  const exitPrice = trueExitPrice - (cfg.fnoExitSpread || 0);
+  const buyValue = entryPrice * quantity;
+  const sellValue = exitPrice * quantity;
+  const brokerageFee = computeFnoBrokerage(broker, segment, buyValue, sellValue, cfg);
+  const { otherCharges, gst } = computeFnoOtherAndGst(segment, buyValue, sellValue, brokerageFee, cfg.fnoOtherChargesPct, cfg.fnoGstPct);
+  const fee = brokerageFee + otherCharges + gst;
+  const slip = cfg.slipMode === "ticks"
+    ? quantity * cfg.slipTicks * cfg.tickValue
+    : quantity * entryPrice * (cfg.slipPct / 100);
+  const spreadCost = quantity * ((cfg.fnoEntrySpread || 0) + (cfg.fnoExitSpread || 0));
+  return Math.max(0, riskAmt + fee + slip + spreadCost);
+}
+
+function guardFnoRiskToBudget(cfg, targetRiskAmt, capital, peak, price, unitValue, lotSize, leverageFactor, broker, segment) {
+  const budget = getRiskBudgetAmount(cfg);
+  if (!Number.isFinite(budget)) {
+    return { riskAmt: targetRiskAmt, applied: false, blocked: false, targetRiskAmt, remainingBefore: Infinity, units: null, reason: null };
+  }
+  const remainingBefore = getRiskBudgetRemaining(cfg, peak, capital);
+  const target = Math.max(0, Number(targetRiskAmt) || 0);
+  const epsilon = Math.max(1e-12, budget * 1e-10);
+  const targetUnits = Math.max(1, Math.round(target / Math.max(1e-12, unitValue)));
+  if (remainingBefore <= epsilon) {
+    return { riskAmt: 0, applied: target > 0, blocked: true, targetRiskAmt: target, remainingBefore, units: 0, reason: "Risk Budget Guard: no peak-to-trough risk budget remains." };
+  }
+  const targetLoss = estimateFnoWorstLossForUnits(cfg, targetUnits, price, unitValue, lotSize, leverageFactor, broker, segment);
+  if (targetLoss <= remainingBefore + epsilon) {
+    return { riskAmt: target, applied: false, blocked: false, targetRiskAmt: target, remainingBefore, units: targetUnits, reason: null };
+  }
+  let lo = 0;
+  let hi = targetUnits;
+  let bestUnits = 0;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const loss = estimateFnoWorstLossForUnits(cfg, mid, price, unitValue, lotSize, leverageFactor, broker, segment);
+    if (loss <= remainingBefore + epsilon) {
+      bestUnits = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
+  }
+  if (bestUnits < 1) {
+    return { riskAmt: 0, applied: true, blocked: true, targetRiskAmt: target, remainingBefore, units: 0, reason: "Risk Budget Guard: even the minimum executable F&O unit exceeds the remaining peak-to-trough budget after costs." };
+  }
+  return { riskAmt: bestUnits * unitValue, applied: true, blocked: false, targetRiskAmt: target, remainingBefore, units: bestUnits, reason: "Risk Budget Guard capped this trade to the largest budget-safe whole unit/lot size." };
+}
+
 
 function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   const BASE_RISK_AMT = cfg.initialCapital * (cfg.riskPct / 100);
@@ -782,6 +940,25 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       : applyRiskAllocationReset(cfg, targetRiskAmt);
     targetRiskAmt = allocationReset.riskAmt;
 
+    const riskBudgetGuard = guardFnoRiskToBudget(
+      cfg,
+      targetRiskAmt,
+      capital,
+      peak,
+      price,
+      UNIT_VALUE,
+      lotSize,
+      leverageFactor,
+      broker,
+      segment
+    );
+    if (riskBudgetGuard.blocked) {
+      stopped = true;
+      stopReason = riskBudgetGuard.reason || `Risk Budget Guard blocked Trade ${i}.`;
+      break;
+    }
+    targetRiskAmt = riskBudgetGuard.riskAmt;
+
     // Round to the nearest whole unit (minimum 1) — Intraday can only trade
     // whole shares (1, 2, 5, 10, 17…), Options/Futures can only trade whole
     // lots (1 lot, 2 lots… never 1.2 or 1.5). Quantity is units × Lot Size
@@ -847,6 +1024,9 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       rr: isWin ? tradeRR : -1,
       risk: riskAmt,
       riskAllocationReset: allocationReset.resetApplied,
+      riskBudgetGuardApplied: riskBudgetGuard.applied,
+      riskBudgetTargetRisk: riskBudgetGuard.targetRiskAmt,
+      riskBudgetRemainingBefore: Number.isFinite(riskBudgetGuard.remainingBefore) ? riskBudgetGuard.remainingBefore : null,
       lots: units,
       quantity,
       entryPrice,
@@ -1087,6 +1267,8 @@ function cleanConfig(cfg) {
     riskAllocationEnabled: cfg.riskAllocationEnabled !== false,
     riskAllocationTriggerPct: Math.max(0, Number(cfg.riskAllocationTriggerPct) || 0),
     riskAllocationResetPct: Math.max(0, Number(cfg.riskAllocationResetPct) || 0),
+    riskBudgetGuardEnabled: cfg.riskBudgetGuardEnabled !== false,
+    riskBudgetPct: Math.max(0, Math.min(100, Number(cfg.riskBudgetPct) || 5)),
     slipPct: Number(cfg.slipPct) || 0,
     slipTicks: Number(cfg.slipTicks) || 0,
     tickValue: Number(cfg.tickValue) || 0,
@@ -3926,6 +4108,7 @@ function evaluateBuilderTargetSequence(engineCfg, sequence, totalRiskAmount, use
     ...engineCfg,
     _rrSeed: rrSeed,
     _riskReferenceWinRate: targetWinRate == null ? engineCfg.winRate : targetWinRate,
+    _riskBudgetAmountOverride: Math.max(0, Number(totalRiskAmount) || 0),
   };
   const calibrated = calibrateBuilderTargetPoints(
     builderEngineCfg,
@@ -4016,6 +4199,7 @@ function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, t
     ...engineCfg,
     _rrSeed: rrSeed,
     _riskReferenceWinRate: targetWinRate == null ? engineCfg.winRate : targetWinRate,
+    _riskBudgetAmountOverride: Math.max(0, Number(totalRiskAmount) || 0),
   };
 
   const calibrated = calibrateBuilderRiskPlan(
@@ -4794,6 +4978,15 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
 
           <div className="mt-1 rounded-md border border-zinc-800 bg-zinc-950/30 px-2.5 py-1.5 text-[9px] font-mono leading-relaxed text-zinc-500 break-words">
             The selected model and its settings run inside every evaluated W/L sequence. Builder keeps the configured allocation shape, auto-scales absolute size to the Total Risk Budget, and preserves existing caps/reset as final guards.
+          </div>
+          <div className="mt-2 min-w-0 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.045] p-2.5 overflow-hidden">
+            <div className="flex items-center justify-between gap-2 min-w-0">
+              <div className="min-w-0">
+                <div className="text-[10px] sm:text-[11px] font-semibold text-emerald-300">Risk Budget Guard</div>
+                <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words">Builder uses Total Risk Budget as the hard peak-to-trough downside envelope.</div>
+              </div>
+              <div className="shrink-0 font-mono text-[10px] text-emerald-300">{fmtPct(cfg.builderTotalRiskPct)}</div>
+            </div>
           </div>
         </div>
       </div>
@@ -7142,6 +7335,32 @@ export default function RiskSimulator() {
                       </div>
                     )}
                   </div>
+
+                  <div className="mt-2.5 min-w-0 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.045] p-2.5 overflow-hidden">
+                    <div className="flex items-start justify-between gap-2 min-w-0">
+                      <div className="min-w-0">
+                        <div className="text-[10px] sm:text-[11px] font-semibold text-emerald-300">Risk Budget Guard</div>
+                        <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words">Limits additional peak-to-trough loss after fees, slippage and spread.</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setCfg((c) => ({ ...c, riskBudgetGuardEnabled: !c.riskBudgetGuardEnabled }))}
+                        className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border transition-colors ${
+                          cfg.riskBudgetGuardEnabled
+                            ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                            : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"
+                        }`}
+                      >
+                        {cfg.riskBudgetGuardEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    {cfg.riskBudgetGuardEnabled && (
+                      <div className="grid grid-cols-2 gap-2 mt-2 min-w-0">
+                        <div className="min-w-0"><Field label="Budget (% Initial)"><NumInput value={cfg.riskBudgetPct} onChange={setField("riskBudgetPct")} step="0.1" min="0" max="100" color="teal" /></Field></div>
+                        <div className="min-w-0"><Field label="Budget Amount"><div className="text-xs font-mono text-emerald-300 py-2.5">{fmtMoney(cfg.initialCapital * (cfg.riskBudgetPct / 100))}</div></Field></div>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -7607,7 +7826,7 @@ export default function RiskSimulator() {
                             >
                               <TradeResultBadge win={t.win} />
                             </td>
-                            <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)} {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300" title="Risk Allocation Reset">RESET</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)} {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300" title="Risk Allocation Reset">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300" title="Risk Budget Guard capped this trade">BUDGET</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                             <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>
