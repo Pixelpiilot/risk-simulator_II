@@ -33,7 +33,7 @@ const DEFAULTS = {
   initialCapital: 100,
   baseLots: 0.1,
   riskPct: 0.3,
-  rr: 2,
+  rr: 2.5,
   // Reward:Risk model: "fixed" preserves the existing behavior; "range"
   // samples a bounded, center-weighted RR independently for each trade.
   rrMode: "fixed",
@@ -42,12 +42,40 @@ const DEFAULTS = {
   feeMode: "perLot", // "perLot" | "turnover"
   feeBaseEntry: 0.1,
   feeBaseExit: 0.1,
-  currentPrice: 2700,
+  currentPrice: 2600,
   leverage: 1,
   entryFeeTurnoverPct: 0.045,
   exitFeeTurnoverPct: 0.045,
-  cascadeMode: "profit", // "profit" (size off last win's/loss's profit) | "capital" (size off current capital)
-  winRiskPct: 70,
+  cascadeMode: "profit", // Existing modes + advanced allocation models
+  // Advanced risk-allocation model settings. These are only active when the
+  // corresponding cascadeMode is selected; the original profit/capital modes
+  // retain their exact existing calculations.
+  drawdownTargetPct: 12,
+  drawdownMinFactor: 0.35,
+  drawdownCurve: 1.8,
+  edgePriorTrades: 20,
+  edgeMinFactor: 0.50,
+  edgeMaxFactor: 1.10,
+  sequenceLossStepPct: 7,
+  sequenceWinStepPct: 3,
+  sequenceMinFactor: 0.50,
+  sequenceMaxFactor: 1.08,
+  pocketStartPct: 70,
+  pocketWinUnlockPct: 5,
+  pocketLossLockPct: 10,
+  pocketMinPct: 35,
+  adaptiveDdWeight: 45,
+  adaptiveEdgeWeight: 30,
+  adaptiveSequenceWeight: 25,
+  adaptiveMinFactor: 0.40,
+  adaptiveMaxFactor: 1.05,
+  // On Profit+ (Cumulative Profit) settings. Only active when the new
+  // profitCumulative allocation mode is selected.
+  profitCumulativeAllocationPct: 30,
+  profitCumulativeLossAdjustPct: -20,
+  profitCumulativeFlipEnabled: true,
+  profitCumulativeFlipAfterLosses: 5,
+  winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
   perTradeCapPct: 70,
@@ -66,7 +94,7 @@ const DEFAULTS = {
   exitSpread: 0.2,
   winRate: 40,
   numTrades: 10,
-  sweepStep: 10,
+  sweepStep: 5,
   sweepRuns: 100,
   batchCount: 200,
   // --- Day / F&O mode (Indian market) ---
@@ -294,6 +322,202 @@ function getSimulationRng(cfg) {
 }
 
 
+
+const RISK_ALLOCATION_MODES = [
+  "profit",
+  "profitCumulative",
+  "capital",
+  "drawdownRecovery",
+  "edgeConfidence",
+  "sequencePressure",
+  "riskPocket",
+  "adaptive",
+];
+
+const BUILDER_RISK_ALLOCATION_KEYS = [
+  "cascadeMode",
+  "profitCumulativeAllocationPct",
+  "profitCumulativeLossAdjustPct",
+  "profitCumulativeFlipEnabled",
+  "profitCumulativeFlipAfterLosses",
+  "winRiskPct",
+  "lossRiskPct",
+  "lossRiskAdjustPct",
+  "drawdownTargetPct",
+  "drawdownMinFactor",
+  "drawdownCurve",
+  "edgePriorTrades",
+  "edgeMinFactor",
+  "edgeMaxFactor",
+  "sequenceLossStepPct",
+  "sequenceWinStepPct",
+  "sequenceMinFactor",
+  "sequenceMaxFactor",
+  "pocketStartPct",
+  "pocketWinUnlockPct",
+  "pocketLossLockPct",
+  "pocketMinPct",
+  "adaptiveDdWeight",
+  "adaptiveEdgeWeight",
+  "adaptiveSequenceWeight",
+  "adaptiveMinFactor",
+  "adaptiveMaxFactor",
+  "riskAllocationEnabled",
+  "riskAllocationTriggerPct",
+  "riskAllocationResetPct",
+];
+
+function builderRiskAllocationFields(cfg) {
+  const out = {};
+  for (const key of BUILDER_RISK_ALLOCATION_KEYS) out[key] = cfg?.[key];
+  return out;
+}
+
+function builderRiskAllocationSignature(cfg) {
+  return JSON.stringify(builderRiskAllocationFields(cfg));
+}
+
+function riskAllocationModeLabel(mode) {
+  const labels = {
+    profit: "On Profit",
+    profitCumulative: "On Profit+",
+    capital: "On Capital",
+    drawdownRecovery: "Drawdown Recovery",
+    edgeConfidence: "Edge Confidence",
+    sequencePressure: "Sequence Pressure",
+    riskPocket: "Risk Pocket",
+    adaptive: "Adaptive",
+  };
+  return labels[RISK_ALLOCATION_MODES.includes(mode) ? mode : "profit"];
+}
+
+function clamp01(value) {
+  return Math.max(0, Math.min(1, Number(value) || 0));
+}
+
+function getCumulativeProfitRiskState(cfg, consecutiveLosses) {
+  // Keep the negative side above -100% so the mode can never dead-loop at
+  // zero risk. Positive adjustments stay bounded and are still subject to the
+  // existing Per-Trade Cap / Max Risk Cap later in the engine.
+  const baseAdjustment = Math.max(
+    -95,
+    Math.min(100, Number(cfg.profitCumulativeLossAdjustPct) || 0)
+  );
+  const resetAfter = Math.max(1, Math.round(Number(cfg.profitCumulativeFlipAfterLosses) || 5));
+  const flipEnabled = cfg.profitCumulativeFlipEnabled !== false;
+  const lossCount = Math.max(0, Math.round(Number(consecutiveLosses) || 0));
+  // N=5 means: after losses 1-5 use the configured sign; Trade 6 uses the
+  // flipped sign. After losses 6-10 keep the flipped sign; Trade 11 flips back.
+  const flipCount = flipEnabled ? Math.floor(lossCount / resetAfter) : 0;
+  const effectiveAdjustment = flipCount % 2 === 1 ? -baseAdjustment : baseAdjustment;
+  const factor = Math.max(0.05, 1 + effectiveAdjustment / 100);
+  return { baseAdjustment, effectiveAdjustment, factor, flipCount, resetAfter, flipEnabled };
+}
+
+function getCumulativeProfitRiskAfterWin(cfg, cumulativeNetProfit, baseRiskAmt) {
+  const allocationPct = Math.max(0, Math.min(100, Number(cfg.profitCumulativeAllocationPct) || 0));
+  const pool = Number(cumulativeNetProfit) || 0;
+  const allocated = Math.max(0, pool) * (allocationPct / 100);
+  // Exact requested rule whenever cumulative NET realized profit is positive.
+  // If the pool is zero/non-positive, using Base Risk avoids an impossible
+  // negative or zero-risk next trade and keeps the simulator usable.
+  return allocated > 0 ? allocated : baseRiskAmt;
+}
+
+// Drawdown Recovery: risk starts at 1.0x, then compresses smoothly as the
+// account moves away from its high-water mark. It never looks ahead.
+function getDrawdownRecoveryFactor(cfg, peak, capital) {
+  const target = Math.max(0.01, Number(cfg.drawdownTargetPct) || 0.01);
+  const minFactor = clamp01(Math.max(0.05, Number(cfg.drawdownMinFactor) || 0.35));
+  const curve = Math.max(0.5, Number(cfg.drawdownCurve) || 1.8);
+  const ddPct = peak > 0 ? Math.max(0, ((peak - capital) / peak) * 100) : 0;
+  const pressure = clamp01(ddPct / target);
+  const retained = 1 - Math.pow(pressure, curve);
+  return minFactor + (1 - minFactor) * retained;
+}
+
+// Edge Confidence: a Bayesian-smoothed win-rate estimate anchored to the
+// configured win rate. The prior prevents tiny samples from overreacting.
+function getEdgeConfidenceFactor(cfg, winsSoFar, lossesSoFar) {
+  const priorTrades = Math.max(2, Number(cfg.edgePriorTrades) || 20);
+  const baselineSource = Number.isFinite(Number(cfg?._riskReferenceWinRate))
+    ? Number(cfg._riskReferenceWinRate)
+    : Number(cfg.winRate);
+  const baselinePct = Math.max(0.5, Math.min(99.5, Number.isFinite(baselineSource) ? baselineSource : 0.5));
+  const p0 = baselinePct / 100;
+  const observedTrades = Math.max(0, Number(winsSoFar) || 0) + Math.max(0, Number(lossesSoFar) || 0);
+  const posterior = (Math.max(0, Number(winsSoFar) || 0) + priorTrades * p0) / Math.max(1, observedTrades + priorTrades);
+  const confidence = 1 - Math.exp(-observedTrades / priorTrades);
+  const relative = p0 > 0 ? posterior / p0 : 1;
+  const raw = 1 + (relative - 1) * confidence;
+  const minFactor = Math.max(0.10, Number(cfg.edgeMinFactor) || 0.50);
+  const maxFactor = Math.max(minFactor, Number(cfg.edgeMaxFactor) || 1.10);
+  return Math.max(minFactor, Math.min(maxFactor, raw));
+}
+
+// Sequence Pressure: losing streaks progressively reduce risk while winning
+// streaks restore it gently. Changes are multiplicative, bounded and use only
+// outcomes already observed before the current trade.
+function getSequencePressureFactor(cfg, consecutiveLosses, consecutiveWins) {
+  const lossStep = Math.max(0, Math.min(50, Number(cfg.sequenceLossStepPct) || 0)) / 100;
+  const winStep = Math.max(0, Math.min(50, Number(cfg.sequenceWinStepPct) || 0)) / 100;
+  const lossFactor = Math.pow(Math.max(0.05, 1 - lossStep), Math.max(0, Number(consecutiveLosses) || 0));
+  const winFactor = Math.pow(1 + winStep, Math.max(0, Number(consecutiveWins) || 0));
+  const raw = lossFactor * winFactor;
+  const minFactor = Math.max(0.10, Number(cfg.sequenceMinFactor) || 0.50);
+  const maxFactor = Math.max(minFactor, Number(cfg.sequenceMaxFactor) || 1.08);
+  return Math.max(minFactor, Math.min(maxFactor, raw));
+}
+
+// Risk Pocket: only a configurable percentage of the current base-risk budget
+// is deployable at first. Wins unlock reserve gradually; losses lock it again.
+function getRiskPocketFactor(cfg, winsSoFar, lossesSoFar) {
+  const start = Math.max(0, Math.min(100, Number(cfg.pocketStartPct) || 70));
+  const unlock = Math.max(0, Math.min(100, Number(cfg.pocketWinUnlockPct) || 0));
+  const lock = Math.max(0, Math.min(100, Number(cfg.pocketLossLockPct) || 0));
+  const minPct = Math.max(5, Math.min(start, Number(cfg.pocketMinPct) || 35));
+  const availablePct = start + (Math.max(0, Number(winsSoFar) || 0) * unlock) - (Math.max(0, Number(lossesSoFar) || 0) * lock);
+  return Math.max(minPct / 100, Math.min(1, availablePct / 100));
+}
+
+function getAdaptiveFactor(cfg, context) {
+  const ddFactor = getDrawdownRecoveryFactor(cfg, context.peak, context.capital);
+  const edgeFactor = getEdgeConfidenceFactor(cfg, context.winsSoFar, context.lossesSoFar);
+  const sequenceFactor = getSequencePressureFactor(cfg, context.consecutiveLosses, context.consecutiveWins);
+  const rawWeights = [
+    Math.max(0, Number(cfg.adaptiveDdWeight) || 0),
+    Math.max(0, Number(cfg.adaptiveEdgeWeight) || 0),
+    Math.max(0, Number(cfg.adaptiveSequenceWeight) || 0),
+  ];
+  const weightSum = rawWeights.reduce((a, b) => a + b, 0) || 1;
+  const weights = rawWeights.map((w) => w / weightSum);
+  const geometric = Math.exp(
+    weights[0] * Math.log(Math.max(0.05, ddFactor)) +
+    weights[1] * Math.log(Math.max(0.05, edgeFactor)) +
+    weights[2] * Math.log(Math.max(0.05, sequenceFactor))
+  );
+  const minFactor = Math.max(0.10, Number(cfg.adaptiveMinFactor) || 0.40);
+  const maxFactor = Math.max(minFactor, Number(cfg.adaptiveMaxFactor) || 1.05);
+  return Math.max(minFactor, Math.min(maxFactor, geometric));
+}
+
+function getAdvancedRiskFactor(cfg, mode, context) {
+  switch (mode) {
+    case "drawdownRecovery":
+      return getDrawdownRecoveryFactor(cfg, context.peak, context.capital);
+    case "edgeConfidence":
+      return getEdgeConfidenceFactor(cfg, context.winsSoFar, context.lossesSoFar);
+    case "sequencePressure":
+      return getSequencePressureFactor(cfg, context.consecutiveLosses, context.consecutiveWins);
+    case "riskPocket":
+      return getRiskPocketFactor(cfg, context.winsSoFar, context.lossesSoFar);
+    case "adaptive":
+      return getAdaptiveFactor(cfg, context);
+    default:
+      return 1;
+  }
+}
+
 function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   const BASE_RISK_AMT = cfg.initialCapital * (cfg.riskPct / 100);
   const LOT_VALUE = BASE_RISK_AMT / cfg.baseLots;
@@ -318,6 +542,13 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   let hasWon = false;        // has any trade in this run won yet?
   let lastProfitNet = null;  // net profit of the most recent WIN
   let consecutiveLosses = 0; // consecutive losses since the last win (or since the start, if no win yet)
+  let consecutiveWins = 0;
+  let winsSoFar = 0;
+  let lossesSoFar = 0;
+  let cumulativeNetProfit = 0;
+  let previousExecutedRiskAmt = null;
+  let currentProfitCumulativeAdjustment = Number(cfg.profitCumulativeLossAdjustPct) || 0;
+  let currentProfitCumulativeFlipCount = 0;
   let price = Number(cfg.currentPrice) || 0; // running instrument price (drives turnover fee + is itself driven by each trade's gross P/L)
 
   const trades = [];
@@ -336,46 +567,71 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       // this engine, so keep the regular cascade/reset logic out of this path.
       riskAmt = Number(explicitRiskPlan[i - 1]) || 0;
     } else if (i === 1) {
-      // Trade 1 always starts at the fixed base risk.
+      // Trade 1 always starts at the fixed base risk in every allocation model.
       riskAmt = BASE_RISK_AMT;
-    } else if (prevWin) {
-
-      if (isCapitalCascade) {
-        riskAmt = capital * (cfg.winRiskPct / 100);
-      } else if (prevNet <= 0) {
-      
+    } else if (cfg.cascadeMode === "profitCumulative") {
+      // On Profit+ (Cumulative):
+      // WIN  -> next risk = cumulative NET realized profit × allocation %.
+      // LOSS -> next risk = previous EXECUTED risk × current adjustment %.
+      // After N consecutive losses the adjustment flips sign for the NEXT trade.
+      // A WIN resets only the losing-streak/flip state; cumulative profit stays.
+      if (prevWin) {
+        riskAmt = getCumulativeProfitRiskAfterWin(cfg, cumulativeNetProfit, BASE_RISK_AMT);
+      } else {
+        const previousRisk = Math.max(0, Number(previousExecutedRiskAmt) || BASE_RISK_AMT);
+        const state = getCumulativeProfitRiskState(cfg, consecutiveLosses);
+        currentProfitCumulativeAdjustment = state.effectiveAdjustment;
+        currentProfitCumulativeFlipCount = state.flipCount;
+        riskAmt = previousRisk * state.factor;
+      }
+    } else if (cfg.cascadeMode === "profit" || cfg.cascadeMode === "capital") {
+      // Existing On Profit / On Capital logic is intentionally preserved exactly.
+      if (prevWin) {
+        if (isCapitalCascade) {
+          const builderCapitalMultiplier = Math.max(0, Number(cfg._builderCapitalRiskMultiplier) || 1);
+          riskAmt = capital * (cfg.winRiskPct / 100) * builderCapitalMultiplier;
+        } else if (prevNet <= 0) {
+          riskAmt = BASE_RISK_AMT;
+        } else {
+          riskAmt = prevNet * (cfg.winRiskPct / 100);
+        }
+      } else if (!isCapitalCascade && !hasWon) {
         riskAmt = BASE_RISK_AMT;
       } else {
-        riskAmt = prevNet * (cfg.winRiskPct / 100);
+        const effectiveLossPct =
+          cfg.lossRiskPct + (consecutiveLosses - 1) * cfg.lossRiskAdjustPct;
+        if (effectiveLossPct <= 0) {
+          stopped = true;
+          stopReason = `Effective Loss Risk % dropped to ${effectiveLossPct.toFixed(
+            1
+          )}% after ${consecutiveLosses} consecutive losses${
+            hasWon ? " since the last win" : ""
+          } (base ${cfg.lossRiskPct}% ${
+            cfg.lossRiskAdjustPct >= 0 ? "+" : ""
+          }${cfg.lossRiskAdjustPct}% per extra loss). Simulation stopped before Trade ${i}.`;
+          break;
+        }
+        if (isCapitalCascade) {
+          const builderCapitalMultiplier = Math.max(0, Number(cfg._builderCapitalRiskMultiplier) || 1);
+          riskAmt = capital * (effectiveLossPct / 100) * builderCapitalMultiplier;
+        } else if (lastProfitNet <= 0) {
+          riskAmt = BASE_RISK_AMT;
+        } else {
+          riskAmt = lastProfitNet * (effectiveLossPct / 100);
+        }
       }
-    } else if (!isCapitalCascade && !hasWon) {
-
-      riskAmt = BASE_RISK_AMT;
     } else {
-
-      const effectiveLossPct =
-        cfg.lossRiskPct + (consecutiveLosses - 1) * cfg.lossRiskAdjustPct;
-      if (effectiveLossPct <= 0) {
-        stopped = true;
-        stopReason = `Effective Loss Risk % dropped to ${effectiveLossPct.toFixed(
-          1
-        )}% after ${consecutiveLosses} consecutive losses${
-          hasWon ? " since the last win" : ""
-        } (base ${cfg.lossRiskPct}% ${
-          cfg.lossRiskAdjustPct >= 0 ? "+" : ""
-        }${cfg.lossRiskAdjustPct}% per extra loss). Simulation stopped before Trade ${i}.`;
-        break;
-      }
-      if (isCapitalCascade) {
-        riskAmt = capital * (effectiveLossPct / 100);
-      } else if (lastProfitNet <= 0) {
-        // The last recorded win left no usable net profit either — same
-        // restart-at-base fallback as above, so the cascade doesn't stay
-        // stuck at zero risk for the rest of the run.
-        riskAmt = BASE_RISK_AMT;
-      } else {
-        riskAmt = lastProfitNet * (effectiveLossPct / 100);
-      }
+      // Advanced models start from Base Risk and adjust it with only information
+      // that existed before the current trade — no look-ahead.
+      const advancedFactor = getAdvancedRiskFactor(cfg, cfg.cascadeMode, {
+        peak,
+        capital,
+        winsSoFar,
+        lossesSoFar,
+        consecutiveLosses,
+        consecutiveWins,
+      });
+      riskAmt = BASE_RISK_AMT * advancedFactor;
     }
 
     // Safety net for any other path that could still slip through negative
@@ -444,6 +700,9 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       spreadCost,
       netPL,
       capital,
+      cumulativeNetProfit: cumulativeNetProfit + netPL,
+      profitCumulativeLossAdjustment: cfg.cascadeMode === "profitCumulative" ? currentProfitCumulativeAdjustment : null,
+      profitCumulativeFlipCount: cfg.cascadeMode === "profitCumulative" ? currentProfitCumulativeFlipCount : null,
     });
 
     if (capital > peak) {
@@ -463,12 +722,28 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     maxProfitValue = Math.max(maxProfitValue, capital - cfg.initialCapital);
     maxLossValue = Math.min(maxLossValue, capital - cfg.initialCapital);
 
+    cumulativeNetProfit += netPL;
+    previousExecutedRiskAmt = riskAmt;
+
     if (isWin) {
       hasWon = true;
       lastProfitNet = netPL;
+      // WIN reset semantics for On Profit+: reset only the losing-streak and
+      // flip state. Cumulative net profit is NOT reset.
       consecutiveLosses = 0;
+      consecutiveWins += 1;
+      winsSoFar += 1;
+      currentProfitCumulativeAdjustment = Number(cfg.profitCumulativeLossAdjustPct) || 0;
+      currentProfitCumulativeFlipCount = 0;
     } else {
       consecutiveLosses += 1;
+      consecutiveWins = 0;
+      lossesSoFar += 1;
+      if (cfg.cascadeMode === "profitCumulative") {
+        const state = getCumulativeProfitRiskState(cfg, consecutiveLosses);
+        currentProfitCumulativeAdjustment = state.effectiveAdjustment;
+        currentProfitCumulativeFlipCount = state.flipCount;
+      }
     }
 
     prevNet = netPL;
@@ -583,6 +858,13 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   let hasWon = false;
   let lastProfitNet = null;
   let consecutiveLosses = 0;
+  let consecutiveWins = 0;
+  let winsSoFar = 0;
+  let lossesSoFar = 0;
+  let cumulativeNetProfit = 0;
+  let previousExecutedRiskAmt = null;
+  let currentProfitCumulativeAdjustment = Number(cfg.profitCumulativeLossAdjustPct) || 0;
+  let currentProfitCumulativeFlipCount = 0;
   let price = Number(cfg.fnoCurrentPrice) || 0;
 
   const trades = [];
@@ -601,40 +883,61 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       targetRiskAmt = Number(explicitRiskPlan[i - 1]) || 0;
     } else if (i === 1) {
       targetRiskAmt = BASE_RISK_AMT;
-    } else if (prevWin) {
-      if (isCapitalCascade) {
-        targetRiskAmt = capital * (cfg.winRiskPct / 100);
-      } else if (prevNet <= 0) {
-        // The trade that just won left no usable net profit behind — reset
-        // to base risk instead of sizing off zero/negative forever.
+    } else if (cfg.cascadeMode === "profitCumulative") {
+      if (prevWin) {
+        targetRiskAmt = getCumulativeProfitRiskAfterWin(cfg, cumulativeNetProfit, BASE_RISK_AMT);
+      } else {
+        const previousRisk = Math.max(0, Number(previousExecutedRiskAmt) || BASE_RISK_AMT);
+        const state = getCumulativeProfitRiskState(cfg, consecutiveLosses);
+        currentProfitCumulativeAdjustment = state.effectiveAdjustment;
+        currentProfitCumulativeFlipCount = state.flipCount;
+        targetRiskAmt = previousRisk * state.factor;
+      }
+    } else if (cfg.cascadeMode === "profit" || cfg.cascadeMode === "capital") {
+      if (prevWin) {
+        if (isCapitalCascade) {
+          const builderCapitalMultiplier = Math.max(0, Number(cfg._builderCapitalRiskMultiplier) || 1);
+          targetRiskAmt = capital * (cfg.winRiskPct / 100) * builderCapitalMultiplier;
+        } else if (prevNet <= 0) {
+          targetRiskAmt = BASE_RISK_AMT;
+        } else {
+          targetRiskAmt = prevNet * (cfg.winRiskPct / 100);
+        }
+      } else if (!isCapitalCascade && !hasWon) {
         targetRiskAmt = BASE_RISK_AMT;
       } else {
-        targetRiskAmt = prevNet * (cfg.winRiskPct / 100);
+        const effectiveLossPct =
+          cfg.lossRiskPct + (consecutiveLosses - 1) * cfg.lossRiskAdjustPct;
+        if (effectiveLossPct <= 0) {
+          stopped = true;
+          stopReason = `Effective Loss Risk % dropped to ${effectiveLossPct.toFixed(
+            1
+          )}% after ${consecutiveLosses} consecutive losses${
+            hasWon ? " since the last win" : ""
+          } (base ${cfg.lossRiskPct}% ${
+            cfg.lossRiskAdjustPct >= 0 ? "+" : ""
+          }${cfg.lossRiskAdjustPct}% per extra loss). Simulation stopped before Trade ${i}.`;
+          break;
+        }
+        if (isCapitalCascade) {
+          const builderCapitalMultiplier = Math.max(0, Number(cfg._builderCapitalRiskMultiplier) || 1);
+          targetRiskAmt = capital * (effectiveLossPct / 100) * builderCapitalMultiplier;
+        } else if (lastProfitNet <= 0) {
+          targetRiskAmt = BASE_RISK_AMT;
+        } else {
+          targetRiskAmt = lastProfitNet * (effectiveLossPct / 100);
+        }
       }
-    } else if (!isCapitalCascade && !hasWon) {
-      targetRiskAmt = BASE_RISK_AMT;
     } else {
-      const effectiveLossPct =
-        cfg.lossRiskPct + (consecutiveLosses - 1) * cfg.lossRiskAdjustPct;
-      if (effectiveLossPct <= 0) {
-        stopped = true;
-        stopReason = `Effective Loss Risk % dropped to ${effectiveLossPct.toFixed(
-          1
-        )}% after ${consecutiveLosses} consecutive losses${
-          hasWon ? " since the last win" : ""
-        } (base ${cfg.lossRiskPct}% ${
-          cfg.lossRiskAdjustPct >= 0 ? "+" : ""
-        }${cfg.lossRiskAdjustPct}% per extra loss). Simulation stopped before Trade ${i}.`;
-        break;
-      }
-      if (isCapitalCascade) {
-        targetRiskAmt = capital * (effectiveLossPct / 100);
-      } else if (lastProfitNet <= 0) {
-        // Same restart-at-base fallback as above, for the loss-sizing path.
-        targetRiskAmt = BASE_RISK_AMT;
-      } else {
-        targetRiskAmt = lastProfitNet * (effectiveLossPct / 100);
-      }
+      const advancedFactor = getAdvancedRiskFactor(cfg, cfg.cascadeMode, {
+        peak,
+        capital,
+        winsSoFar,
+        lossesSoFar,
+        consecutiveLosses,
+        consecutiveWins,
+      });
+      targetRiskAmt = BASE_RISK_AMT * advancedFactor;
     }
 
     // Safety net for any other path that could still slip through negative
@@ -724,6 +1027,9 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       spreadCost,
       netPL,
       capital,
+      cumulativeNetProfit: cumulativeNetProfit + netPL,
+      profitCumulativeLossAdjustment: cfg.cascadeMode === "profitCumulative" ? currentProfitCumulativeAdjustment : null,
+      profitCumulativeFlipCount: cfg.cascadeMode === "profitCumulative" ? currentProfitCumulativeFlipCount : null,
     });
 
     if (capital > peak) {
@@ -743,12 +1049,28 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     maxProfitValue = Math.max(maxProfitValue, capital - cfg.initialCapital);
     maxLossValue = Math.min(maxLossValue, capital - cfg.initialCapital);
 
+    cumulativeNetProfit += netPL;
+    previousExecutedRiskAmt = riskAmt;
+
     if (isWin) {
       hasWon = true;
       lastProfitNet = netPL;
+      // WIN reset semantics for On Profit+: reset only the losing-streak and
+      // flip state. Cumulative net profit is NOT reset.
       consecutiveLosses = 0;
+      consecutiveWins += 1;
+      winsSoFar += 1;
+      currentProfitCumulativeAdjustment = Number(cfg.profitCumulativeLossAdjustPct) || 0;
+      currentProfitCumulativeFlipCount = 0;
     } else {
       consecutiveLosses += 1;
+      consecutiveWins = 0;
+      lossesSoFar += 1;
+      if (cfg.cascadeMode === "profitCumulative") {
+        const state = getCumulativeProfitRiskState(cfg, consecutiveLosses);
+        currentProfitCumulativeAdjustment = state.effectiveAdjustment;
+        currentProfitCumulativeFlipCount = state.flipCount;
+      }
     }
 
     prevNet = netPL;
@@ -904,7 +1226,30 @@ function cleanConfig(cfg) {
     leverage: Math.min(1000, Math.max(0, Number(cfg.leverage) || 0)),
     entryFeeTurnoverPct: Number(cfg.entryFeeTurnoverPct) || 0,
     exitFeeTurnoverPct: Number(cfg.exitFeeTurnoverPct) || 0,
-    cascadeMode: cfg.cascadeMode === "capital" ? "capital" : "profit",
+    cascadeMode: RISK_ALLOCATION_MODES.includes(cfg.cascadeMode) ? cfg.cascadeMode : "profit",
+    drawdownTargetPct: Math.max(0.1, Number(cfg.drawdownTargetPct) || 12),
+    drawdownMinFactor: Math.max(0.05, Math.min(1, Number(cfg.drawdownMinFactor) || 0.35)),
+    drawdownCurve: Math.max(0.5, Number(cfg.drawdownCurve) || 1.8),
+    edgePriorTrades: Math.max(2, Math.round(Number(cfg.edgePriorTrades) || 20)),
+    edgeMinFactor: Math.max(0.1, Number(cfg.edgeMinFactor) || 0.5),
+    edgeMaxFactor: Math.max(1, Number(cfg.edgeMaxFactor) || 1.1),
+    sequenceLossStepPct: Math.max(0, Math.min(50, Number(cfg.sequenceLossStepPct) || 0)),
+    sequenceWinStepPct: Math.max(0, Math.min(50, Number(cfg.sequenceWinStepPct) || 0)),
+    sequenceMinFactor: Math.max(0.1, Number(cfg.sequenceMinFactor) || 0.5),
+    sequenceMaxFactor: Math.max(1, Number(cfg.sequenceMaxFactor) || 1.08),
+    pocketStartPct: Math.max(0, Math.min(100, Number(cfg.pocketStartPct) || 70)),
+    pocketWinUnlockPct: Math.max(0, Math.min(100, Number(cfg.pocketWinUnlockPct) || 5)),
+    pocketLossLockPct: Math.max(0, Math.min(100, Number(cfg.pocketLossLockPct) || 10)),
+    pocketMinPct: Math.max(5, Math.min(100, Number(cfg.pocketMinPct) || 35)),
+    adaptiveDdWeight: Math.max(0, Number(cfg.adaptiveDdWeight) || 45),
+    adaptiveEdgeWeight: Math.max(0, Number(cfg.adaptiveEdgeWeight) || 30),
+    adaptiveSequenceWeight: Math.max(0, Number(cfg.adaptiveSequenceWeight) || 25),
+    adaptiveMinFactor: Math.max(0.1, Number(cfg.adaptiveMinFactor) || 0.4),
+    adaptiveMaxFactor: Math.max(1, Number(cfg.adaptiveMaxFactor) || 1.05),
+    profitCumulativeAllocationPct: Math.max(0, Math.min(100, Number(cfg.profitCumulativeAllocationPct) || 30)),
+    profitCumulativeLossAdjustPct: Math.max(-95, Math.min(100, Number(cfg.profitCumulativeLossAdjustPct) || -20)),
+    profitCumulativeFlipEnabled: cfg.profitCumulativeFlipEnabled !== false,
+    profitCumulativeFlipAfterLosses: Math.max(1, Math.round(Number(cfg.profitCumulativeFlipAfterLosses) || 5)),
     winRiskPct: Number(cfg.winRiskPct) || 0,
     lossRiskPct: Number(cfg.lossRiskPct) || 0,
     lossRiskAdjustPct: Number(cfg.lossRiskAdjustPct) || 0,
@@ -1936,6 +2281,417 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
 }
 
 
+
+// -----------------------------------------------------------------------------
+// Bankroll analytics
+// -----------------------------------------------------------------------------
+// Long-horizon bankroll analysis is an analytical layer over the SAME core
+// simulation engines used by Single Run / Day-F&O. It never reimplements P/L,
+// costs, RR, cascade, reset, slippage, spread or safety-stop mechanics.
+function buildBernoulliWinLossSeq(n, winRatePct, rng = Math.random) {
+  const p = Math.max(0, Math.min(1, Number(winRatePct) / 100));
+  return Array.from({ length: Math.max(1, Math.round(n)) }, () => rng() < p);
+}
+
+function longestLossStreak(seq) {
+  let current = 0;
+  let longest = 0;
+  for (const isWin of seq || []) {
+    if (isWin) current = 0;
+    else {
+      current += 1;
+      longest = Math.max(longest, current);
+    }
+  }
+  return longest;
+}
+
+function percentileValue(values, p) {
+  if (!values || !values.length) return 0;
+  const a = [...values].sort((x, y) => x - y);
+  const pos = (a.length - 1) * p;
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return a[lo];
+  return a[lo] + (a[hi] - a[lo]) * (pos - lo);
+}
+
+function wilsonInterval(successes, total, z = 1.96) {
+  const n = Math.max(0, Number(total) || 0);
+  if (!n) return { low: 0, high: 0 };
+  const p = Math.max(0, Math.min(1, (Number(successes) || 0) / n));
+  const z2 = z * z;
+  const denom = 1 + z2 / n;
+  const center = (p + z2 / (2 * n)) / denom;
+  const margin = (z / denom) * Math.sqrt((p * (1 - p) / n) + (z2 / (4 * n * n)));
+  return {
+    low: Math.max(0, center - margin),
+    high: Math.min(1, center + margin),
+  };
+}
+
+function makeDistributionBins(values, count = 12) {
+  const nums = (values || []).map(Number).filter(Number.isFinite);
+  if (!nums.length) return [];
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  if (Math.abs(max - min) < 1e-12) {
+    return [{
+      start: min,
+      end: max,
+      label: `${fmtMoney(min)}`,
+      count: nums.length,
+    }];
+  }
+  const binCount = Math.max(5, Math.min(count, Math.ceil(Math.sqrt(nums.length))));
+  const width = (max - min) / binCount;
+  const bins = Array.from({ length: binCount }, (_, i) => ({
+    start: min + i * width,
+    end: i === binCount - 1 ? max : min + (i + 1) * width,
+    count: 0,
+  }));
+  nums.forEach((v) => {
+    let idx = Math.floor((v - min) / width);
+    if (idx >= binCount) idx = binCount - 1;
+    if (idx < 0) idx = 0;
+    bins[idx].count += 1;
+  });
+  return bins.map((b) => ({
+    ...b,
+    label: `${fmtMoney(b.start)}–${fmtMoney(b.end)}`,
+  }));
+}
+
+function scaleBankrollConfig(rawCfg, baseMode, multiplier) {
+  const cfg = cleanConfig(rawCfg);
+  const m = Math.max(0.05, Number(multiplier) || 1);
+  const next = { ...cfg };
+  next.riskPct = Math.max(0.0001, cfg.riskPct * m);
+  if (baseMode === "fno") {
+    if (cfg.fnoSegment === "intraday") {
+      next.fnoQuantity = Math.max(1, Math.round(cfg.fnoQuantity * m));
+    } else {
+      next.fnoLots = Math.max(1, Math.round(cfg.fnoLots * m));
+    }
+  } else {
+    next.baseLots = Math.max(0.0001, cfg.baseLots * m);
+  }
+  return next;
+}
+
+function BankrollPathTooltip({ active, payload, label, initialCapital }) {
+  if (!active || !payload || !payload.length) return null;
+  const median = payload.find((p) => p.dataKey === "median")?.value;
+  const p10 = payload.find((p) => p.dataKey === "p10")?.value;
+  const p90 = payload.find((p) => p.dataKey === "p90")?.value;
+  return (
+    <div className="min-w-[210px] bg-[#27272A] border border-[#57534D] rounded-lg px-3 py-2.5 shadow-xl shadow-black/50 font-mono">
+      <div className="flex items-center justify-between gap-3 mb-2">
+        <span className="text-[10px] uppercase tracking-wide text-zinc-400">Trade {label}</span>
+        <span className="text-[9px] text-zinc-600">Capital band</span>
+      </div>
+      {[['Median', median, '#42D3F2'], ['P10', p10, '#FF692A'], ['P90', p90, '#7CCF35']].map(([k, v, c]) => (
+        <div key={k} className="flex items-center justify-between gap-4 text-[10px] leading-5">
+          <span className="text-zinc-500">{k}</span>
+          <span className="font-semibold" style={{ color: c }}>{v == null ? '—' : fmtMoney(v)}</span>
+        </div>
+      ))}
+      <div className="mt-1.5 pt-1.5 border-t border-[#57534D]/50 text-[9px] text-zinc-600">
+        Start {fmtMoney(initialCapital)}
+      </div>
+    </div>
+  );
+}
+
+function BankrollRiskTooltip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const d = payload[0]?.payload;
+  if (!d) return null;
+  return (
+    <div className="min-w-[190px] bg-[#27272A] border border-[#57534D] rounded-lg px-3 py-2.5 shadow-xl shadow-black/50 font-mono">
+      <div className="text-[10px] uppercase tracking-wide text-zinc-400 mb-2">Base Risk {d.riskPct.toFixed(2)}%</div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[10px]">
+        <span className="text-zinc-500">Ruin</span><span className="text-right text-[#FF692A]">{d.ruinPct.toFixed(2)}%</span>
+        <span className="text-zinc-500">Median Final</span><span className="text-right text-[#42D3F2]">{fmtMoney(d.medianFinal)}</span>
+        <span className="text-zinc-500">P90 DD</span><span className="text-right text-[#FF692A]">{d.p90DD.toFixed(2)}%</span>
+        <span className="text-zinc-500">Profitable</span><span className="text-right text-[#7CCF35]">{d.profitablePct.toFixed(1)}%</span>
+      </div>
+    </div>
+  );
+}
+
+function BankrollDistributionTooltip({ active, payload, label, title }) {
+  if (!active || !payload || !payload.length) return null;
+  const d = payload[0]?.payload;
+  if (!d) return null;
+  return (
+    <div className="min-w-[190px] bg-[#27272A] border border-[#57534D] rounded-lg px-3 py-2.5 shadow-xl shadow-black/50 font-mono">
+      <div className="text-[10px] uppercase tracking-wide text-zinc-400 mb-1">{title}</div>
+      <div className="text-[11px] text-zinc-200 mb-1">{label}</div>
+      <div className="text-[10px] text-zinc-500">Runs: <span className="text-zinc-200">{d.count}</span></div>
+    </div>
+  );
+}
+
+function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD, onRunsChange, onCyclesChange, onTradesChange, onRuinDDChange, onBaseModeChange, result, onRun, running, progress, error }) {
+  const initialCapital = Math.max(0, Number(sourceCfg?.initialCapital) || 0);
+  const sourceCfgClean = cleanConfig(sourceCfg || DEFAULTS);
+  const hasResult = !!result;
+  const overall = result?.overallStats || result?.stats || null;
+  const totalSimulations = result ? result.pooledRunsCount || (result.runs?.length || 0) : 0;
+
+  return (
+    <div className="space-y-4">
+      <div className={`${CARD} overflow-hidden`}>
+        <div className="px-4 py-3 border-b border-[#57534D]/70 flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-[14px] font-semibold text-zinc-100">
+              <Shield size={14} className="text-[#42D3F2] shrink-0" />
+              Bankroll
+            </div>
+            <div className="mt-1 text-[10px] text-zinc-400">Long-run survival, drawdown and risk-size analysis from the active core engine.</div>
+          </div>
+          <div className="flex items-center gap-1.5 p-0.5 rounded-lg bg-[#27272A] border border-[#57534D]">
+            {[['single', 'Single Run'], ['fno', 'Day / F&O']].map(([m, label]) => (
+              <button
+                key={m}
+                onClick={() => onBaseModeChange(m)}
+                className={`px-3 py-1.5 rounded-md text-[10px] font-mono transition-colors ${
+                  baseMode === m ? 'bg-[#57534D] text-zinc-100' : 'text-zinc-400 hover:text-zinc-100'
+                }`}
+              >{label}</button>
+            ))}
+          </div>
+        </div>
+
+        <div className="p-4">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2.5">
+            <MiniStat label="Initial Capital" value={fmtMoney(initialCapital)} valueColor="#42D3F2" />
+            <MiniStat label="Win Rate" value={fmtPct(sourceCfgClean.winRate)} valueColor="#7CCF35" />
+            <MiniStat label="Reward:Risk" value={sourceCfgClean.rrMode === 'range' ? `${sourceCfgClean.rrMin.toFixed(2)}–${sourceCfgClean.rrMax.toFixed(2)}` : sourceCfgClean.rr.toFixed(2)} valueColor="#7CCF35" />
+            <MiniStat label="Base Risk" value={`${sourceCfgClean.riskPct.toFixed(2)}%`} valueColor="#FF692A" />
+            <MiniStat label="Risk Model" value={riskAllocationModeLabel(sourceCfgClean.cascadeMode)} valueColor="#42D3F2" />
+          </div>
+
+          <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-2.5">
+            <Field label="Simulations / Bankroll" hint="default 200">
+              <NumInput value={runs} onChange={onRunsChange} step="50" min="20" max="2000" color="blue" />
+            </Field>
+            <Field label="Bankroll Repeats" hint="default 100">
+              <NumInput value={cycles} onChange={onCyclesChange} step="10" min="1" max="1000" color="blue" />
+            </Field>
+            <Field label="Trades / Run" hint="long-horizon sample">
+              <NumInput value={tradesPerRun} onChange={onTradesChange} step="10" min="10" max="1000" color="blue" />
+            </Field>
+            <Field label="Ruin Threshold" hint="drawdown from initial">
+              <NumInput value={ruinDD} onChange={onRuinDDChange} step="5" min="50" max="99" color="blue" />
+            </Field>
+          </div>
+
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+            <div className="min-w-0 flex-1 text-[10px] leading-relaxed text-zinc-400">
+              One bankroll repeat = the full simulation set above. The overall summary pools every simulation across all repeats.
+              {progress?.total > 0 && progress.done > 0 && running && (
+                <span className="ml-2 font-mono text-[#42D3F2]">{progress.done}/{progress.total} bankroll repeats</span>
+              )}
+            </div>
+            <button
+              onClick={onRun}
+              disabled={running || initialCapital <= 0}
+              className="shrink-0 flex items-center gap-1.5 px-4 py-2 rounded-md text-[10px] font-mono bg-[#42D3F2]/10 border border-[#42D3F2]/35 text-[#42D3F2] hover:bg-[#42D3F2]/15 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <Play size={11} fill="currentColor" />
+              {running ? `RUNNING ${progress?.done || 0}/${progress?.total || Number(cycles) || 0}` : 'RUN BANKROLL'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div className={`${CARD} border border-[#FF692A]/35 bg-[#FF692A]/[0.05] px-4 py-3 text-[11px] text-[#FF692A] font-mono`} role="alert">
+          {error}
+        </div>
+      )}
+
+      {!hasResult && (
+        <div className={`${CARD} py-14 text-center text-zinc-400 text-xs`}>
+          Run the bankroll model to build an overall survival, drawdown and risk profile across repeated simulation sets.
+        </div>
+      )}
+
+      {hasResult && overall && (
+        <>
+          <div className={`${CARD} overflow-hidden`}>
+            <div className="px-4 py-3 border-b border-[#57534D]/70 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-[13px] font-semibold text-zinc-100">Overall Summary</div>
+                <div className="text-[10px] text-zinc-400 mt-0.5">Average distribution across the complete bankroll run set</div>
+              </div>
+              <div className="text-[10px] font-mono text-zinc-300">{result.totalBankrollCycles} bankroll repeats × {result.runsPerBankroll} simulations = {totalSimulations.toLocaleString('en-IN')} outcomes</div>
+              {result.note && <div className="w-full mt-1 text-[10px] font-mono text-[#FF692A]">{result.note}</div>}
+            </div>
+            <div className="p-3 grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-2.5">
+              <MiniStat label="Survival Rate" value={fmtPct(overall.survivalPct)} valueColor="#7CCF35" />
+              <MiniStat label="Simulated Ruin" value={fmtPct(overall.ruinPct)} sub={`95% CI ${fmtPct(overall.ruinCI.low)}–${fmtPct(overall.ruinCI.high)}`} valueColor="#FF692A" />
+              <MiniStat label="Average Final" value={fmtMoney(overall.meanFinal)} valueColor="#42D3F2" />
+              <MiniStat label="Median Final" value={fmtMoney(overall.medianFinal)} valueColor="#42D3F2" />
+              <MiniStat label="Average Max DD" value={fmtPct(overall.meanDD)} valueColor="#FF692A" />
+              <MiniStat label="P90 Max DD" value={fmtPct(overall.p90DD)} valueColor="#FF692A" />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            <div className={`${CARD} overflow-hidden`}>
+              <div className="px-4 py-3 border-b border-[#57534D]/70 flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-[13px] font-semibold text-zinc-100">Capital Paths</div>
+                  <div className="text-[10px] text-zinc-400 mt-0.5">Average P10–P90 bands across bankroll repeats with sample outcome paths</div>
+                </div>
+                <div className="text-[10px] font-mono text-zinc-300">{result.runsPerBankroll} sample paths</div>
+              </div>
+              <div className="h-80 px-2 pt-4 pb-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={result.pathChartData} margin={{ top: 8, right: 12, bottom: 0, left: 0 }}>
+                    <CartesianGrid stroke="#57534D" strokeOpacity={0.25} strokeDasharray="3 3" vertical={false} />
+                    <XAxis dataKey="trade" stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+                    <YAxis stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} width={62} tickFormatter={(v) => fmtMoney(v)} domain={['auto', 'auto']} />
+                    <ReferenceLine y={initialCapital} stroke="#57534D" strokeDasharray="4 4" />
+                    <Tooltip content={<BankrollPathTooltip initialCapital={initialCapital} />} cursor={{ stroke: '#57534D', strokeWidth: 1 }} />
+                    <Area type="monotone" dataKey="bandBase" stackId="capitalBand" stroke="none" fill="transparent" fillOpacity={0} isAnimationActive={false} />
+                    <Area type="monotone" dataKey="bandWidth" stackId="capitalBand" stroke="none" fill="#42D3F2" fillOpacity={0.08} isAnimationActive={false} />
+                    {result.pathSeries.map((series, idx) => (
+                      <Line
+                        key={series.key}
+                        type="monotone"
+                        dataKey={series.key}
+                        stroke={series.selected ? '#42D3F2' : series.final >= initialCapital ? '#7CCF35' : '#FF692A'}
+                        strokeWidth={series.selected ? 2.2 : 0.8}
+                        strokeOpacity={series.selected ? 1 : 0.12}
+                        dot={false}
+                        isAnimationActive={false}
+                        connectNulls={false}
+                      />
+                    ))}
+                    <Line type="monotone" dataKey="median" stroke="#42D3F2" strokeWidth={2.5} dot={false} isAnimationActive={false} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="px-4 pb-3 flex flex-wrap gap-x-4 gap-y-1 text-[9px] font-mono text-zinc-400">
+                <span><i className="inline-block w-2 h-2 rounded-full bg-[#42D3F2] mr-1" />Average median</span>
+                <span><i className="inline-block w-2 h-2 rounded-full bg-[#7CCF35] mr-1" />Profitable paths</span>
+                <span><i className="inline-block w-2 h-2 rounded-full bg-[#FF692A] mr-1" />Losing paths</span>
+                <span>Reference = Initial Capital</span>
+              </div>
+            </div>
+
+            <div className={`${CARD} overflow-hidden`}>
+              <div className="px-4 py-3 border-b border-[#57534D]/70 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <div className="text-[13px] font-semibold text-zinc-100">Risk Size Sensitivity</div>
+                  <div className="text-[10px] text-zinc-400 mt-0.5">Same sampled outcome sequences replayed at different base-risk sizes</div>
+                </div>
+                <span className="text-[9px] font-mono text-zinc-300">Representative sample</span>
+              </div>
+              <div className="h-80 px-2 pt-4 pb-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={result.riskSensitivity} margin={{ top: 8, right: 10, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke="#57534D" strokeOpacity={0.22} strokeDasharray="3 3" vertical={false} />
+                    <XAxis dataKey="riskLabel" stroke="#A1A1AA" fontSize={10} tickLine={false} axisLine={false} />
+                    <YAxis yAxisId="left" stroke="#FF692A" fontSize={10} tickLine={false} axisLine={false} width={48} tickFormatter={(v) => `${v}%`} />
+                    <YAxis yAxisId="right" orientation="right" stroke="#42D3F2" fontSize={10} tickLine={false} axisLine={false} width={60} tickFormatter={(v) => fmtMoney(v)} />
+                    <Tooltip content={<BankrollRiskTooltip />} cursor={{ stroke: '#57534D' }} />
+                    <Line yAxisId="left" type="monotone" dataKey="ruinPct" name="Ruin" stroke="#FF692A" strokeWidth={2.3} dot={{ r: 2.5, fill: '#FF692A', strokeWidth: 0 }} isAnimationActive={false} />
+                    <Line yAxisId="right" type="monotone" dataKey="medianFinal" name="Median Final" stroke="#42D3F2" strokeWidth={1.9} dot={{ r: 2, fill: '#42D3F2', strokeWidth: 0 }} isAnimationActive={false} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="px-4 pb-3 text-[10px] text-zinc-400">Lower risk generally reduces drawdown and ruin exposure; higher risk increases both.</div>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            <div className={`${CARD} overflow-hidden`}>
+              <div className="px-4 py-3 border-b border-[#57534D]/70"><div className="text-[13px] font-semibold text-zinc-100">Final Capital Distribution</div></div>
+              <div className="h-60 px-2 pt-4 pb-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={result.finalBins} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke="#57534D" strokeOpacity={0.20} strokeDasharray="3 3" vertical={false} />
+                    <XAxis dataKey="label" hide />
+                    <YAxis stroke="#A1A1AA" fontSize={9} tickLine={false} axisLine={false} width={36} />
+                    <Tooltip content={<BankrollDistributionTooltip title="Final Capital" />} />
+                    <Bar dataKey="count" name="Runs" fill="#42D3F2" isAnimationActive={false} radius={[3,3,0,0]} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="px-4 pb-3 text-[10px] text-zinc-400">P10 {fmtMoney(overall.p10Final)} · Median {fmtMoney(overall.medianFinal)} · P90 {fmtMoney(overall.p90Final)}</div>
+            </div>
+
+            <div className={`${CARD} overflow-hidden`}>
+              <div className="px-4 py-3 border-b border-[#57534D]/70"><div className="text-[13px] font-semibold text-zinc-100">Drawdown Distribution</div></div>
+              <div className="h-60 px-2 pt-4 pb-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={result.ddBins} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke="#57534D" strokeOpacity={0.20} strokeDasharray="3 3" vertical={false} />
+                    <XAxis dataKey="label" hide />
+                    <YAxis stroke="#A1A1AA" fontSize={9} tickLine={false} axisLine={false} width={36} />
+                    <Tooltip content={<BankrollDistributionTooltip title="Max Drawdown" />} />
+                    <Bar dataKey="count" name="Runs" fill="#FF692A" isAnimationActive={false} radius={[3,3,0,0]} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="px-4 pb-3 text-[10px] text-zinc-400">Median {fmtPct(overall.medianDD)} · P90 {fmtPct(overall.p90DD)} · Worst {fmtPct(overall.worstDD)}</div>
+            </div>
+
+            <div className={`${CARD} overflow-hidden`}>
+              <div className="px-4 py-3 border-b border-[#57534D]/70"><div className="text-[13px] font-semibold text-zinc-100">Losing Streak Distribution</div></div>
+              <div className="h-60 px-2 pt-4 pb-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <ComposedChart data={result.streakBins} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                    <CartesianGrid stroke="#57534D" strokeOpacity={0.20} strokeDasharray="3 3" vertical={false} />
+                    <XAxis dataKey="label" hide />
+                    <YAxis stroke="#A1A1AA" fontSize={9} tickLine={false} axisLine={false} width={36} />
+                    <Tooltip content={<BankrollDistributionTooltip title="Longest Losing Streak" />} />
+                    <Bar dataKey="count" name="Runs" fill="#7CCF35" isAnimationActive={false} radius={[3,3,0,0]} />
+                  </ComposedChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="px-4 pb-3 text-[10px] text-zinc-400">Median {overall.medianLossStreak} losses · P90 {overall.p90LossStreak} · Worst {overall.worstLossStreak}</div>
+            </div>
+          </div>
+
+          <div className={`${CARD} overflow-hidden`}>
+            <div className="px-4 py-3 border-b border-[#57534D]/70 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-[13px] font-semibold text-zinc-100">Risk Profile</div>
+                <div className="text-[10px] text-zinc-400 mt-0.5">Overall readout across every simulated outcome</div>
+              </div>
+              <div className="text-[10px] font-mono text-zinc-300">Ruin = equity reaches {fmtPct(100 - result.ruinDD)} of initial capital or lower</div>
+            </div>
+            <div className="p-3 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-2.5">
+              {[
+                ['Average Return', fmtPct(overall.meanReturn), 'Arithmetic mean across all simulated outcomes', overall.meanReturn >= 0 ? '#7CCF35' : '#FF692A'],
+                ['Profitable Runs', fmtPct(overall.profitablePct), 'Outcomes finishing above starting capital', '#7CCF35'],
+                ['Simulated Ruin', fmtPct(overall.ruinPct), `${overall.ruinedCount.toLocaleString('en-IN')} of ${overall.total.toLocaleString('en-IN')} outcomes`, '#FF692A'],
+                ['Survival Rate', fmtPct(overall.survivalPct), 'Outcomes that stayed above the ruin level', '#7CCF35'],
+                ['Stopped Runs', `${overall.stoppedCount.toLocaleString('en-IN')} / ${overall.total.toLocaleString('en-IN')}`, 'Triggered by existing safety/risk rules', '#FF692A'],
+                ['Average Trades Executed', overall.avgTradesExecuted.toFixed(1), 'Accounts for early safety stops', '#42D3F2'],
+                ['Average Final Capital', fmtMoney(overall.meanFinal), 'Arithmetic mean ending equity', '#42D3F2'],
+                ['P90 Max Drawdown', fmtPct(overall.p90DD), '90th percentile peak-to-trough decline', '#FF692A'],
+              ].map(([label, value, detail, color]) => (
+                <div key={label} className="rounded-lg border border-[#57534D] bg-[#27272A]/65 px-3 py-2.5 min-w-0">
+                  <div className="text-[10px] uppercase tracking-wide text-zinc-400">{label}</div>
+                  <div className="mt-1 text-[13px] font-mono font-semibold tabular-nums" style={{ color }}>{value}</div>
+                  <div className="mt-1 text-[9px] leading-4 text-zinc-300">{detail}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 // Floating Run button: fixed to the viewport (not the Configuration column)
 // so it stays reachable even after that sidebar is scrolled past, and
 // free-draggable to wherever on screen the user wants it parked. A plain
@@ -2218,6 +2974,16 @@ function buildBuilderScaledConfig(engineCfg, scale, useFno) {
     }
   }
 
+  // Builder-only normalization for On Capital: its dynamic win/loss risk is
+  // calculated from current capital rather than Base Risk, so scaling Base
+  // Risk alone would not scale Trades 2+. The multiplier preserves the same
+  // configured capital-percentage model while fitting the Builder budget.
+  if (engineCfg.cascadeMode === "capital") {
+    next._builderCapitalRiskMultiplier = s;
+  } else {
+    next._builderCapitalRiskMultiplier = 1;
+  }
+
   return next;
 }
 
@@ -2380,6 +3146,13 @@ function buildBuilderTargetConfig(engineCfg, baseRiskAmount, riskPoints, useFno,
     rr,
     riskPct: initialCapital > 0 ? (riskAmount / initialCapital) * 100 : 0,
   };
+
+  const sourceBaseRiskAmount = initialCapital > 0
+    ? initialCapital * (Math.max(0, Number(engineCfg.riskPct) || 0) / 100)
+    : 0;
+  next._builderCapitalRiskMultiplier = engineCfg.cascadeMode === "capital" && sourceBaseRiskAmount > 0
+    ? riskAmount / sourceBaseRiskAmount
+    : 1;
 
   if (useFno) {
     const segment = engineCfg.fnoSegment === "options" || engineCfg.fnoSegment === "futures"
@@ -2566,7 +3339,11 @@ function evaluateBuilderTargetSequence(engineCfg, sequence, totalRiskAmount, use
   const rrSeed = hashStringToUint32(
     `builder-target|${targetWinRate ?? "actual"}|${sequence.length}|${sequence.map((x) => (x ? "W" : "L")).join("")}`
   );
-  const builderEngineCfg = { ...engineCfg, _rrSeed: rrSeed };
+  const builderEngineCfg = {
+    ...engineCfg,
+    _rrSeed: rrSeed,
+    _riskReferenceWinRate: targetWinRate == null ? engineCfg.winRate : targetWinRate,
+  };
   const calibrated = calibrateBuilderTargetPoints(
     builderEngineCfg,
     sequence,
@@ -2652,7 +3429,11 @@ function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, t
   const rrSeed = hashStringToUint32(
     `builder-rr|${targetWinRate ?? "actual"}|${sequence.length}|${sequence.map((x) => (x ? "W" : "L")).join("")}`
   );
-  const builderEngineCfg = { ...engineCfg, _rrSeed: rrSeed };
+  const builderEngineCfg = {
+    ...engineCfg,
+    _rrSeed: rrSeed,
+    _riskReferenceWinRate: targetWinRate == null ? engineCfg.winRate : targetWinRate,
+  };
 
   const calibrated = calibrateBuilderRiskPlan(
     builderEngineCfg,
@@ -3211,21 +3992,113 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
         </div>
       </div>
 
-      <div className="mb-5">
+      <div className="mb-5 min-w-0">
         <GroupTitle icon={BarChart2} color="violet">Risk Allocation</GroupTitle>
-        <div className="flex items-center justify-between text-[11px] font-mono mb-2">
-          <span className="text-zinc-400">{strategyCfg.cascadeMode === "profit" ? "On Profit" : "On Capital"}</span>
-          <span className={strategyCfg.riskAllocationEnabled ? "text-violet-300" : "text-zinc-600"}>Reset {strategyCfg.riskAllocationEnabled ? "ON" : "OFF"}</span>
+        <div className="rounded-lg border border-violet-500/20 bg-violet-500/[0.04] p-3 min-w-0 overflow-hidden">
+          <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-2">Mode</div>
+          <button
+            type="button"
+            onClick={() => onChange("builderRiskMenuOpen")({ target: { value: !cfg.builderRiskMenuOpen } })}
+            className="w-full min-w-0 flex items-center justify-between gap-2 rounded-lg border border-zinc-700/70 bg-zinc-950/60 px-3 py-2 text-[11px] font-mono text-zinc-200 hover:border-violet-500/40 transition-colors"
+          >
+            <span className="min-w-0 truncate">{riskAllocationModeLabel(cfg.cascadeMode)}</span>
+            <ChevronDown size={14} className={`shrink-0 text-zinc-500 transition-transform ${cfg.builderRiskMenuOpen ? "rotate-180" : ""}`} />
+          </button>
+
+          {cfg.builderRiskMenuOpen && (
+            <div className="grid grid-cols-2 gap-1.5 mt-2 min-w-0">
+              {RISK_ALLOCATION_MODES.map((cm) => (
+                <button
+                  key={cm}
+                  type="button"
+                  onClick={() => {
+                    onChange("cascadeMode")({ target: { value: cm } });
+                    onChange("builderRiskMenuOpen")({ target: { value: false } });
+                  }}
+                  className={`min-w-0 text-left rounded-md border px-2 py-2 text-[10px] font-mono leading-tight transition-colors ${
+                    cfg.cascadeMode === cm
+                      ? "bg-violet-500/15 border-violet-500/35 text-violet-200"
+                      : "bg-zinc-950/40 border-zinc-800 text-zinc-400 hover:text-zinc-200 hover:border-zinc-700"
+                  }`}
+                >
+                  {riskAllocationModeLabel(cm)}
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div className="mt-2 min-w-0 rounded-md border border-violet-500/15 bg-zinc-950/40 px-2.5 py-2 text-[9px] sm:text-[10px] leading-relaxed text-zinc-300 break-words whitespace-normal overflow-hidden">
+            {cfg.cascadeMode === "profitCumulative"
+              ? "WIN → cumulative net profit × allocation. LOSS → previous executed risk × adjustment; the adjustment flips after the configured loss count."
+              : cfg.cascadeMode === "profit"
+              ? "Existing On Profit logic: winning risk is derived from usable previous profit."
+              : cfg.cascadeMode === "capital"
+              ? "Existing On Capital logic: risk follows current capital."
+              : cfg.cascadeMode === "drawdownRecovery"
+              ? "Compresses risk as drawdown from the high-water mark increases."
+              : cfg.cascadeMode === "edgeConfidence"
+              ? "Adjusts base risk using a smoothed, non-look-ahead win-rate estimate."
+              : cfg.cascadeMode === "sequencePressure"
+              ? "Responds to observed win/loss streak pressure with bounded scaling."
+              : cfg.cascadeMode === "riskPocket"
+              ? "Deploys a controlled portion of base risk while protecting a reserve."
+              : "Combines drawdown, edge-confidence and sequence factors geometrically."}
+          </div>
+
+          <div className="mt-2.5 grid grid-cols-2 gap-x-2 gap-y-0 min-w-0">
+            {cfg.cascadeMode === "profitCumulative" ? (
+              <>
+                <Field label="Profit Allocation %"><NumInput value={cfg.profitCumulativeAllocationPct} onChange={onChange("profitCumulativeAllocationPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Loss Adjustment %"><NumInput value={cfg.profitCumulativeLossAdjustPct} onChange={onChange("profitCumulativeLossAdjustPct")} step="1" min="-95" max="100" color="violet" /></Field>
+                <Field label="Flip After Losses"><NumInput value={cfg.profitCumulativeFlipAfterLosses} onChange={onChange("profitCumulativeFlipAfterLosses")} step="1" min="1" color="violet" /></Field>
+              </>
+            ) : (cfg.cascadeMode === "profit" || cfg.cascadeMode === "capital") ? (
+              <>
+                <Field label="Win Risk %"><NumInput value={cfg.winRiskPct} onChange={onChange("winRiskPct")} step="0.1" color="violet" /></Field>
+                <Field label="Loss Risk %"><NumInput value={cfg.lossRiskPct} onChange={onChange("lossRiskPct")} step="0.1" color="violet" /></Field>
+                <Field label="Incr / Decr %"><NumInput value={cfg.lossRiskAdjustPct} onChange={onChange("lossRiskAdjustPct")} step="0.1" color="violet" /></Field>
+              </>
+            ) : cfg.cascadeMode === "drawdownRecovery" ? (
+              <>
+                <Field label="DD Target %"><NumInput value={cfg.drawdownTargetPct} onChange={onChange("drawdownTargetPct")} step="1" min="1" color="violet" /></Field>
+                <Field label="Min Risk Factor"><NumInput value={cfg.drawdownMinFactor} onChange={onChange("drawdownMinFactor")} step="0.05" min="0.05" max="1" color="violet" /></Field>
+                <Field label="Curve"><NumInput value={cfg.drawdownCurve} onChange={onChange("drawdownCurve")} step="0.1" min="0.5" color="violet" /></Field>
+              </>
+            ) : cfg.cascadeMode === "edgeConfidence" ? (
+              <>
+                <Field label="Prior Trades"><NumInput value={cfg.edgePriorTrades} onChange={onChange("edgePriorTrades")} step="1" min="2" color="violet" /></Field>
+                <Field label="Min Factor"><NumInput value={cfg.edgeMinFactor} onChange={onChange("edgeMinFactor")} step="0.05" min="0.1" color="violet" /></Field>
+                <Field label="Max Factor"><NumInput value={cfg.edgeMaxFactor} onChange={onChange("edgeMaxFactor")} step="0.05" min="1" color="violet" /></Field>
+              </>
+            ) : cfg.cascadeMode === "sequencePressure" ? (
+              <>
+                <Field label="Loss Step %"><NumInput value={cfg.sequenceLossStepPct} onChange={onChange("sequenceLossStepPct")} step="1" min="0" color="violet" /></Field>
+                <Field label="Win Step %"><NumInput value={cfg.sequenceWinStepPct} onChange={onChange("sequenceWinStepPct")} step="1" min="0" color="violet" /></Field>
+                <Field label="Min Factor"><NumInput value={cfg.sequenceMinFactor} onChange={onChange("sequenceMinFactor")} step="0.05" min="0.1" color="violet" /></Field>
+                <Field label="Max Factor"><NumInput value={cfg.sequenceMaxFactor} onChange={onChange("sequenceMaxFactor")} step="0.05" min="1" color="violet" /></Field>
+              </>
+            ) : cfg.cascadeMode === "riskPocket" ? (
+              <>
+                <Field label="Start Active %"><NumInput value={cfg.pocketStartPct} onChange={onChange("pocketStartPct")} step="5" min="0" max="100" color="violet" /></Field>
+                <Field label="Win Unlock %"><NumInput value={cfg.pocketWinUnlockPct} onChange={onChange("pocketWinUnlockPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Loss Lock %"><NumInput value={cfg.pocketLossLockPct} onChange={onChange("pocketLossLockPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Min Active %"><NumInput value={cfg.pocketMinPct} onChange={onChange("pocketMinPct")} step="5" min="5" max="100" color="violet" /></Field>
+              </>
+            ) : (
+              <>
+                <Field label="DD Weight"><NumInput value={cfg.adaptiveDdWeight} onChange={onChange("adaptiveDdWeight")} step="5" min="0" color="violet" /></Field>
+                <Field label="Edge Weight"><NumInput value={cfg.adaptiveEdgeWeight} onChange={onChange("adaptiveEdgeWeight")} step="5" min="0" color="violet" /></Field>
+                <Field label="Sequence Weight"><NumInput value={cfg.adaptiveSequenceWeight} onChange={onChange("adaptiveSequenceWeight")} step="5" min="0" color="violet" /></Field>
+                <Field label="Min Factor"><NumInput value={cfg.adaptiveMinFactor} onChange={onChange("adaptiveMinFactor")} step="0.05" min="0.1" color="violet" /></Field>
+                <Field label="Max Factor"><NumInput value={cfg.adaptiveMaxFactor} onChange={onChange("adaptiveMaxFactor")} step="0.05" min="1" color="violet" /></Field>
+              </>
+            )}
+          </div>
+
+          <div className="mt-1 rounded-md border border-zinc-800 bg-zinc-950/30 px-2.5 py-1.5 text-[9px] font-mono leading-relaxed text-zinc-500 break-words">
+            The selected model and its settings run inside every evaluated W/L sequence. Builder keeps the configured allocation shape, auto-scales absolute size to the Total Risk Budget, and preserves existing caps/reset as final guards.
+          </div>
         </div>
-        <div className="grid grid-cols-2 gap-2.5">
-          <Field label="Win Risk %"><div className="text-xs font-mono text-zinc-200 py-2.5">{fmtPct(strategyCfg.winRiskPct)}</div></Field>
-          <Field label="Loss Risk %"><div className="text-xs font-mono text-zinc-200 py-2.5">{fmtPct(strategyCfg.lossRiskPct)}</div></Field>
-        </div>
-        <div className="grid grid-cols-2 gap-2.5">
-          <Field label="Incr/Decr Risk %"><div className="text-xs font-mono text-zinc-200 py-2.5">{fmtPct(strategyCfg.lossRiskAdjustPct)}</div></Field>
-          <Field label="Trigger (% Initial)"><div className="text-xs font-mono text-zinc-200 py-2.5">{fmtPct(strategyCfg.riskAllocationTriggerPct)}</div></Field>
-        </div>
-        <Field label="Reset To (% Initial)"><div className="text-xs font-mono text-zinc-200 py-2.5">{fmtPct(strategyCfg.riskAllocationResetPct)}</div></Field>
       </div>
 
       <div className="mb-5">
@@ -3907,11 +4780,21 @@ const MODE_LABEL = {
   sweep: "Win Rate",
   fno: "Day / F&O",
   builder: "Builder",
+  bankroll: "Bankroll",
 };
 
 export default function RiskSimulator() {
   const [cfg, setCfg] = useState(DEFAULTS);
   const [mode, setMode] = useState("single");
+  const [bankrollBaseMode, setBankrollBaseMode] = useState("single");
+  const [bankrollRuns, setBankrollRuns] = useState(200);
+  const [bankrollCycles, setBankrollCycles] = useState(100);
+  const [bankrollTrades, setBankrollTrades] = useState(100);
+  const [bankrollRuinDD, setBankrollRuinDD] = useState(80);
+  const [bankrollResult, setBankrollResult] = useState(null);
+  const [bankrollRunning, setBankrollRunning] = useState(false);
+  const [bankrollProgress, setBankrollProgress] = useState({ done: 0, total: 100 });
+  const [bankrollError, setBankrollError] = useState("");
   // Which base strategy engine the Win Rate Sweep should run: "single"
   // (fractional-lot engine) or "fno" (whole-lot, Indian-market engine). This
   // automatically follows whichever of the two tabs the user configured
@@ -3934,6 +4817,7 @@ export default function RiskSimulator() {
   const [dragOverIdx, setDragOverIdx] = useState(null);
   const [allocationOpenIdx, setAllocationOpenIdx] = useState(null);
   const [allocationScales, setAllocationScales] = useState({});
+  const [riskAllocationOpen, setRiskAllocationOpen] = useState(false);
   const lastCleanCfgRef = useRef(null);
   const lastRunModeRef = useRef(null);
 
@@ -4016,7 +4900,13 @@ export default function RiskSimulator() {
       selectedBatchRunIdx,
       cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
       baseMode: strategyBaseMode,
-      sourceSignature: builderSourceSignature(cfg, strategyBaseMode),
+      sourceSignature: builderSourceSignature(
+      strategyWorkspaceRef.current[strategyBaseMode]?.cfg || cfg,
+      strategyBaseMode
+    ),
+      sourceRiskAllocationSignature: builderRiskAllocationSignature(
+        strategyWorkspaceRef.current[strategyBaseMode]?.cfg || cfg
+      ),
     };
   }, [
     mode,
@@ -4048,7 +4938,13 @@ export default function RiskSimulator() {
           selectedBatchRunIdx,
           cleanCfg: lastCleanCfgRef.current ? { ...lastCleanCfgRef.current } : null,
           baseMode: strategyBaseMode,
-          sourceSignature: builderSourceSignature(cfg, strategyBaseMode),
+          sourceSignature: builderSourceSignature(
+      strategyWorkspaceRef.current[strategyBaseMode]?.cfg || cfg,
+      strategyBaseMode
+    ),
+      sourceRiskAllocationSignature: builderRiskAllocationSignature(
+        strategyWorkspaceRef.current[strategyBaseMode]?.cfg || cfg
+      ),
         };
       }
 
@@ -4091,9 +4987,17 @@ export default function RiskSimulator() {
         return;
       }
 
+      if (nextMode === "bankroll") {
+        const sourceMode = mode === "fno" ? "fno" : mode === "single" ? "single" : (mode === "builder" ? strategyBaseMode : bankrollBaseMode);
+        setBankrollBaseMode(sourceMode === "fno" ? "fno" : "single");
+        setBankrollResult(null);
+        setMode("bankroll");
+        return;
+      }
+
       if (nextMode === "builder") {
         const strategyBase = nextMode === "builder"
-          ? (mode === "fno" ? "fno" : mode === "single" ? "single" : strategyBaseMode)
+          ? (mode === "fno" ? "fno" : mode === "single" ? "single" : mode === "bankroll" ? bankrollBaseMode : strategyBaseMode)
           : strategyBaseMode;
         const currentSourceCfg =
           mode === "single" || mode === "fno"
@@ -4127,10 +5031,18 @@ export default function RiskSimulator() {
               builderMinTrades: Number(currentSourceCfg.builderMinTrades) || 5,
               builderMaxTrades: Number(currentSourceCfg.builderMaxTrades) || 10,
               builderSequenceLimit: BUILDER_SAFE_LIMITS.maxSequenceEvaluations,
+              builderMode: currentSourceCfg.builderMode,
+              builderTargetInputMode: currentSourceCfg.builderTargetInputMode,
+              builderTargetValue: currentSourceCfg.builderTargetValue,
             };
+        const preservedBuilderRiskInputs = workspace && workspaceMatchesSource
+          ? builderRiskAllocationFields(workspace.cfg || {})
+          : {};
         const mergedBuilderCfg = {
           ...currentSourceCfg,
           ...preservedBuilderInputs,
+          ...preservedBuilderRiskInputs,
+          builderRiskMenuOpen: false,
         };
         if (!workspace) {
           mergedBuilderCfg.builderInitialCapital = Number(currentSourceCfg.initialCapital) || 0;
@@ -4184,6 +5096,7 @@ export default function RiskSimulator() {
       builderSelectedKey,
       strategyBaseMode,
       scenarioInput,
+      bankrollBaseMode,
     ]
   );
 
@@ -4204,9 +5117,12 @@ export default function RiskSimulator() {
       "builderTargetInputMode",
       "builderBaseMode",
     ]);
+    const booleanKeys = new Set(["builderRiskMenuOpen"]);
     setCfg((c) => ({
       ...c,
-      [key]: stringKeys.has(key)
+      [key]: booleanKeys.has(key)
+        ? Boolean(val)
+        : stringKeys.has(key)
         ? String(val ?? "")
         : val === ""
         ? ""
@@ -4241,7 +5157,13 @@ export default function RiskSimulator() {
       selectedBatchRunIdx: null,
       cleanCfg: { ...runCfg },
       baseMode,
-      sourceSignature: builderSourceSignature(cfg, baseMode),
+      sourceSignature: builderSourceSignature(
+        strategyWorkspaceRef.current[baseMode]?.cfg || cfg,
+        baseMode
+      ),
+      sourceRiskAllocationSignature: builderRiskAllocationSignature(
+        strategyWorkspaceRef.current[baseMode]?.cfg || cfg
+      ),
     };
   }, [cfg, builderResult]);
 
@@ -4305,7 +5227,13 @@ export default function RiskSimulator() {
       selectedBatchRunIdx: null,
       cleanCfg: { ...(editedCandidate.autoStrategyCfg || builderResult.strategyCfg) },
       baseMode: builderResult.baseMode,
-      sourceSignature: builderSourceSignature(cfg, builderResult.baseMode),
+      sourceSignature: builderSourceSignature(
+        strategyWorkspaceRef.current[builderResult.baseMode]?.cfg || cfg,
+        builderResult.baseMode
+      ),
+      sourceRiskAllocationSignature: builderRiskAllocationSignature(
+        strategyWorkspaceRef.current[builderResult.baseMode]?.cfg || cfg
+      ),
     };
   }, [builderResult, cfg]);
 
@@ -4376,7 +5304,13 @@ export default function RiskSimulator() {
             selectedBatchRunIdx: null,
             cleanCfg: { ...built.strategyCfg },
             baseMode: built.baseMode,
-            sourceSignature: builderSourceSignature(normalized, built.baseMode),
+            sourceSignature: builderSourceSignature(
+              strategyWorkspaceRef.current[built.baseMode]?.cfg || normalized,
+              built.baseMode
+            ),
+            sourceRiskAllocationSignature: builderRiskAllocationSignature(
+              strategyWorkspaceRef.current[built.baseMode]?.cfg || normalized
+            ),
           };
         }
       } finally {
@@ -4723,7 +5657,13 @@ export default function RiskSimulator() {
         selectedBatchRunIdx: null,
         cleanCfg: { ...(editedCandidate.autoStrategyCfg || builderResult.strategyCfg) },
         baseMode: builderResult.baseMode,
-        sourceSignature: builderSourceSignature(cfg, builderResult.baseMode),
+        sourceSignature: builderSourceSignature(
+        strategyWorkspaceRef.current[builderResult.baseMode]?.cfg || cfg,
+        builderResult.baseMode
+      ),
+      sourceRiskAllocationSignature: builderRiskAllocationSignature(
+        strategyWorkspaceRef.current[builderResult.baseMode]?.cfg || cfg
+      ),
       };
     },
     [result, builderResult, builderSelectedKey, cfg]
@@ -4891,6 +5831,263 @@ export default function RiskSimulator() {
     winRateRR = riskMag > 0 ? rewardMag / riskMag : rewardMag > 0 ? Infinity : 0;
   }
 
+
+  const bankrollSourceCfg = bankrollBaseMode === "fno"
+    ? (strategyWorkspaceRef.current.fno?.cfg || DEFAULTS)
+    : (strategyWorkspaceRef.current.single?.cfg || DEFAULTS);
+
+  const handleRunBankroll = useCallback(async () => {
+    setBankrollError("");
+
+    // Snapshot the source configuration once at the start of a run. This keeps
+    // every repeat internally consistent even if the user changes a different
+    // page while a long bankroll calculation is still running.
+    const source = cleanConfig(bankrollSourceCfg || DEFAULTS);
+    const baseMode = bankrollBaseMode === "fno" ? "fno" : "single";
+    const requestedRunCount = Math.min(2000, Math.max(20, Math.round(Number(bankrollRuns) || 200)));
+    const tradeCount = Math.min(1000, Math.max(1, Math.round(Number(bankrollTrades) || 100)));
+    const requestedCycles = Math.min(1000, Math.max(1, Math.round(Number(bankrollCycles) || 100)));
+
+    if (baseMode === "fno") {
+      if (!source.initialCapital) {
+        setBankrollError("Initial Capital must be greater than 0.");
+        return;
+      }
+      if (source.fnoSegment === "intraday" && !source.fnoQuantity) {
+        setBankrollError("Day / F&O Intraday requires a valid Quantity.");
+        return;
+      }
+      if (source.fnoSegment !== "intraday" && (!source.fnoLots || !source.fnoLotSize)) {
+        setBankrollError("Day / F&O Options/Futures requires valid Lots and Lot Size.");
+        return;
+      }
+    } else if (!source.initialCapital || !source.baseLots) {
+      setBankrollError("Single Run requires Initial Capital and Base Lots greater than 0.");
+      return;
+    }
+
+    // Keep the browser responsive by yielding between small simulation chunks.
+    // The default 200 × 100 × 100 still represents the full requested workload
+    // (2,000,000 core trade evaluations) rather than silently changing the model.
+    const maxCoreEvaluations = 2000000;
+    const perCycleEvaluations = Math.max(1, requestedRunCount * tradeCount);
+    const runCount = Math.min(requestedRunCount, Math.max(20, Math.floor(300000 / tradeCount)));
+    const actualCycles = Math.min(
+      requestedCycles,
+      Math.max(1, Math.floor(maxCoreEvaluations / Math.max(1, runCount * tradeCount)))
+    );
+    const chunkRuns = Math.max(5, Math.min(25, Math.floor(10000 / Math.max(1, tradeCount))));
+
+    const bankrollCfg = { ...source, numTrades: tradeCount };
+    // Resolve the selected core engine once for the entire bankroll run so the
+    // same simulator function is available both in the main cycles and in
+    // the later risk-sensitivity replay.
+    const runFn = baseMode === "fno" ? simulateFromSequenceFnO : simulateFromSequence;
+    setBankrollRunning(true);
+    setBankrollProgress({ done: 0, total: actualCycles });
+
+    const yieldToBrowser = () => new Promise((resolve) => setTimeout(resolve, 0));
+    let representativeRuns = null;
+    let representativeSequences = null;
+    let pathAccumulator = Array.from({ length: tradeCount + 1 }, () => ({ p10: 0, p25: 0, median: 0, p75: 0, p90: 0, count: 0 }));
+    const allFinalValues = [];
+    const allReturns = [];
+    const allDrawdowns = [];
+    const allStreaks = [];
+    let pooledProfitableCount = 0;
+    let pooledRuinedCount = 0;
+    let pooledStoppedCount = 0;
+    let pooledTradesExecuted = 0;
+
+    try {
+      for (let cycle = 0; cycle < actualCycles; cycle++) {
+        const sequences = Array.from({ length: runCount }, () => buildBernoulliWinLossSeq(tradeCount, bankrollCfg.winRate));
+        const cycleRuns = [];
+
+        // Chunk the synchronous core work so the React page can paint progress.
+        for (let start = 0; start < runCount; start += chunkRuns) {
+          const end = Math.min(runCount, start + chunkRuns);
+          for (let idx = start; idx < end; idx++) {
+            const seq = sequences[idx];
+            const sim = runFn(bankrollCfg, seq);
+            const capitalPath = [
+              bankrollCfg.initialCapital,
+              ...(sim.trades || []).map((t) => Number(t.capital) || bankrollCfg.initialCapital),
+            ];
+            const minCapital = Math.min(...capitalPath);
+            const executedSeq = (sim.trades || [])
+              .map((t, i) => (typeof t.win === "boolean" ? t.win : !!seq[i]))
+              .slice(0, sim.trades?.length || 0);
+            const longestStreak = longestLossStreak(executedSeq);
+            cycleRuns.push({
+              index: idx + 1,
+              winLossSeq: seq,
+              result: sim,
+              capitalPath,
+              minCapital,
+              ruined: minCapital <= bankrollCfg.initialCapital * (1 - Number(bankrollRuinDD || 80) / 100),
+              longestLossStreak: longestStreak,
+            });
+          }
+          await yieldToBrowser();
+        }
+
+        if (!representativeRuns) {
+          representativeRuns = cycleRuns;
+          representativeSequences = sequences;
+        }
+
+        for (let t = 0; t <= tradeCount; t++) {
+          const vals = cycleRuns.map((r) => r.capitalPath[t]).filter((v) => Number.isFinite(v));
+          if (!vals.length) continue;
+          const point = {
+            p10: percentileValue(vals, 0.10),
+            p25: percentileValue(vals, 0.25),
+            median: percentileValue(vals, 0.50),
+            p75: percentileValue(vals, 0.75),
+            p90: percentileValue(vals, 0.90),
+          };
+          pathAccumulator[t].p10 += point.p10;
+          pathAccumulator[t].p25 += point.p25;
+          pathAccumulator[t].median += point.median;
+          pathAccumulator[t].p75 += point.p75;
+          pathAccumulator[t].p90 += point.p90;
+          pathAccumulator[t].count += 1;
+        }
+
+        cycleRuns.forEach((r) => {
+          const finalValue = Number(r.result.finalCapital) || bankrollCfg.initialCapital;
+          const returnPct = bankrollCfg.initialCapital > 0
+            ? (Number(r.result.netPL) || 0) / bankrollCfg.initialCapital * 100
+            : 0;
+          const dd = Number(r.result.maxDD) || 0;
+          allFinalValues.push(finalValue);
+          allReturns.push(returnPct);
+          allDrawdowns.push(dd);
+          allStreaks.push(r.longestLossStreak);
+          if (r.result.netPL > 0) pooledProfitableCount += 1;
+          if (r.ruined) pooledRuinedCount += 1;
+          if (r.result.stopped) pooledStoppedCount += 1;
+          pooledTradesExecuted += r.result.trades?.length || 0;
+        });
+
+        setBankrollProgress({ done: cycle + 1, total: actualCycles });
+        await yieldToBrowser();
+      }
+
+      const totalOutcomes = Math.max(1, allFinalValues.length);
+      const meanFinal = allFinalValues.reduce((a, b) => a + b, 0) / totalOutcomes;
+      const meanReturn = allReturns.reduce((a, b) => a + b, 0) / totalOutcomes;
+      const meanDD = allDrawdowns.reduce((a, b) => a + b, 0) / totalOutcomes;
+      const ruinCI = wilsonInterval(pooledRuinedCount, totalOutcomes);
+
+      // Use one shared chart-data array for percentile lines + representative
+      // paths. This is more reliable than supplying a separate data array to
+      // every Recharts <Line>, and fixes the previously flat/blank Capital Paths.
+      const representativePathCount = Math.min(24, representativeRuns?.length || 0);
+      const representativePathSeries = (representativeRuns || []).slice(0, representativePathCount).map((r, idx) => ({
+        key: `path_${idx}`,
+        final: Number(r.result.finalCapital) || bankrollCfg.initialCapital,
+        selected: idx === 0,
+        label: `Run ${r.index}`,
+      }));
+      const pathChartData = pathAccumulator.map((a, trade) => {
+        const row = {
+          trade,
+          p10: a.count ? a.p10 / a.count : null,
+          p25: a.count ? a.p25 / a.count : null,
+          median: a.count ? a.median / a.count : null,
+          p75: a.count ? a.p75 / a.count : null,
+          p90: a.count ? a.p90 / a.count : null,
+        };
+        representativePathSeries.forEach((series, idx) => {
+          const r = representativeRuns[idx];
+          row[series.key] = trade < r.capitalPath.length ? r.capitalPath[trade] : null;
+        });
+        row.bandBase = row.p10;
+        row.bandWidth = row.p10 != null && row.p90 != null ? Math.max(0, row.p90 - row.p10) : null;
+        return row;
+      });
+
+      const sensitivityLevels = [0.50, 0.75, 1, 1.25, 1.50, 2, 2.50];
+      const sensitivityRuns = Math.min((representativeSequences || []).length, 100);
+      const sensitivity = sensitivityLevels.map((multiplier) => {
+        const scaledCfg = scaleBankrollConfig(bankrollCfg, baseMode, multiplier);
+        const sims = (representativeSequences || []).slice(0, sensitivityRuns).map((seq) => runFn(scaledCfg, seq));
+        const sensFinals = sims.map((r) => r.finalCapital);
+        const sensDD = sims.map((r) => r.maxDD);
+        const ruined = sims.filter((r) => {
+          const path = [scaledCfg.initialCapital, ...(r.trades || []).map((t) => Number(t.capital) || scaledCfg.initialCapital)];
+          return Math.min(...path) <= scaledCfg.initialCapital * (1 - Number(bankrollRuinDD || 80) / 100);
+        }).length;
+        const prof = sims.filter((r) => r.netPL > 0).length;
+        const baseRiskPct = scaledCfg.riskPct;
+        return {
+          multiplier,
+          riskPct: baseRiskPct,
+          riskLabel: `${baseRiskPct.toFixed(2)}%`,
+          ruinPct: sims.length ? (ruined / sims.length) * 100 : 0,
+          medianFinal: percentileValue(sensFinals, 0.5),
+          p90DD: percentileValue(sensDD, 0.9),
+          profitablePct: sims.length ? (prof / sims.length) * 100 : 0,
+        };
+      });
+
+      const overallStats = {
+        total: totalOutcomes,
+        profitablePct: (pooledProfitableCount / totalOutcomes) * 100,
+        survivalPct: ((totalOutcomes - pooledRuinedCount) / totalOutcomes) * 100,
+        ruinPct: (pooledRuinedCount / totalOutcomes) * 100,
+        ruinCI: { low: ruinCI.low * 100, high: ruinCI.high * 100 },
+        meanFinal,
+        medianFinal: percentileValue(allFinalValues, 0.50),
+        p10Final: percentileValue(allFinalValues, 0.10),
+        p90Final: percentileValue(allFinalValues, 0.90),
+        meanDD,
+        medianDD: percentileValue(allDrawdowns, 0.50),
+        p90DD: percentileValue(allDrawdowns, 0.90),
+        worstDD: Math.max(0, ...allDrawdowns),
+        medianLossStreak: percentileValue(allStreaks, 0.50),
+        p90LossStreak: percentileValue(allStreaks, 0.90),
+        worstLossStreak: Math.max(0, ...allStreaks),
+        meanReturn,
+        stoppedCount: pooledStoppedCount,
+        avgTradesExecuted: pooledTradesExecuted / totalOutcomes,
+        ruinedCount: pooledRuinedCount,
+      };
+
+      const next = {
+        sourceCfg: bankrollCfg,
+        baseMode,
+        runs: representativeRuns || [],
+        runsPerBankroll: runCount,
+        totalBankrollCycles: actualCycles,
+        requestedBankrollCycles: requestedCycles,
+        pooledRunsCount: totalOutcomes,
+        tradesPerRun: tradeCount,
+        ruinDD: Number(bankrollRuinDD || 80),
+        pathChartData,
+        pathSeries: representativePathSeries,
+        riskSensitivity: sensitivity,
+        finalBins: makeDistributionBins(allFinalValues, 12),
+        ddBins: makeDistributionBins(allDrawdowns, 12),
+        streakBins: makeDistributionBins(allStreaks, 12),
+        overallStats,
+        stats: overallStats,
+        note: actualCycles < requestedCycles
+          ? `Workload cap limited the requested ${requestedCycles} bankroll repeats to ${actualCycles}.`
+          : null,
+      };
+      setBankrollResult(next);
+      setBankrollProgress({ done: actualCycles, total: actualCycles });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown bankroll simulation error.";
+      setBankrollError(`Bankroll run failed: ${message}`);
+    } finally {
+      setBankrollRunning(false);
+    }
+  }, [bankrollSourceCfg, bankrollBaseMode, bankrollRuns, bankrollCycles, bankrollTrades, bankrollRuinDD]);
+
   const builderDisplayCandidate = builderResult
     ? (builderResult.points.flatMap((p) => p.allCombinations || []).find((c) => c.key === builderSelectedKey)
         || builderResult.bestReturnPoint?.candidate
@@ -4939,8 +6136,8 @@ export default function RiskSimulator() {
               </div>
             </div>
           </div>
-          <div className="grid grid-cols-4 sm:flex bg-zinc-900/60 border border-zinc-800 rounded-lg p-1 w-full sm:w-auto">
-            {["single", "sweep", "fno", "builder"].map((m) => (
+          <div className="grid grid-cols-5 sm:flex bg-zinc-900/60 border border-zinc-800 rounded-lg p-1 w-full sm:w-auto">
+            {["single", "sweep", "fno", "builder", "bankroll"].map((m) => (
               <button
                 key={m}
                 onClick={() => handleModeChange(m)}
@@ -4957,7 +6154,7 @@ export default function RiskSimulator() {
         {/* Fixed two-column layout: config left (fixed width), results right (fills remaining space) */}
         <div className="flex flex-row gap-5 items-start overflow-x-auto">
           {/* Config column */}
-          <aside className={`${CARD} w-80 shrink-0 self-start p-4 sm:p-5`}>
+          <aside className={`${mode === "bankroll" ? "hidden" : `${CARD} w-80 shrink-0 self-start p-4 sm:p-5`}`}>
             <div className="flex items-center gap-2 mb-4">
               <Settings2 size={16} className="text-zinc-300" />
               <span className="text-[15px] font-semibold text-zinc-100">Configuration</span>
@@ -5092,44 +6289,170 @@ export default function RiskSimulator() {
                 </div>
               </div>
 
-              <div className="mb-5">
+              <div className="mb-5 min-w-0">
                 <GroupTitle icon={BarChart2} color="violet">Risk Allocation</GroupTitle>
-                <div className="flex bg-zinc-800/40 border border-zinc-700/50 rounded-lg p-1 mb-2.5">
-                  {["profit", "capital"].map((cm) => (
-                    <button
-                      key={cm}
-                      onClick={() => setCfg((c) => ({ ...c, cascadeMode: cm }))}
-                      className={`flex-1 py-1.5 rounded-md text-xs font-mono transition-colors ${
-                        cfg.cascadeMode === cm ? "bg-violet-500/20 text-violet-300" : "text-zinc-500"
-                      }`}
-                    >
-                      {cm === "profit" ? "On Profit" : "On Capital"}
-                    </button>
-                  ))}
-                </div>
-                <div className="grid grid-cols-2 gap-2.5">
-                  <Field label="Win Risk %">
-                    <NumInput value={cfg.winRiskPct} onChange={setField("winRiskPct")} step="0.1" color="violet" />
-                  </Field>
-                  <Field label="Loss Risk %">
-                    <NumInput value={cfg.lossRiskPct} onChange={setField("lossRiskPct")} step="0.1" color="violet" />
-                  </Field>
-                </div>
-                <Field label="Incr/Decr Risk %">
-                  <NumInput value={cfg.lossRiskAdjustPct} onChange={setField("lossRiskAdjustPct")} step="0.1" color="violet" />
-                </Field>
-                <div className="mt-2 p-2.5 rounded-lg border border-violet-500/20 bg-violet-500/5">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-[11px] text-violet-300 font-medium">Risk Allocation Reset</span>
-                    <button onClick={() => setCfg((c) => ({ ...c, riskAllocationEnabled: !c.riskAllocationEnabled }))} className={`px-2 py-1 rounded text-[10px] font-mono ${cfg.riskAllocationEnabled ? "bg-violet-500/20 text-violet-300" : "bg-zinc-800 text-zinc-500"}`}>{cfg.riskAllocationEnabled ? "ON" : "OFF"}</button>
+
+                <button
+                  type="button"
+                  onClick={() => setRiskAllocationOpen((v) => !v)}
+                  className="w-full min-w-0 flex items-center justify-between gap-2 rounded-lg border border-zinc-700/60 bg-zinc-900/55 px-3 py-2.5 text-left hover:bg-zinc-900/75 transition-colors"
+                  aria-expanded={riskAllocationOpen}
+                >
+                  <span className="min-w-0 flex items-center gap-2">
+                    <span className="shrink-0 text-[11px] font-medium text-zinc-300">Mode</span>
+                    <span className="min-w-0 truncate text-[11px] sm:text-xs font-mono font-semibold text-violet-200">
+                      {riskAllocationModeLabel(cfg.cascadeMode)}
+                    </span>
+                  </span>
+                  <ChevronDown size={14} className={`shrink-0 text-zinc-400 transition-transform ${riskAllocationOpen ? "rotate-180" : ""}`} />
+                </button>
+
+                {riskAllocationOpen && (
+                  <div className="mt-2 min-w-0 rounded-lg border border-zinc-700/55 bg-zinc-900/35 p-2.5 sm:p-3">
+                    <div className="grid grid-cols-2 gap-2 min-w-0">
+                      {RISK_ALLOCATION_MODES.map((cm) => {
+                        const active = cfg.cascadeMode === cm;
+                        return (
+                          <button
+                            key={cm}
+                            type="button"
+                            onClick={() => {
+                              setCfg((c) => ({ ...c, cascadeMode: cm }));
+                              setRiskAllocationOpen(false);
+                            }}
+                            className={`min-w-0 min-h-[38px] w-full px-2 rounded-md border text-[9px] sm:text-[10px] leading-tight font-mono font-medium text-center break-words transition-colors ${
+                              active
+                                ? "bg-violet-500/15 text-violet-200 border-violet-500/40"
+                                : "text-zinc-300 border-zinc-700/55 bg-zinc-800/30 hover:bg-zinc-800/60 hover:text-white"
+                            }`}
+                          >
+                            {riskAllocationModeLabel(cm)}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <Field label="Trigger (% Initial)">
-                      <NumInput value={cfg.riskAllocationTriggerPct} onChange={setField("riskAllocationTriggerPct")} step="1" color="violet" />
-                    </Field>
-                    <Field label="Reset To (% Initial)">
-                      <NumInput value={cfg.riskAllocationResetPct} onChange={setField("riskAllocationResetPct")} step="1" color="violet" />
-                    </Field>
+                )}
+
+                <div className="mt-2 min-w-0 rounded-lg border border-zinc-700/55 bg-zinc-900/45 p-2.5 sm:p-3 overflow-hidden">
+                  <div className="min-w-0 rounded-md border border-violet-500/20 bg-violet-500/[0.045] px-2.5 py-2 mb-2.5 overflow-hidden">
+                    <div className="text-[10px] sm:text-[11px] font-semibold text-violet-200 truncate">
+                      {riskAllocationModeLabel(cfg.cascadeMode)}
+                    </div>
+                    <div className="mt-1 text-[9px] sm:text-[10px] leading-relaxed text-zinc-300 break-words whitespace-normal">
+                      {cfg.cascadeMode === "profit"
+                        ? "Sizes from usable previous profit."
+                        : cfg.cascadeMode === "profitCumulative"
+                        ? "WIN → cumulative net profit × allocation; LOSS → previous risk × adjustment."
+                        : cfg.cascadeMode === "capital"
+                        ? "Sizes from current capital."
+                        : cfg.cascadeMode === "drawdownRecovery"
+                        ? "Compresses risk as drawdown grows."
+                        : cfg.cascadeMode === "edgeConfidence"
+                        ? "Smooths edge confidence before resizing."
+                        : cfg.cascadeMode === "sequencePressure"
+                        ? "Responds gradually to win/loss streak pressure."
+                        : cfg.cascadeMode === "riskPocket"
+                        ? "Protects reserve while controlled risk is deployed."
+                        : "Blends drawdown, edge and sequence state."}
+                    </div>
+                  </div>
+
+                  <div className="min-w-0">
+                    {cfg.cascadeMode === "profitCumulative" ? (
+                      <>
+                        <div className="grid grid-cols-2 gap-2 min-w-0">
+                          <div className="min-w-0">
+                            <Field label="Profit Allocation %">
+                              <NumInput value={cfg.profitCumulativeAllocationPct} onChange={setField("profitCumulativeAllocationPct")} step="1" min="0" max="100" color="violet" />
+                            </Field>
+                          </div>
+                          <div className="min-w-0">
+                            <Field label="Loss Adjustment %">
+                              <NumInput value={cfg.profitCumulativeLossAdjustPct} onChange={setField("profitCumulativeLossAdjustPct")} step="1" min="-95" max="100" color="violet" />
+                            </Field>
+                          </div>
+                          <div className="min-w-0">
+                            <Field label="Flip After Losses">
+                              <NumInput value={cfg.profitCumulativeFlipAfterLosses} onChange={setField("profitCumulativeFlipAfterLosses")} step="1" min="1" color="violet" />
+                            </Field>
+                          </div>
+                        </div>
+                        <div className="mt-2 min-w-0 rounded-md border border-violet-500/20 bg-zinc-950/30 px-2.5 py-2 text-[9px] sm:text-[10px] leading-relaxed text-zinc-300 break-words whitespace-normal overflow-hidden">
+                          <span className="text-emerald-300">WIN:</span> next risk = cumulative net profit × allocation %. <span className="text-orange-300">LOSS:</span> next risk = previous executed risk × adjustment. After the configured loss count, the adjustment sign flips for the next trade. A WIN resets the loss/flip state, not cumulative profit.
+                        </div>
+                      </>
+                    ) : (cfg.cascadeMode === "profit" || cfg.cascadeMode === "capital") ? (
+                      <div className="grid grid-cols-2 gap-2 min-w-0">
+                        <div className="min-w-0"><Field label="Win Risk %"><NumInput value={cfg.winRiskPct} onChange={setField("winRiskPct")} step="0.1" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Loss Risk %"><NumInput value={cfg.lossRiskPct} onChange={setField("lossRiskPct")} step="0.1" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Incr / Decr %"><NumInput value={cfg.lossRiskAdjustPct} onChange={setField("lossRiskAdjustPct")} step="0.1" color="violet" /></Field></div>
+                      </div>
+                    ) : cfg.cascadeMode === "drawdownRecovery" ? (
+                      <div className="grid grid-cols-2 gap-2 min-w-0">
+                        <div className="min-w-0"><Field label="DD Target %"><NumInput value={cfg.drawdownTargetPct} onChange={setField("drawdownTargetPct")} step="1" min="1" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Min Risk Factor"><NumInput value={cfg.drawdownMinFactor} onChange={setField("drawdownMinFactor")} step="0.05" min="0.05" max="1" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Curve"><NumInput value={cfg.drawdownCurve} onChange={setField("drawdownCurve")} step="0.1" min="0.5" color="violet" /></Field></div>
+                      </div>
+                    ) : cfg.cascadeMode === "edgeConfidence" ? (
+                      <div className="grid grid-cols-2 gap-2 min-w-0">
+                        <div className="min-w-0"><Field label="Prior Trades"><NumInput value={cfg.edgePriorTrades} onChange={setField("edgePriorTrades")} step="1" min="2" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Min Factor"><NumInput value={cfg.edgeMinFactor} onChange={setField("edgeMinFactor")} step="0.05" min="0.1" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Max Factor"><NumInput value={cfg.edgeMaxFactor} onChange={setField("edgeMaxFactor")} step="0.05" min="1" color="violet" /></Field></div>
+                      </div>
+                    ) : cfg.cascadeMode === "sequencePressure" ? (
+                      <div className="grid grid-cols-2 gap-2 min-w-0">
+                        <div className="min-w-0"><Field label="Loss Step %"><NumInput value={cfg.sequenceLossStepPct} onChange={setField("sequenceLossStepPct")} step="1" min="0" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Win Step %"><NumInput value={cfg.sequenceWinStepPct} onChange={setField("sequenceWinStepPct")} step="1" min="0" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Min Factor"><NumInput value={cfg.sequenceMinFactor} onChange={setField("sequenceMinFactor")} step="0.05" min="0.1" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Max Factor"><NumInput value={cfg.sequenceMaxFactor} onChange={setField("sequenceMaxFactor")} step="0.05" min="1" color="violet" /></Field></div>
+                      </div>
+                    ) : cfg.cascadeMode === "riskPocket" ? (
+                      <div className="grid grid-cols-2 gap-2 min-w-0">
+                        <div className="min-w-0"><Field label="Start Active %"><NumInput value={cfg.pocketStartPct} onChange={setField("pocketStartPct")} step="5" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Win Unlock %"><NumInput value={cfg.pocketWinUnlockPct} onChange={setField("pocketWinUnlockPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Loss Lock %"><NumInput value={cfg.pocketLossLockPct} onChange={setField("pocketLossLockPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Min Active %"><NumInput value={cfg.pocketMinPct} onChange={setField("pocketMinPct")} step="5" min="5" max="100" color="violet" /></Field></div>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="grid grid-cols-2 gap-2 min-w-0">
+                          <div className="min-w-0"><Field label="DD Weight"><NumInput value={cfg.adaptiveDdWeight} onChange={setField("adaptiveDdWeight")} step="5" min="0" color="violet" /></Field></div>
+                          <div className="min-w-0"><Field label="Edge Weight"><NumInput value={cfg.adaptiveEdgeWeight} onChange={setField("adaptiveEdgeWeight")} step="5" min="0" color="violet" /></Field></div>
+                          <div className="min-w-0"><Field label="Sequence Weight"><NumInput value={cfg.adaptiveSequenceWeight} onChange={setField("adaptiveSequenceWeight")} step="5" min="0" color="violet" /></Field></div>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 mt-2 min-w-0">
+                          <div className="min-w-0"><Field label="Min Factor"><NumInput value={cfg.adaptiveMinFactor} onChange={setField("adaptiveMinFactor")} step="0.05" min="0.1" color="violet" /></Field></div>
+                          <div className="min-w-0"><Field label="Max Factor"><NumInput value={cfg.adaptiveMaxFactor} onChange={setField("adaptiveMaxFactor")} step="0.05" min="1" color="violet" /></Field></div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  <div className="mt-2.5 min-w-0 rounded-lg border border-violet-500/20 bg-zinc-950/30 p-2.5 overflow-hidden">
+                    <div className="flex items-start justify-between gap-2 min-w-0">
+                      <div className="min-w-0">
+                        <div className="text-[10px] sm:text-[11px] font-semibold text-zinc-200">Risk Allocation Reset</div>
+                        <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words whitespace-normal">Applies after the calculated allocation reaches the trigger.</div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setCfg((c) => ({ ...c, riskAllocationEnabled: !c.riskAllocationEnabled }))}
+                        className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border transition-colors ${
+                          cfg.riskAllocationEnabled
+                            ? "bg-violet-500/15 text-violet-300 border-violet-500/30"
+                            : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"
+                        }`}
+                      >
+                        {cfg.riskAllocationEnabled ? "ON" : "OFF"}
+                      </button>
+                    </div>
+                    {cfg.riskAllocationEnabled && (
+                      <div className="grid grid-cols-2 gap-2 mt-2 min-w-0">
+                        <div className="min-w-0"><Field label="Trigger (% Initial)"><NumInput value={cfg.riskAllocationTriggerPct} onChange={setField("riskAllocationTriggerPct")} step="1" min="0" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Reset To (% Initial)"><NumInput value={cfg.riskAllocationResetPct} onChange={setField("riskAllocationResetPct")} step="1" min="0" color="violet" /></Field></div>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -5387,7 +6710,31 @@ export default function RiskSimulator() {
           </aside>
 
           {/* Results column */}
-          <main className="min-w-0 flex-1 space-y-4">
+          <main className={`${mode === "bankroll" ? "w-full" : "min-w-0 flex-1"} space-y-4`}>
+            {mode === "bankroll" && (
+              <BankrollPage
+                baseMode={bankrollBaseMode}
+                sourceCfg={bankrollSourceCfg}
+                runs={bankrollRuns}
+                cycles={bankrollCycles}
+                tradesPerRun={bankrollTrades}
+                ruinDD={bankrollRuinDD}
+                onRunsChange={(e) => setBankrollRuns(e.target.value === "" ? "" : parseInt(e.target.value, 10))}
+                onCyclesChange={(e) => setBankrollCycles(e.target.value === "" ? "" : parseInt(e.target.value, 10))}
+                onTradesChange={(e) => setBankrollTrades(e.target.value === "" ? "" : parseInt(e.target.value, 10))}
+                onRuinDDChange={(e) => setBankrollRuinDD(e.target.value === "" ? "" : parseFloat(e.target.value))}
+                onBaseModeChange={(m) => {
+                  setBankrollBaseMode(m);
+                  setBankrollResult(null);
+                }}
+                result={bankrollResult}
+                onRun={handleRunBankroll}
+                running={bankrollRunning}
+                progress={bankrollProgress}
+                error={bankrollError}
+              />
+            )}
+
             {mode === "builder" && (
               <BuilderResults
                 builder={builderResult}
@@ -6131,7 +7478,7 @@ export default function RiskSimulator() {
         </div>
       </div>
 
-      {mode !== "builder" && <DraggableRunButton onRun={handleRun} />}
+      {mode !== "builder" && mode !== "bankroll" && <DraggableRunButton onRun={handleRun} />}
     </div>
   );
 }
