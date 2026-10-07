@@ -1928,8 +1928,8 @@ function MultiSimPathsTooltip({ active, payload, label, selectedRunIdx }) {
           </div>
         </div>
       ) : (
-        <div className="text-[10px] leading-relaxed text-zinc-500">
-          Select a scenario from the chart or outcome bars to inspect its exact path.
+        <div className="text-[10px] text-zinc-500 truncate whitespace-nowrap">
+          Select a scenario to inspect its exact path.
         </div>
       )}
     </div>
@@ -1988,8 +1988,8 @@ function MultiSimPathsChart({ runs, selectedRunIdx, onSelectRun }) {
               <Activity size={14} className="text-zinc-300" />
               Cumulative P/L Paths
             </div>
-            <div className="text-[10px] text-zinc-500 mt-1 leading-relaxed">
-              Every simulation outcome · cumulative Net P/L from Trade 0 to {maxTrades}
+            <div className="text-[10px] text-zinc-500 mt-1 truncate whitespace-nowrap">
+              All runs · cumulative Net P/L · Trade 0→{maxTrades}
             </div>
           </div>
           <div className="flex items-center gap-2.5 text-[10px] font-mono flex-none pt-0.5">
@@ -2738,7 +2738,7 @@ function summarizeRecoveryAnalyses(analyses) {
 }
 
 function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initialCapital, runs = null, summary = null, breakEvenSummary = null, compact = false }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
   const [analysisMode, setAnalysisMode] = useState("drawdown");
 
   let drawdownRecovery = summary;
@@ -2776,8 +2776,8 @@ function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initia
   const hasAnyRecovered = recoveredCount > 0 || recovery.avgRecoveryTrades != null;
   const sectionTitle = isBreakEven ? "Break-even Recovery" : title;
   const subtitle = isBreakEven
-    ? "Time from the deepest negative cumulative P/L point back to ₹0 or better."
-    : "Peak-to-trough DD recovery from actual equity paths · time is measured in executed trades.";
+    ? "Deepest negative P/L → ₹0+."
+    : "Peak → trough → prior peak; measured in trades.";
   const bucketTitle = isBreakEven
     ? "Recovery by Deepest Negative P/L Severity"
     : "Recovery by Maximum Drawdown Severity";
@@ -2798,7 +2798,7 @@ function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initia
             {sectionTitle}
             <ChevronDown size={14} className={`text-zinc-500 transition-transform ${collapsed ? "" : "rotate-180"}`} />
           </div>
-          <div className="text-[10px] text-zinc-400 mt-0.5">{subtitle}</div>
+          <div className="text-[10px] text-zinc-400 mt-0.5 truncate whitespace-nowrap">{subtitle}</div>
         </button>
         <div className="flex items-center gap-2 flex-none">
           <div className="flex rounded-md border border-[#57534D] bg-[#27272A] p-0.5">
@@ -2831,44 +2831,44 @@ function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initia
                 <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
                   <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Median Recovery</div>
                   <div className="mt-auto pt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianRecoveryTrades)}</div>
-                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">{isBreakEven ? "trough → P/L ≥ 0" : "trough → prior peak"}</div>
+                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px] truncate whitespace-nowrap">{isBreakEven ? "trough → ₹0+" : "trough → peak"}</div>
                 </div>
                 <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
                   <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">P75 Recovery</div>
                   <div className="mt-auto pt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.p75RecoveryTrades)}</div>
-                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">upper-middle case</div>
+                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px] truncate whitespace-nowrap">upper-middle</div>
                 </div>
                 <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
                   <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">P90 Recovery</div>
                   <div className="mt-auto pt-1 font-mono text-sm text-[#7CCF35]">{timeLabel(recovery.p90RecoveryTrades)}</div>
-                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">90th percentile</div>
+                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px] truncate whitespace-nowrap">90th pct</div>
                 </div>
                 <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
                   <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Worst Recovery</div>
                   <div className="mt-auto pt-1 font-mono text-sm text-[#FF692A]">{timeLabel(recovery.worstRecoveryTrades)}</div>
-                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">longest recovered case</div>
+                  <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px] truncate whitespace-nowrap">longest recovered</div>
                 </div>
                 {!compact && (
                   <>
                     <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
                       <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Median Underwater</div>
                       <div className="mt-auto pt-1 font-mono text-sm text-[#42D3F2]">{timeLabel(recovery.medianUnderwaterTrades)}</div>
-                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">{isBreakEven ? "negative → break-even" : "peak → recovery/end"}</div>
+                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px] truncate whitespace-nowrap">{isBreakEven ? "negative → ₹0" : "peak → recovery/end"}</div>
                     </div>
                     <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
                       <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Worst Underwater</div>
                       <div className="mt-auto pt-1 font-mono text-sm text-[#FF692A]">{recovery.worstUnderwaterTrades ? `${recovery.worstUnderwaterTrades} trades` : "—"}</div>
-                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">observed duration</div>
+                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px] truncate whitespace-nowrap">observed</div>
                     </div>
                     <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
                       <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Recovered</div>
                       <div className="mt-auto pt-1 font-mono text-sm text-[#7CCF35]">{recoveredCount.toLocaleString("en-IN")}</div>
-                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">{recovery.recoveryPct.toFixed(2)}% of {isBreakEven ? "negative runs" : "DD runs"}</div>
+                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px] truncate whitespace-nowrap">{recovery.recoveryPct.toFixed(2)}% recovered</div>
                     </div>
                     <div className="bg-zinc-900 px-3 py-2.5 min-h-[92px] flex flex-col min-w-0">
                       <div className="text-[10px] leading-tight text-zinc-400 min-h-[24px]">Unrecovered</div>
                       <div className="mt-auto pt-1 font-mono text-sm text-[#FF692A]">{unrecoveredCount.toLocaleString("en-IN")}</div>
-                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px]">{recovery.unrecoveredPct.toFixed(2)}% of {isBreakEven ? "negative runs" : "DD runs"}</div>
+                      <div className="text-[9px] leading-tight text-zinc-500 mt-0.5 min-h-[22px] truncate whitespace-nowrap">{recovery.unrecoveredPct.toFixed(2)}% unrecovered</div>
                     </div>
                   </>
                 )}
@@ -2914,10 +2914,10 @@ function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initia
                   </table>
                 </div>
               </div>
-              <div className="px-4 pb-3 text-[9px] text-zinc-500">
+              <div className="px-4 pb-3 text-[9px] text-zinc-500 truncate whitespace-nowrap overflow-hidden">
                 {isBreakEven
-                  ? "Break-even recovery uses cumulative realized Net P/L and counts recovery when the path returns to 0 or above. Unrecovered episodes receive no fabricated recovery time."
-                  : "Recovery time excludes unrecovered episodes. Underwater duration is observed from the peak through the recovery trade, or through the end of the analyzed horizon when unrecovered."}
+                  ? "Uses cumulative Net P/L; unrecovered episodes are not timed."
+                  : "Recovery excludes unrecovered episodes; underwater runs to recovery/end."}
                 {!hasAnyRecovered ? (isBreakEven ? " No negative P/L episode reached break-even within the analyzed horizon." : " No drawdown episode recovered to its prior peak within the analyzed horizon.") : ""}
               </div>
             </>
@@ -2929,7 +2929,7 @@ function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initia
 }
 
 function RecoveryTimeSweepSection({ points }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
   const [analysisMode, setAnalysisMode] = useState("drawdown");
   if (!points?.length) return null;
   const isBreakEven = analysisMode === "breakeven";
@@ -2963,8 +2963,8 @@ function RecoveryTimeSweepSection({ points }) {
   if (!usable) return null;
   const title = isBreakEven ? "Break-even Recovery" : "Drawdown Recovery Time";
   const subtitle = isBreakEven
-    ? "How long negative cumulative P/L takes to return to break-even at each Win Rate."
-    : "How long the maximum drawdown takes to reclaim the prior peak at each Win Rate.";
+    ? "Negative P/L → ₹0 by Win Rate."
+    : "DD → prior peak by Win Rate.";
   const yLabel = isBreakEven ? "Trades to P/L ≥ 0" : "Trades to prior peak";
   return (
     <div className={`${CARD} overflow-hidden`}>
@@ -2981,7 +2981,7 @@ function RecoveryTimeSweepSection({ points }) {
             {title}
             <ChevronDown size={14} className={`text-zinc-500 transition-transform ${collapsed ? "" : "rotate-180"}`} />
           </div>
-          <div className="text-[10px] text-zinc-400 mt-0.5">{subtitle}</div>
+          <div className="text-[10px] text-zinc-400 mt-0.5 truncate whitespace-nowrap">{subtitle}</div>
         </button>
         <div className="flex items-center gap-2 flex-none">
           <div className="flex rounded-md border border-[#57534D] bg-[#27272A] p-0.5">
@@ -2993,7 +2993,7 @@ function RecoveryTimeSweepSection({ points }) {
       </div>
       {!collapsed && (
         <>
-          <div className="px-4 py-2 border-b border-zinc-800/70 flex flex-wrap items-center gap-x-4 gap-y-1 text-[9px] font-mono text-zinc-400">
+          <div className="px-4 py-2 border-b border-zinc-800/70 flex items-center gap-4 text-[9px] font-mono text-zinc-400 overflow-x-auto whitespace-nowrap">
             <span><i className="inline-block w-2 h-2 rounded-full bg-[#42D3F2] mr-1" />Median</span>
             <span><i className="inline-block w-2 h-2 rounded-full bg-[#7CCF35] mr-1" />P90 upper tail</span>
             <span className="text-zinc-500">Shaded gap = Median → P90</span>
@@ -3207,7 +3207,7 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
               <Shield size={14} className="text-[#42D3F2] shrink-0" />
               Bankroll
             </div>
-            <div className="mt-1 text-[10px] text-zinc-400">Long-run survival, drawdown and risk-size analysis from the active core engine.</div>
+            <div className="mt-1 text-[10px] text-zinc-400">Long-run risk, drawdown and size analysis.</div>
           </div>
           <div className="flex items-center gap-1.5 p-0.5 rounded-lg bg-[#27272A] border border-[#57534D]">
             {[['single', 'Single Run'], ['fno', 'Day / F&O']].map(([m, label]) => (
@@ -3248,7 +3248,7 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
 
           <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
             <div className="min-w-0 flex-1 text-[10px] leading-relaxed text-zinc-400">
-              One bankroll repeat = the full simulation set above. The overall summary pools every simulation across all repeats.
+              Each repeat runs the full set; summary pools all outcomes.
               {progress?.total > 0 && progress.done > 0 && running && (
                 <span className="ml-2 font-mono text-[#42D3F2]">{progress.done}/{progress.total} bankroll repeats</span>
               )}
@@ -3283,7 +3283,7 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
             <div className="px-4 py-3 border-b border-[#57534D]/70 flex flex-wrap items-center justify-between gap-2">
               <div>
                 <div className="text-[13px] font-semibold text-zinc-100">Overall Summary</div>
-                <div className="text-[10px] text-zinc-400 mt-0.5">Average distribution across the complete bankroll run set</div>
+                <div className="text-[10px] text-zinc-400 mt-0.5">Average across all bankroll runs</div>
               </div>
               <div className="text-[10px] font-mono text-zinc-300">{result.totalBankrollCycles} bankroll repeats × {result.runsPerBankroll} simulations = {totalSimulations.toLocaleString('en-IN')} outcomes</div>
               {result.note && <div className="w-full mt-1 text-[10px] font-mono text-[#FF692A]">{result.note}</div>}
@@ -3303,7 +3303,7 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
               <div className="px-4 py-3 border-b border-[#57534D]/70 flex items-center justify-between gap-3">
                 <div>
                   <div className="text-[13px] font-semibold text-zinc-100">Capital Paths</div>
-                  <div className="text-[10px] text-zinc-400 mt-0.5">Average P10–P90 bands across bankroll repeats with sample outcome paths</div>
+                  <div className="text-[10px] text-zinc-400 mt-0.5">P10–P90 path bands across repeats</div>
                 </div>
                 <div className="text-[10px] font-mono text-zinc-300">{result.runsPerBankroll} sample paths</div>
               </div>
@@ -3346,7 +3346,7 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
               <div className="px-4 py-3 border-b border-[#57534D]/70 flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <div className="text-[13px] font-semibold text-zinc-100">Risk Size Sensitivity</div>
-                  <div className="text-[10px] text-zinc-400 mt-0.5">Same sampled outcome sequences replayed at different base-risk sizes</div>
+                  <div className="text-[10px] text-zinc-400 mt-0.5">Same sequences at different base-risk sizes</div>
                 </div>
                 <span className="text-[9px] font-mono text-zinc-300">Representative sample</span>
               </div>
@@ -3363,7 +3363,7 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
                   </ComposedChart>
                 </ResponsiveContainer>
               </div>
-              <div className="px-4 pb-3 text-[10px] text-zinc-400">Lower risk generally reduces drawdown and ruin exposure; higher risk increases both.</div>
+              <div className="px-4 pb-3 text-[10px] text-zinc-400">Lower risk ↓ DD/ruin; higher risk ↑.</div>
             </div>
           </div>
 
@@ -3440,7 +3440,7 @@ function BankrollPage({ baseMode, sourceCfg, runs, cycles, tradesPerRun, ruinDD,
                 ['Stopped Runs', `${overall.stoppedCount.toLocaleString('en-IN')} / ${overall.total.toLocaleString('en-IN')}`, 'Triggered by existing safety/risk rules', '#FF692A'],
                 ['Average Trades Executed', overall.avgTradesExecuted.toFixed(1), 'Accounts for early safety stops', '#42D3F2'],
                 ['Average Final Capital', fmtMoney(overall.meanFinal), 'Arithmetic mean ending equity', '#42D3F2'],
-                ['P90 Max Drawdown', fmtPct(overall.p90DD), '90th percentile peak-to-trough decline', '#FF692A'],
+                ['P90 Max Drawdown', fmtPct(overall.p90DD), '90th pct peak-to-trough decline', '#FF692A'],
               ].map(([label, value, detail, color]) => (
                 <div key={label} className="rounded-lg border border-[#57534D] bg-[#27272A]/65 px-3 py-2.5 min-w-0">
                   <div className="text-[10px] uppercase tracking-wide text-zinc-400">{label}</div>
@@ -4804,7 +4804,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                 max={totalCap}
                 color="blue"
               />
-              <div className="mt-1 text-[9px] leading-relaxed text-zinc-600">
+              <div className="mt-1 text-[9px] text-zinc-600 truncate whitespace-nowrap">
                 Default: up to {totalCap.toLocaleString("en-IN")} sequences. Lower manually.
               </div>
             </div>
@@ -4869,10 +4869,10 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
               </div>
 
               <div className="mt-1 rounded-md border border-violet-500/15 bg-zinc-950/40 px-2.5 py-2 text-[9px] leading-relaxed text-zinc-400 break-words">
-                Use this to find sequences such as: <span className="text-zinc-200">first 3 losses → finish green</span>. Optional Green by Trade requires cumulative realized Net P/L to cross above zero by that trade.
+                Find <span className="text-zinc-200">3 opening losses → finish green</span>; Green by Trade adds a deadline.
               </div>
               {cfg.builderSequenceFilterGreenByTrade > 0 && cfg.builderSequenceFilterGreenByTrade <= cfg.builderSequenceFilterLeadingLosses && (
-                <div className="mt-1.5 text-[9px] font-mono text-[#FF692A]">No sequence can turn green by T{cfg.builderSequenceFilterGreenByTrade} after {cfg.builderSequenceFilterLeadingLosses} opening losses. Increase Green by Trade.</div>
+                <div className="mt-1.5 text-[9px] font-mono text-[#FF692A] truncate whitespace-nowrap overflow-hidden">No recovery by T{cfg.builderSequenceFilterGreenByTrade}; reduce opening losses or raise the deadline.</div>
               )}
             </div>
           )}
@@ -4881,8 +4881,8 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
 
       <div className="mb-5">
         <GroupTitle icon={DollarSign} color="blue">Capital &amp; Auto Base Risk</GroupTitle>
-        <div className="mb-2 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.05] px-3 py-2 text-[10px] leading-relaxed text-zinc-500">
-          Builder auto-calculates risk and size from the hard Total Risk Budget. The source Base Risk % / Base Lots are ignored for Builder execution.
+        <div className="mb-2 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.05] px-3 py-2 text-[10px] text-zinc-500 truncate whitespace-nowrap">
+          Auto risk/size uses Total Risk Budget; source Base Risk/Lots are ignored.
         </div>
         <div className="grid grid-cols-2 gap-2.5">
           <Field label="Initial Capital">
@@ -4975,14 +4975,14 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
             ) : null}
           </div>
 
-          <div className="mt-1 rounded-md border border-zinc-800 bg-zinc-950/30 px-2.5 py-1.5 text-[9px] font-mono leading-relaxed text-zinc-500 break-words">
-            The selected model and its settings run inside every evaluated W/L sequence. Builder keeps the configured allocation shape, auto-scales absolute size to the separate Total Risk Budget, and preserves existing caps/reset as final guards.
+          <div className="mt-1 rounded-md border border-zinc-800 bg-zinc-950/30 px-2.5 py-1.5 text-[9px] font-mono text-zinc-500 truncate whitespace-nowrap overflow-hidden">
+            Model settings run in every sequence; Total Risk Budget scales size.
           </div>
           <div className="mt-2 min-w-0 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.045] p-2.5 overflow-hidden">
             <div className="flex items-center justify-between gap-2 min-w-0">
               <div className="min-w-0">
                 <div className="text-[10px] sm:text-[11px] font-semibold text-emerald-300">Risk Budget Guard</div>
-                <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words">Inherited from the active Single Run / Day-F&O configuration. This guard is separate from Builder Total Risk Budget.</div>
+                <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 truncate whitespace-nowrap overflow-hidden">Inherited from Single Run / Day-F&O; separate from Total Risk Budget.</div>
               </div>
               <div className="shrink-0 text-right font-mono text-[10px] text-emerald-300">
                 <div>{strategyCfg.riskBudgetGuardEnabled === false ? "OFF" : fmtPct(strategyCfg.riskBudgetPct)}</div>
@@ -5031,11 +5031,11 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
 
       <div className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
         <div className="text-[10px] uppercase tracking-wider text-amber-300/80 font-semibold">Active Configuration</div>
-        <div className="text-[10px] leading-relaxed text-zinc-500 mt-1.5">
+        <div className="text-[10px] text-zinc-500 mt-1.5 truncate whitespace-nowrap">
           {isTargetMode
             ? `Target: ${targetInputMode === "targetPoints" ? "Target" : "Risk"} Points → Auto Risk/Lots at RR.`
-            : `Uses current ${isFno ? "F&amp;O" : "Single Run"} settings; auto-sizes to the risk budget.`}
-          {strategyCfg.rrMode === "range" ? " RR Range uses midpoint RR." : ""}
+            : `Uses current ${isFno ? "F&amp;O" : "Single Run"} settings; auto-sizes to budget.`}
+          {strategyCfg.rrMode === "range" ? " RR range → midpoint RR." : ""}
         </div>
       </div>
     </div>
@@ -5292,7 +5292,7 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           <div className="text-[11px] text-zinc-500 mt-1">
             {builder.baseMode === "fno" ? "Day / F&amp;O" : "Single Run"} configuration · {fmtMoney(builder.totalRiskAmount)} total risk budget · {builder.minTrades}–{builder.maxTrades} trades
           </div>
-          <div className="text-[10px] text-zinc-600 mt-1">
+          <div className="text-[10px] text-zinc-600 mt-1 truncate whitespace-nowrap">
             <span className={`mr-2 inline-flex items-center px-1.5 py-0.5 rounded border text-[9px] ${builder.builderMode === "target" ? "bg-violet-500/10 border-violet-500/20 text-violet-300" : "bg-zinc-800 border-zinc-700 text-zinc-400"}`}>
               {builder.builderMode === "target" ? "Target" : "Normal"}
             </span>
@@ -5351,7 +5351,7 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           >
             <div className="text-[13px] font-semibold text-zinc-200">Win-Rate Strategy Matrix</div>
             {matrixOpen && (
-              <div className="text-[10px] text-zinc-600 mt-1">Click a Win Rate to inspect its profitable scenarios. Drag the W/L chips in a Combination to reorder it and recalculate.</div>
+              <div className="text-[10px] text-zinc-600 mt-1 truncate whitespace-nowrap">Click Win Rate to inspect; drag W/L chips to reorder.</div>
             )}
           </button>
           <CollapsibleSectionToggle open={matrixOpen} onClick={() => setMatrixOpen((v) => !v)} label="Win-Rate Strategy Matrix" />
@@ -5453,7 +5453,7 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           >
             <div className="text-[13px] font-semibold text-zinc-200">Winning Combination Scenarios</div>
             {winningScenariosOpen && (
-              <div className="text-[10px] text-zinc-600 mt-1">
+              <div className="text-[10px] text-zinc-600 mt-1 truncate whitespace-nowrap">
                 {formatBuilderWinRate(activeWinRatePoint?.targetWinRate ?? 0)} Win Rate · {winningScenarios.length} {builder.searchMode === "sampled" ? "sampled" : "stored"} profitable scenario{winningScenarios.length === 1 ? "" : "s"}{builder.sequenceFilter?.enabled ? ` · ${Number(activeWinRatePoint?.filterMatchedCount || 0).toLocaleString("en-IN")} filter match${Number(activeWinRatePoint?.filterMatchedCount || 0) === 1 ? "" : "es"}` : ""} · Click any bar to open that exact Trade Log.
               </div>
             )}
@@ -5503,7 +5503,7 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
           <div className="px-4 py-3 border-b border-zinc-800 flex items-center justify-between gap-3">
             <div>
               <div className="text-[13px] font-semibold text-zinc-200">Highest-Return Combination Found</div>
-              <div className="text-[10px] text-zinc-600 mt-1">This combination uses the active strategy settings for risk model, RR, costs and safety stops.</div>
+              <div className="text-[10px] text-zinc-600 mt-1 truncate whitespace-nowrap">Uses active risk model, RR, costs and safety stops.</div>
             </div>
             <div className="font-mono text-sm text-emerald-400">+{best.returnPct.toFixed(2)}</div>
           </div>
@@ -5533,7 +5533,7 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
         </div>
       )}
 
-      <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-4 py-3 text-[10px] leading-relaxed text-zinc-500">
+      <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 px-4 py-3 text-[10px] text-zinc-500 truncate whitespace-nowrap overflow-hidden">
         <span className="text-zinc-300 font-semibold">Interpretation:</span> <span className="text-red-400">Losing Range</span> means no complete profitable combination survived the active strategy settings at that tested win rate. “—” means no exact win/trade-count combination exists or every exact combination was stopped by the configured safety rules.
       </div>
     </>
@@ -7271,7 +7271,7 @@ export default function RiskSimulator() {
                     </div>
                     <div className="mt-1 text-[9px] sm:text-[10px] leading-relaxed text-zinc-300 break-words whitespace-normal">
                       {cfg.cascadeMode === "profit"
-                        ? "Sizes from usable previous profit."
+                        ? "Sizes from prior profit."
                         : cfg.cascadeMode === "profitCumulative"
                         ? "WIN → cumulative net profit × allocation; LOSS → previous risk × adjustment."
                         : "Sizes from current capital."}
@@ -7298,8 +7298,8 @@ export default function RiskSimulator() {
                             </Field>
                           </div>
                         </div>
-                        <div className="mt-2 min-w-0 rounded-md border border-violet-500/20 bg-zinc-950/30 px-2.5 py-2 text-[9px] sm:text-[10px] leading-relaxed text-zinc-300 break-words whitespace-normal overflow-hidden">
-                          <span className="text-emerald-300">WIN:</span> next risk = cumulative net profit × allocation %. <span className="text-orange-300">LOSS:</span> next risk = previous executed risk × adjustment. After the configured loss count, the adjustment sign flips for the next trade. A WIN resets the loss/flip state, not cumulative profit.
+                        <div className="mt-2 min-w-0 rounded-md border border-violet-500/20 bg-zinc-950/30 px-2.5 py-1.5 text-[9px] sm:text-[10px] text-zinc-300 truncate whitespace-nowrap overflow-hidden">
+                          <span className="text-emerald-300">WIN:</span> cumulative profit × allocation. <span className="text-orange-300">LOSS:</span> previous risk × adjustment; flip after N losses. WIN resets loss/flip state.
                         </div>
                       </>
                     ) : (cfg.cascadeMode === "profit" || cfg.cascadeMode === "capital") ? (
@@ -7315,7 +7315,7 @@ export default function RiskSimulator() {
                     <div className="flex items-start justify-between gap-2 min-w-0">
                       <div className="min-w-0">
                         <div className="text-[10px] sm:text-[11px] font-semibold text-zinc-200">Risk Allocation Reset</div>
-                        <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words whitespace-normal">Applies after the calculated allocation reaches the trigger.</div>
+                        <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 truncate whitespace-nowrap overflow-hidden">Resets after allocation reaches the trigger.</div>
                       </div>
                       <button
                         type="button"
@@ -7341,7 +7341,7 @@ export default function RiskSimulator() {
                     <div className="flex items-start justify-between gap-2 min-w-0">
                       <div className="min-w-0">
                         <div className="text-[10px] sm:text-[11px] font-semibold text-emerald-300">Risk Budget Guard</div>
-                        <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words">Limits additional peak-to-trough loss after fees, slippage and spread.</div>
+                        <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 truncate whitespace-nowrap overflow-hidden">Caps extra peak-to-trough loss after costs.</div>
                       </div>
                       <button
                         type="button"
