@@ -69,9 +69,6 @@ const DEFAULTS = {
   // its separate Total Risk Budget controls Builder calibration only.
   riskBudgetGuardEnabled: true,
   riskBudgetPct: 5,
-  // Separate guard for realized cumulative P/L peak giveback.
-  cumulativePnlGuardEnabled: true,
-  cumulativePnlGuardPct: 50,
   slipMode: "percent",
   slipPct: 0,
   slipTicks: 1,
@@ -277,6 +274,7 @@ function fmtPct3(v) {
   return Number(v).toFixed(3) + "%";
 }
 
+
 function hashStringToUint32(value) {
   const text = String(value ?? "");
   let h = 2166136261;
@@ -314,6 +312,8 @@ function getSimulationRng(cfg) {
     ? mulberry32(Number(cfg._rrSeed) >>> 0)
     : Math.random;
 }
+
+
 
 const RISK_ALLOCATION_MODES = [
   "profit",
@@ -408,7 +408,6 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   let lastProfitNet = null;  // net profit of the most recent WIN
   let consecutiveLosses = 0; // consecutive losses since the last win (or since the start, if no win yet)
   let cumulativeNetProfit = 0;
-  let cumulativePnlGuardPeak = 0;
   let previousExecutedRiskAmt = null;
   let currentProfitCumulativeAdjustment = Number(cfg.profitCumulativeLossAdjustPct) || 0;
   let currentProfitCumulativeFlipCount = 0;
@@ -422,7 +421,6 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   const rrRng = getSimulationRng(cfg);
 
   for (let i = 1; i <= numTrades; i++) {
-    cumulativePnlGuardPeak = Math.max(cumulativePnlGuardPeak, Math.max(0, cumulativeNetProfit));
     let riskAmt;
 
     if (Array.isArray(explicitRiskPlan)) {
@@ -515,17 +513,6 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     }
     riskAmt = riskBudgetGuard.riskAmt;
 
-    const cumulativePnlGuard = guardSingleRiskToCumulativePnl(
-      cfg, riskAmt, cumulativeNetProfit, cumulativePnlGuardPeak, price,
-      LOT_VALUE, feePerLotEntry, feePerLotExit, isTurnoverFee, !!winLossSeq[i - 1]
-    );
-    if (cumulativePnlGuard.blocked) {
-      stopped = true;
-      stopReason = cumulativePnlGuard.reason || `Cumulative P/L Guard blocked Trade ${i}.`;
-      break;
-    }
-    riskAmt = cumulativePnlGuard.riskAmt;
-
     const lots = riskAmt / LOT_VALUE;
 
     if (riskAmt > capital * (cfg.perTradeCapPct / 100)) {
@@ -578,11 +565,6 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       riskBudgetGuardApplied: riskBudgetGuard.applied,
       riskBudgetTargetRisk: riskBudgetGuard.targetRiskAmt,
       riskBudgetRemainingBefore: Number.isFinite(riskBudgetGuard.remainingBefore) ? riskBudgetGuard.remainingBefore : null,
-      cumulativePnlGuardApplied: cumulativePnlGuard.applied,
-      cumulativePnlGuardTargetRisk: cumulativePnlGuard.targetRiskAmt,
-      cumulativePnlGuardPeak: cumulativePnlGuard.peakCumulativePnl,
-      cumulativePnlGuardFloor: cumulativePnlGuard.protectedFloor,
-      cumulativePnlGuardAllowedNetLoss: Number.isFinite(cumulativePnlGuard.allowedNetLoss) ? cumulativePnlGuard.allowedNetLoss : null,
       lots,
       entryPrice,
       price: exitPrice,
@@ -615,9 +597,6 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     maxLossValue = Math.min(maxLossValue, capital - cfg.initialCapital);
 
     cumulativeNetProfit += netPL;
-    if (cumulativeNetProfit > cumulativePnlGuardPeak) {
-      cumulativePnlGuardPeak = cumulativeNetProfit;
-    }
     previousExecutedRiskAmt = riskAmt;
 
     if (isWin) {
@@ -687,6 +666,7 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     lossesCount: losses.length,
   };
 }
+
 
 // Standard browser randomness. Each simulation run gets a fresh random sequence,
 // matching the original simulator behavior.
@@ -843,113 +823,6 @@ function guardFnoRiskToBudget(cfg, targetRiskAmt, capital, peak, price, unitValu
   return { riskAmt: bestUnits * unitValue, applied: true, blocked: false, targetRiskAmt: target, remainingBefore, units: bestUnits, reason: "Risk Budget Guard capped this trade to the largest budget-safe whole unit/lot size." };
 }
 
-function getCumulativePnlGuardEnabled(cfg) {
-  return cfg?.cumulativePnlGuardEnabled !== false;
-}
-
-function getCumulativePnlGuardPct(cfg) {
-  return Math.max(0, Math.min(100, Number(cfg?.cumulativePnlGuardPct) || 0));
-}
-
-function getCumulativePnlGuardFloor(peakCumulativePnl, cfg) {
-  const peak = Math.max(0, Number(peakCumulativePnl) || 0);
-  return peak * (1 - getCumulativePnlGuardPct(cfg) / 100);
-}
-
-function guardSingleRiskToCumulativePnl(cfg, targetRiskAmt, cumulativePnl, peakCumulativePnl, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee, isWin) {
-  if (!getCumulativePnlGuardEnabled(cfg) || isWin) {
-    return { riskAmt: targetRiskAmt, applied: false, blocked: false, targetRiskAmt, peakCumulativePnl, protectedFloor: null, allowedNetLoss: Infinity, reason: null };
-  }
-
-  const currentPnl = Number(cumulativePnl) || 0;
-  const peak = Math.max(0, Number(peakCumulativePnl) || 0);
-  const floor = getCumulativePnlGuardFloor(peak, cfg);
-  const target = Math.max(0, Number(targetRiskAmt) || 0);
-  const epsilon = Math.max(1e-12, Math.max(peak, 1) * 1e-10);
-
-  // No positive peak yet: a loss would not be a peak-giveback event, but it
-  // still must not push realized cumulative P/L below zero.
-  if (peak <= 0) {
-    const allowedNetLoss = Math.max(0, currentPnl);
-    if (target > 0 && allowedNetLoss <= epsilon) {
-      return { riskAmt: 0, applied: true, blocked: true, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: 0, allowedNetLoss, reason: 'Cumulative P/L Guard: cumulative P/L has no positive cushion; a losing trade is blocked.' };
-    }
-    if (target > 0) {
-      const targetLoss = estimateSingleWorstLossForRisk(cfg, target, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee);
-      if (targetLoss > allowedNetLoss + epsilon) {
-        let lo = 0, hi = target, best = 0;
-        for (let i = 0; i < 52; i++) {
-          const mid = (lo + hi) / 2;
-          const loss = estimateSingleWorstLossForRisk(cfg, mid, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee);
-          if (loss <= allowedNetLoss + epsilon) { best = mid; lo = mid; } else hi = mid;
-        }
-        if (best <= epsilon) {
-          return { riskAmt: 0, applied: true, blocked: true, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: 0, allowedNetLoss, reason: 'Cumulative P/L Guard: losing trade cannot fit without making cumulative P/L negative.' };
-        }
-        return { riskAmt: best, applied: true, blocked: false, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: 0, allowedNetLoss, reason: 'Cumulative P/L Guard capped this loss to keep cumulative P/L non-negative.' };
-      }
-    }
-    return { riskAmt: target, applied: false, blocked: false, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: 0, allowedNetLoss, reason: null };
-  }
-
-  const allowedNetLoss = Math.max(0, currentPnl - floor);
-  if (allowedNetLoss <= epsilon) {
-    return { riskAmt: 0, applied: target > 0, blocked: target > 0, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: floor, allowedNetLoss, reason: target > 0 ? `Cumulative P/L Guard: protected floor ${fmtMoney(floor)} has been reached.` : null };
-  }
-
-  const targetLoss = estimateSingleWorstLossForRisk(cfg, target, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee);
-  if (targetLoss <= allowedNetLoss + epsilon) {
-    return { riskAmt: target, applied: false, blocked: false, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: floor, allowedNetLoss, reason: null };
-  }
-
-  // Solve against NET loss (after fee/slippage/spread), not gross risk. This
-  // is the mathematically correct way to hold the post-trade cumulative P/L
-  // at or above the protected floor.
-  let lo = 0, hi = target, best = 0;
-  for (let i = 0; i < 52; i++) {
-    const mid = (lo + hi) / 2;
-    const loss = estimateSingleWorstLossForRisk(cfg, mid, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee);
-    if (loss <= allowedNetLoss + epsilon) { best = mid; lo = mid; } else hi = mid;
-  }
-  if (best <= epsilon) {
-    return { riskAmt: 0, applied: true, blocked: true, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: floor, allowedNetLoss, reason: 'Cumulative P/L Guard: requested loss cannot fit inside the protected cumulative-profit floor after costs.' };
-  }
-  return { riskAmt: best, applied: true, blocked: false, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: floor, allowedNetLoss, reason: `Cumulative P/L Guard capped this loss to protect ${fmtMoney(floor)} minimum cumulative P/L.` };
-}
-
-function guardFnoRiskToCumulativePnl(cfg, targetRiskAmt, cumulativePnl, peakCumulativePnl, price, unitValue, lotSize, leverageFactor, broker, segment, isWin) {
-  if (!getCumulativePnlGuardEnabled(cfg) || isWin) {
-    return { riskAmt: targetRiskAmt, applied: false, blocked: false, targetRiskAmt, peakCumulativePnl, protectedFloor: null, allowedNetLoss: Infinity, units: null, reason: null };
-  }
-
-  const currentPnl = Number(cumulativePnl) || 0;
-  const peak = Math.max(0, Number(peakCumulativePnl) || 0);
-  const floor = getCumulativePnlGuardFloor(peak, cfg);
-  const target = Math.max(0, Number(targetRiskAmt) || 0);
-  const epsilon = Math.max(1e-12, Math.max(peak, 1) * 1e-10);
-  const targetUnits = Math.max(1, Math.round(target / Math.max(1e-12, unitValue)));
-
-  const allowedNetLoss = peak > 0 ? Math.max(0, currentPnl - floor) : Math.max(0, currentPnl);
-  if (allowedNetLoss <= epsilon) {
-    return { riskAmt: 0, applied: target > 0, blocked: target > 0, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: peak > 0 ? floor : 0, allowedNetLoss, units: 0, reason: target > 0 ? `Cumulative P/L Guard: protected floor ${fmtMoney(peak > 0 ? floor : 0)} has been reached.` : null };
-  }
-
-  const targetLoss = estimateFnoWorstLossForUnits(cfg, targetUnits, price, unitValue, lotSize, leverageFactor, broker, segment);
-  if (targetLoss <= allowedNetLoss + epsilon) {
-    return { riskAmt: target, applied: false, blocked: false, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: peak > 0 ? floor : 0, allowedNetLoss, units: targetUnits, reason: null };
-  }
-
-  let lo = 0, hi = targetUnits, bestUnits = 0;
-  while (lo <= hi) {
-    const mid = Math.floor((lo + hi) / 2);
-    const loss = estimateFnoWorstLossForUnits(cfg, mid, price, unitValue, lotSize, leverageFactor, broker, segment);
-    if (loss <= allowedNetLoss + epsilon) { bestUnits = mid; lo = mid + 1; } else hi = mid - 1;
-  }
-  if (bestUnits < 1) {
-    return { riskAmt: 0, applied: true, blocked: true, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: peak > 0 ? floor : 0, allowedNetLoss, units: 0, reason: 'Cumulative P/L Guard: minimum executable F&O unit would breach the protected cumulative-profit floor after costs.' };
-  }
-  return { riskAmt: bestUnits * unitValue, applied: true, blocked: false, targetRiskAmt: target, peakCumulativePnl: peak, protectedFloor: floor, allowedNetLoss, units: bestUnits, reason: `Cumulative P/L Guard capped this F&O loss to protect ${fmtMoney(floor)} minimum cumulative P/L.` };
-}
 
 function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   const BASE_RISK_AMT = cfg.initialCapital * (cfg.riskPct / 100);
@@ -987,7 +860,6 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   let lastProfitNet = null;
   let consecutiveLosses = 0;
   let cumulativeNetProfit = 0;
-  let cumulativePnlGuardPeak = 0;
   let previousExecutedRiskAmt = null;
   let currentProfitCumulativeAdjustment = Number(cfg.profitCumulativeLossAdjustPct) || 0;
   let currentProfitCumulativeFlipCount = 0;
@@ -1001,7 +873,6 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   const rrRng = getSimulationRng(cfg);
 
   for (let i = 1; i <= numTrades; i++) {
-    cumulativePnlGuardPeak = Math.max(cumulativePnlGuardPeak, Math.max(0, cumulativeNetProfit));
     let targetRiskAmt;
 
     if (Array.isArray(explicitRiskPlan)) {
@@ -1087,17 +958,6 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     }
     targetRiskAmt = riskBudgetGuard.riskAmt;
 
-    const cumulativePnlGuard = guardFnoRiskToCumulativePnl(
-      cfg, targetRiskAmt, cumulativeNetProfit, cumulativePnlGuardPeak, price,
-      UNIT_VALUE, lotSize, leverageFactor, broker, segment, !!winLossSeq[i - 1]
-    );
-    if (cumulativePnlGuard.blocked) {
-      stopped = true;
-      stopReason = cumulativePnlGuard.reason || `Cumulative P/L Guard blocked Trade ${i}.`;
-      break;
-    }
-    targetRiskAmt = cumulativePnlGuard.riskAmt;
-
     // Round to the nearest whole unit (minimum 1) — Intraday can only trade
     // whole shares (1, 2, 5, 10, 17…), Options/Futures can only trade whole
     // lots (1 lot, 2 lots… never 1.2 or 1.5). Quantity is units × Lot Size
@@ -1166,11 +1026,6 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       riskBudgetGuardApplied: riskBudgetGuard.applied,
       riskBudgetTargetRisk: riskBudgetGuard.targetRiskAmt,
       riskBudgetRemainingBefore: Number.isFinite(riskBudgetGuard.remainingBefore) ? riskBudgetGuard.remainingBefore : null,
-      cumulativePnlGuardApplied: cumulativePnlGuard.applied,
-      cumulativePnlGuardTargetRisk: cumulativePnlGuard.targetRiskAmt,
-      cumulativePnlGuardPeak: cumulativePnlGuard.peakCumulativePnl,
-      cumulativePnlGuardFloor: cumulativePnlGuard.protectedFloor,
-      cumulativePnlGuardAllowedNetLoss: Number.isFinite(cumulativePnlGuard.allowedNetLoss) ? cumulativePnlGuard.allowedNetLoss : null,
       lots: units,
       quantity,
       entryPrice,
@@ -1208,9 +1063,6 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     maxLossValue = Math.min(maxLossValue, capital - cfg.initialCapital);
 
     cumulativeNetProfit += netPL;
-    if (cumulativeNetProfit > cumulativePnlGuardPeak) {
-      cumulativePnlGuardPeak = cumulativeNetProfit;
-    }
     previousExecutedRiskAmt = riskAmt;
 
     if (isWin) {
@@ -1288,6 +1140,7 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     lossesCount: losses.length,
   };
 }
+
 
 function runSimulation(cfg) {
   const winLossSeq = buildWinLossSeq(cfg.numTrades, cfg.winRate);
@@ -1415,8 +1268,6 @@ function cleanConfig(cfg) {
     riskAllocationResetPct: Math.max(0, Number(cfg.riskAllocationResetPct) || 0),
     riskBudgetGuardEnabled: cfg.riskBudgetGuardEnabled !== false,
     riskBudgetPct: Math.max(0, Math.min(100, Number(cfg.riskBudgetPct) || 5)),
-    cumulativePnlGuardEnabled: cfg.cumulativePnlGuardEnabled !== false,
-    cumulativePnlGuardPct: Math.max(0, Math.min(100, Number(cfg.cumulativePnlGuardPct) || 50)),
     slipPct: Number(cfg.slipPct) || 0,
     slipTicks: Number(cfg.slipTicks) || 0,
     tickValue: Number(cfg.tickValue) || 0,
@@ -2045,6 +1896,7 @@ function MultiSimHistogram({ runs, selectedRunIdx, onSelectRun }) {
   );
 }
 
+
 // Custom tooltip for the cumulative-P/L path chart. The tooltip stays compact
 // and focuses on the selected scenario so large simulation sets remain readable.
 function MultiSimPathsTooltip({ active, payload, label, selectedRunIdx }) {
@@ -2259,6 +2111,7 @@ function MultiSimPathsChart({ runs, selectedRunIdx, onSelectRun }) {
   );
 }
 
+
 // Small clickable summary of one batch run, used by BatchRunSection for the
 // Max Profit / Max Loss / Max Drawdown scenario callouts. Clicking loads
 // that exact run's trade sequence into the stats/chart/Trade Log above.
@@ -2454,6 +2307,8 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
   );
 }
 
+
+
 // -----------------------------------------------------------------------------
 // Drawdown recovery analytics
 // -----------------------------------------------------------------------------
@@ -2594,6 +2449,7 @@ function analyzeDrawdownRecovery(trades, initialCapital) {
     unrecoveredEpisodes,
   };
 }
+
 
 // Break-even recovery analytics: measures the time needed to take cumulative
 // realized net P/L from its deepest negative episode back to >= 0 (break-even).
@@ -3849,6 +3705,7 @@ function addTopBuilderCandidate(candidates, candidate, maxKeep = BUILDER_SAFE_LI
   }
 }
 
+
 function roundBuilderInput(value, decimals = 2) {
   const n = Number(value);
   if (!Number.isFinite(n)) return 0;
@@ -4025,6 +3882,7 @@ function calibrateBuilderRiskPlan(engineCfg, sequence, totalRiskAmount, useFno) 
 
   return best;
 }
+
 
 function getBuilderTargetRR(engineCfg) {
   const minRR = Math.max(0, Number(engineCfg.rrMin) || 0);
@@ -4249,6 +4107,7 @@ function evaluateBuilderTargetSequence(engineCfg, sequence, totalRiskAmount, use
     ...engineCfg,
     _rrSeed: rrSeed,
     _riskReferenceWinRate: targetWinRate == null ? engineCfg.winRate : targetWinRate,
+    _riskBudgetAmountOverride: Math.max(0, Number(totalRiskAmount) || 0),
   };
   const calibrated = calibrateBuilderTargetPoints(
     builderEngineCfg,
@@ -4326,6 +4185,7 @@ function evaluateBuilderTargetSequence(engineCfg, sequence, totalRiskAmount, use
   };
 }
 
+
 function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, targetWinRate = null) {
   const initialCapital = Math.max(0, Number(engineCfg.initialCapital) || 0);
   const n = sequence.length;
@@ -4338,6 +4198,7 @@ function evaluateBuilderSequence(engineCfg, sequence, totalRiskAmount, useFno, t
     ...engineCfg,
     _rrSeed: rrSeed,
     _riskReferenceWinRate: targetWinRate == null ? engineCfg.winRate : targetWinRate,
+    _riskBudgetAmountOverride: Math.max(0, Number(totalRiskAmount) || 0),
   };
 
   const calibrated = calibrateBuilderRiskPlan(
@@ -5131,18 +4992,6 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
               </div>
             </div>
           </div>
-
-          <div className="mt-2.5 min-w-0 rounded-lg border border-cyan-500/20 bg-cyan-500/[0.04] p-2.5 overflow-hidden">
-            <div className="flex items-start justify-between gap-2 min-w-0">
-              <div className="min-w-0">
-                <div className="text-[10px] sm:text-[11px] font-semibold text-cyan-300">Cumulative P/L Guard</div>
-                <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words">Inherited from Single Run / Day-F&O. Protects realized cumulative profit from peak giveback; separate from Builder Total Risk Budget.</div>
-              </div>
-              <div className="shrink-0 text-right font-mono text-[10px] text-cyan-300">
-                <div>{strategyCfg.cumulativePnlGuardEnabled === false ? "OFF" : fmtPct(strategyCfg.cumulativePnlGuardPct)}</div>
-              </div>
-            </div>
-          </div>
         </div>
       </div>
 
@@ -5192,6 +5041,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
     </div>
   );
 }
+
 
 function TradeAllocationScale({ trade, fno = false, riskScale, onRiskScaleChange }) {
   const originalRisk = Math.max(0, Number(trade?.risk) || 0);
@@ -5690,6 +5540,7 @@ function BuilderResults({ builder, selectedKey, onSelectCandidate, onReorderComb
   );
 }
 
+
 function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReorder }) {
   const [dragIdx, setDragIdx] = useState(null);
   const [dragOverIdx, setDragOverIdx] = useState(null);
@@ -6098,8 +5949,6 @@ export default function RiskSimulator() {
           // Budget value or a stale Builder snapshot.
           riskBudgetGuardEnabled: currentSourceCfg.riskBudgetGuardEnabled !== false,
           riskBudgetPct: Math.max(0, Math.min(100, Number(currentSourceCfg.riskBudgetPct) || 0)),
-          cumulativePnlGuardEnabled: currentSourceCfg.cumulativePnlGuardEnabled !== false,
-          cumulativePnlGuardPct: Math.max(0, Math.min(100, Number(currentSourceCfg.cumulativePnlGuardPct) || 0)),
           builderRiskMenuOpen: false,
         };
         if (!workspace) {
@@ -6574,6 +6423,7 @@ export default function RiskSimulator() {
     };
   }, [cfg, mode]);
 
+
   // Clears the Multi Simulations batch entirely — back to the empty "Set a
   // Scenarios count..." state — without touching the main Trade Log/stats
   // above (those keep showing whatever single run or selected batch run
@@ -6583,6 +6433,7 @@ export default function RiskSimulator() {
     setSelectedBatchRunIdx(null);
     setScenarioInput("");
   }, []);
+
 
   // Loads one batch run's exact trade sequence + result into the normal
   // result state, so the stats cards, Per-Trade P/L chart and Trade Log
@@ -6899,6 +6750,7 @@ export default function RiskSimulator() {
     const rewardMag = Math.abs(winRatePoint100.avgReturnPct);
     winRateRR = riskMag > 0 ? rewardMag / riskMag : rewardMag > 0 ? Infinity : 0;
   }
+
 
   const bankrollSourceCfg = bankrollBaseMode === "fno"
     ? (strategyWorkspaceRef.current.fno?.cfg || DEFAULTS)
@@ -7510,26 +7362,6 @@ export default function RiskSimulator() {
                       </div>
                     )}
                   </div>
-
-                  <div className="mt-2.5 min-w-0 rounded-lg border border-cyan-500/20 bg-cyan-500/[0.04] p-2.5 overflow-hidden">
-                    <div className="flex items-start justify-between gap-2 min-w-0">
-                      <div className="min-w-0">
-                        <div className="text-[10px] sm:text-[11px] font-semibold text-cyan-300">Cumulative P/L Guard</div>
-                        <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words">Protects realized cumulative P/L from giving back more than the selected share of its highest positive peak. Uses NET P/L after costs.</div>
-                      </div>
-                      <button type="button" onClick={() => setCfg((c) => ({ ...c, cumulativePnlGuardEnabled: !c.cumulativePnlGuardEnabled }))} className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border transition-colors ${cfg.cumulativePnlGuardEnabled ? "bg-cyan-500/15 text-cyan-300 border-cyan-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>
-                        {cfg.cumulativePnlGuardEnabled ? "ON" : "OFF"}
-                      </button>
-                    </div>
-                    {cfg.cumulativePnlGuardEnabled && (
-                      <div className="mt-2 min-w-0">
-                        <Field label="Max Giveback %"><NumInput value={cfg.cumulativePnlGuardPct} onChange={setField("cumulativePnlGuardPct")} step="1" min="0" max="100" color="teal" /></Field>
-                      </div>
-                    )}
-                    <div className="mt-2 rounded-md border border-cyan-500/15 bg-zinc-950/30 px-2.5 py-2 text-[9px] sm:text-[10px] text-zinc-400 leading-relaxed">
-                      Peak +₹93.92 with 50% Max Giveback → protected floor +₹46.96. A losing trade is sized from the allowed <span className="text-cyan-300">NET</span> loss, so the post-trade cumulative P/L stays at or above that floor. The selected On Profit / On Profit+ / On Capital model continues normally afterward.
-                    </div>
-                  </div>
                 </div>
               </div>
 
@@ -7990,7 +7822,7 @@ export default function RiskSimulator() {
                             >
                               <TradeResultBadge win={t.win} />
                             </td>
-                            <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)} {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300" title="Risk Allocation Reset">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300" title="Risk Budget Guard capped this trade">BUDGET</span> : null}{t.cumulativePnlGuardApplied ? <span className="ml-1 text-[9px] text-cyan-300" title={`Cumulative P/L Guard capped this trade · floor ${fmtMoney(t.cumulativePnlGuardFloor)}`}>P/L</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right">{fmtMoney(t.risk)} {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300" title="Risk Allocation Reset">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300" title="Risk Budget Guard capped this trade">BUDGET</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                             <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>
@@ -8482,6 +8314,7 @@ export default function RiskSimulator() {
                     </ResponsiveContainer>
                   </div>
                 </div>
+
 
                 <RecoveryTimeSweepSection points={sweep.points} />
 
