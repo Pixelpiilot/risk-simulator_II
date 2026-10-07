@@ -64,8 +64,9 @@ const DEFAULTS = {
   riskAllocationEnabled: true,
   riskAllocationTriggerPct: 100,
   riskAllocationResetPct: 50,
-  // Hard peak-to-trough risk envelope shared by all allocation modes.
-  // Builder overrides the amount with its own Total Risk Budget.
+  // Hard peak-to-trough risk envelope shared by the strategy engine.
+  // Builder inherits this guard from the active Single Run / Day-F&O strategy;
+  // its separate Total Risk Budget controls Builder calibration only.
   riskBudgetGuardEnabled: true,
   riskBudgetPct: 5,
   slipMode: "percent",
@@ -332,8 +333,6 @@ const BUILDER_RISK_ALLOCATION_KEYS = [
   "riskAllocationEnabled",
   "riskAllocationTriggerPct",
   "riskAllocationResetPct",
-  "riskBudgetGuardEnabled",
-  "riskBudgetPct",
 ];
 
 function builderRiskAllocationFields(cfg) {
@@ -4977,15 +4976,20 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
           </div>
 
           <div className="mt-1 rounded-md border border-zinc-800 bg-zinc-950/30 px-2.5 py-1.5 text-[9px] font-mono leading-relaxed text-zinc-500 break-words">
-            The selected model and its settings run inside every evaluated W/L sequence. Builder keeps the configured allocation shape, auto-scales absolute size to the Total Risk Budget, and preserves existing caps/reset as final guards.
+            The selected model and its settings run inside every evaluated W/L sequence. Builder keeps the configured allocation shape, auto-scales absolute size to the separate Total Risk Budget, and preserves existing caps/reset as final guards.
           </div>
           <div className="mt-2 min-w-0 rounded-lg border border-emerald-500/20 bg-emerald-500/[0.045] p-2.5 overflow-hidden">
             <div className="flex items-center justify-between gap-2 min-w-0">
               <div className="min-w-0">
                 <div className="text-[10px] sm:text-[11px] font-semibold text-emerald-300">Risk Budget Guard</div>
-                <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words">Builder uses Total Risk Budget as the hard peak-to-trough downside envelope.</div>
+                <div className="text-[9px] sm:text-[10px] text-zinc-300 mt-0.5 leading-relaxed break-words">Inherited from the active Single Run / Day-F&O configuration. This guard is separate from Builder Total Risk Budget.</div>
               </div>
-              <div className="shrink-0 font-mono text-[10px] text-emerald-300">{fmtPct(cfg.builderTotalRiskPct)}</div>
+              <div className="shrink-0 text-right font-mono text-[10px] text-emerald-300">
+                <div>{strategyCfg.riskBudgetGuardEnabled === false ? "OFF" : fmtPct(strategyCfg.riskBudgetPct)}</div>
+                {strategyCfg.riskBudgetGuardEnabled !== false ? (
+                  <div className="text-[9px] text-zinc-400 mt-0.5">{fmtMoney(strategyCfg.initialCapital * (Number(strategyCfg.riskBudgetPct) || 0) / 100)}</div>
+                ) : null}
+              </div>
             </div>
           </div>
         </div>
@@ -5939,6 +5943,12 @@ export default function RiskSimulator() {
           ...currentSourceCfg,
           ...preservedBuilderInputs,
           ...preservedBuilderRiskInputs,
+          // Risk Budget Guard is a STRATEGY setting, not a Builder budget.
+          // Always fetch the latest value from the active Single Run / Day-F&O
+          // workspace so Builder cannot accidentally reuse its own Total Risk
+          // Budget value or a stale Builder snapshot.
+          riskBudgetGuardEnabled: currentSourceCfg.riskBudgetGuardEnabled !== false,
+          riskBudgetPct: Math.max(0, Math.min(100, Number(currentSourceCfg.riskBudgetPct) || 0)),
           builderRiskMenuOpen: false,
         };
         if (!workspace) {
