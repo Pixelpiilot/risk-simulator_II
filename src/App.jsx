@@ -2293,10 +2293,6 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
                 />
               </div>
 
-              <RecoveryTimeAnalysis
-                runs={batchResult.runs}
-                initialCapital={cfg.initialCapital}
-              />
             </div>
           )}
         </>
