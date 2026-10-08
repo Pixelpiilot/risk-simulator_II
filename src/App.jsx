@@ -60,6 +60,13 @@ const DEFAULTS = {
   profitShieldLossRiskPct: 35,
   profitShieldCapitalFloorPct: 97.5,
   profitShieldMaxRiskPct: 3,
+  // Recovery Window: after realized capital drops below Initial Capital,
+  // temporarily use a tighter risk fraction until capital recovers or the
+  // configured recovery window expires.
+  profitShieldRecoveryEnabled: true,
+  profitShieldRecoveryRiskPct: 50,
+  profitShieldRecoveryMaxTrades: 4,
+  profitShieldRecoveryCapturePct: 100,
   winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
@@ -340,6 +347,10 @@ const BUILDER_RISK_ALLOCATION_KEYS = [
   "profitShieldLossRiskPct",
   "profitShieldCapitalFloorPct",
   "profitShieldMaxRiskPct",
+  "profitShieldRecoveryEnabled",
+  "profitShieldRecoveryRiskPct",
+  "profitShieldRecoveryMaxTrades",
+  "profitShieldRecoveryCapturePct",
   "winRiskPct",
   "lossRiskPct",
   "lossRiskAdjustPct",
@@ -404,12 +415,41 @@ function getProfitShieldSettings(cfg) {
     lossRiskPct: Math.max(0, Math.min(100, Number(cfg.profitShieldLossRiskPct) || 0)),
     capitalFloorPct: Math.max(0, Math.min(100, Number(cfg.profitShieldCapitalFloorPct) || 0)),
     maxRiskPct: Math.max(0, Math.min(100, Number(cfg.profitShieldMaxRiskPct) || 0)),
+    recoveryEnabled: cfg.profitShieldRecoveryEnabled !== false,
+    recoveryRiskPct: Math.max(0, Math.min(100, Number(cfg.profitShieldRecoveryRiskPct) || 0)),
+    recoveryMaxTrades: Math.max(1, Math.round(Number(cfg.profitShieldRecoveryMaxTrades) || 1)),
+    recoveryCapturePct: Math.max(0, Math.min(100, Number(cfg.profitShieldRecoveryCapturePct) || 0)),
   };
 }
 
-function getProfitShieldRiskTarget(cfg, baseRiskAmt, previousExecutedRiskAmt, prevWin, lastUnlockedProfit) {
+function isProfitShieldRecoveryActive(cfg, capital, initialCapital, recoveryTradesUsed) {
+  const settings = getProfitShieldSettings(cfg);
+  if (!settings.recoveryEnabled) return false;
+  const epsilon = Math.max(1e-12, Math.max(1, Math.abs(Number(initialCapital) || 0)) * 1e-12);
+  return Number(capital) < Number(initialCapital) - epsilon && recoveryTradesUsed < settings.recoveryMaxTrades;
+}
+
+function getProfitShieldRiskTarget(
+  cfg,
+  baseRiskAmt,
+  previousExecutedRiskAmt,
+  prevWin,
+  lastUnlockedProfit,
+  capital,
+  initialCapital,
+  recoveryTradesUsed
+) {
   const settings = getProfitShieldSettings(cfg);
   const previousRisk = Math.max(0, Number(previousExecutedRiskAmt) || baseRiskAmt);
+  const recoveryActive = isProfitShieldRecoveryActive(cfg, capital, initialCapital, recoveryTradesUsed);
+
+  if (recoveryActive) {
+    // Recovery Window deliberately ignores profit deployment while the account
+    // is still below Initial Capital. Risk contracts from the last executed
+    // risk until the deficit is repaired or the recovery window expires.
+    return previousRisk * (settings.recoveryRiskPct / 100);
+  }
+
   if (prevWin && Number(lastUnlockedProfit) > 0) {
     return Math.max(0, Number(lastUnlockedProfit) || 0) * (settings.deployPct / 100);
   }
@@ -505,6 +545,8 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   let currentProfitCumulativeFlipCount = 0;
   let profitShieldLockedProfit = 0;
   let profitShieldLastUnlockedProfit = 0;
+  let profitShieldRecoveryTradesUsed = 0;
+  let profitShieldRecoveryDeficit = 0;
   let price = Number(cfg.currentPrice) || 0; // running instrument price (drives turnover fee + is itself driven by each trade's gross P/L)
 
   const trades = [];
@@ -543,7 +585,16 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     } else if (cfg.cascadeMode === "profitShield") {
       // Profit Shield recycles only the unlocked part of the latest win and
       // contracts risk after each loss. Existing modes stay untouched.
-      riskAmt = getProfitShieldRiskTarget(cfg, BASE_RISK_AMT, previousExecutedRiskAmt, prevWin, profitShieldLastUnlockedProfit);
+      riskAmt = getProfitShieldRiskTarget(
+        cfg,
+        BASE_RISK_AMT,
+        previousExecutedRiskAmt,
+        prevWin,
+        profitShieldLastUnlockedProfit,
+        capital,
+        cfg.initialCapital,
+        profitShieldRecoveryTradesUsed
+      );
     } else if (cfg.cascadeMode === "profit" || cfg.cascadeMode === "capital") {
       // Existing On Profit / On Capital logic is intentionally preserved exactly.
       if (prevWin) {
@@ -671,15 +722,41 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     price = trueExitPrice; // baseline carries forward clean, unaffected by spread
 
     let profitShieldNewlyLocked = 0;
+    let profitShieldRecoveryApplied = 0;
+    let profitShieldRecoveryMode = false;
     if (cfg.cascadeMode === "profitShield") {
+      const shieldSettings = getProfitShieldSettings(cfg);
+      const capitalBeforeTrade = capital - netPL;
+      const deficitBefore = Math.max(0, Number(cfg.initialCapital) - Number(capitalBeforeTrade));
+      profitShieldRecoveryMode = shieldSettings.recoveryEnabled && deficitBefore > 1e-12;
+
+      if (profitShieldRecoveryMode) {
+        profitShieldRecoveryTradesUsed += 1;
+      }
+
       if (isWin && netPL > 0) {
-        const shieldSettings = getProfitShieldSettings(cfg);
-        profitShieldNewlyLocked = netPL * (shieldSettings.lockPct / 100);
+        // Recovery has first priority. Only profit above the outstanding
+        // Initial-Capital deficit becomes eligible for Profit Shield locking.
+        profitShieldRecoveryApplied = Math.min(
+          deficitBefore,
+          netPL * (shieldSettings.recoveryCapturePct / 100)
+        );
+        const excessProfit = Math.max(0, netPL - profitShieldRecoveryApplied);
+        profitShieldNewlyLocked = excessProfit * (shieldSettings.lockPct / 100);
         profitShieldLockedProfit += profitShieldNewlyLocked;
-        profitShieldLastUnlockedProfit = netPL - profitShieldNewlyLocked;
+        profitShieldLastUnlockedProfit = excessProfit - profitShieldNewlyLocked;
       } else {
         profitShieldNewlyLocked = 0;
         profitShieldLastUnlockedProfit = 0;
+      }
+
+      profitShieldRecoveryDeficit = Math.max(0, Number(cfg.initialCapital) - Number(capital));
+      if (profitShieldRecoveryDeficit <= 1e-12) {
+        profitShieldRecoveryTradesUsed = 0;
+      } else if (profitShieldRecoveryTradesUsed >= shieldSettings.recoveryMaxTrades) {
+        // Once the window expires while still below Initial Capital, the mode
+        // falls back to its normal tighter loss-contraction rule.
+        profitShieldRecoveryTradesUsed = shieldSettings.recoveryMaxTrades;
       }
     }
     const profitShieldFloorAfter = cfg.cascadeMode === "profitShield"
@@ -700,6 +777,10 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       riskBudgetRemainingBefore: Number.isFinite(riskBudgetGuard.remainingBefore) ? riskBudgetGuard.remainingBefore : null,
       profitShieldLockedProfit: cfg.cascadeMode === "profitShield" ? profitShieldLockedProfit : null,
       profitShieldNewlyLocked: cfg.cascadeMode === "profitShield" ? profitShieldNewlyLocked : null,
+      profitShieldRecoveryApplied: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryApplied : null,
+      profitShieldRecoveryDeficit: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryDeficit : null,
+      profitShieldRecoveryMode: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryMode : false,
+      profitShieldRecoveryTradesUsed: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryTradesUsed : null,
       profitShieldProtectedFloor: cfg.cascadeMode === "profitShield" ? profitShieldFloorAfter : null,
       profitShieldAvailableBuffer: cfg.cascadeMode === "profitShield" ? profitShieldBufferAfter : null,
       profitShieldGuardApplied: cfg.cascadeMode === "profitShield" ? !!profitShieldGuard?.applied : false,
@@ -801,6 +882,8 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     totalFees,
     expectancy,
     profitShieldLockedProfit: cfg.cascadeMode === "profitShield" ? profitShieldLockedProfit : null,
+    profitShieldRecoveryDeficit: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryDeficit : null,
+    profitShieldRecoveryTradesUsed: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryTradesUsed : null,
     profitShieldProtectedFloor: cfg.cascadeMode === "profitShield" ? getProfitShieldCapitalFloor(cfg, profitShieldLockedProfit) : null,
     winsCount: wins.length,
     lossesCount: losses.length,
@@ -1005,6 +1088,8 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   let currentProfitCumulativeFlipCount = 0;
   let profitShieldLockedProfit = 0;
   let profitShieldLastUnlockedProfit = 0;
+  let profitShieldRecoveryTradesUsed = 0;
+  let profitShieldRecoveryDeficit = 0;
   let price = Number(cfg.fnoCurrentPrice) || 0;
 
   const trades = [];
@@ -1034,7 +1119,16 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
         targetRiskAmt = previousRisk * state.factor;
       }
     } else if (cfg.cascadeMode === "profitShield") {
-      targetRiskAmt = getProfitShieldRiskTarget(cfg, BASE_RISK_AMT, previousExecutedRiskAmt, prevWin, profitShieldLastUnlockedProfit);
+      targetRiskAmt = getProfitShieldRiskTarget(
+        cfg,
+        BASE_RISK_AMT,
+        previousExecutedRiskAmt,
+        prevWin,
+        profitShieldLastUnlockedProfit,
+        capital,
+        cfg.initialCapital,
+        profitShieldRecoveryTradesUsed
+      );
     } else if (cfg.cascadeMode === "profit" || cfg.cascadeMode === "capital") {
       if (prevWin) {
         if (isCapitalCascade) {
@@ -1180,15 +1274,41 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     price = trueExitPrice; // baseline carries forward clean, unaffected by spread
 
     let profitShieldNewlyLocked = 0;
+    let profitShieldRecoveryApplied = 0;
+    let profitShieldRecoveryMode = false;
     if (cfg.cascadeMode === "profitShield") {
+      const shieldSettings = getProfitShieldSettings(cfg);
+      const capitalBeforeTrade = capital - netPL;
+      const deficitBefore = Math.max(0, Number(cfg.initialCapital) - Number(capitalBeforeTrade));
+      profitShieldRecoveryMode = shieldSettings.recoveryEnabled && deficitBefore > 1e-12;
+
+      if (profitShieldRecoveryMode) {
+        profitShieldRecoveryTradesUsed += 1;
+      }
+
       if (isWin && netPL > 0) {
-        const shieldSettings = getProfitShieldSettings(cfg);
-        profitShieldNewlyLocked = netPL * (shieldSettings.lockPct / 100);
+        // Recovery has first priority. Only profit above the outstanding
+        // Initial-Capital deficit becomes eligible for Profit Shield locking.
+        profitShieldRecoveryApplied = Math.min(
+          deficitBefore,
+          netPL * (shieldSettings.recoveryCapturePct / 100)
+        );
+        const excessProfit = Math.max(0, netPL - profitShieldRecoveryApplied);
+        profitShieldNewlyLocked = excessProfit * (shieldSettings.lockPct / 100);
         profitShieldLockedProfit += profitShieldNewlyLocked;
-        profitShieldLastUnlockedProfit = netPL - profitShieldNewlyLocked;
+        profitShieldLastUnlockedProfit = excessProfit - profitShieldNewlyLocked;
       } else {
         profitShieldNewlyLocked = 0;
         profitShieldLastUnlockedProfit = 0;
+      }
+
+      profitShieldRecoveryDeficit = Math.max(0, Number(cfg.initialCapital) - Number(capital));
+      if (profitShieldRecoveryDeficit <= 1e-12) {
+        profitShieldRecoveryTradesUsed = 0;
+      } else if (profitShieldRecoveryTradesUsed >= shieldSettings.recoveryMaxTrades) {
+        // Once the window expires while still below Initial Capital, the mode
+        // falls back to its normal tighter loss-contraction rule.
+        profitShieldRecoveryTradesUsed = shieldSettings.recoveryMaxTrades;
       }
     }
     const profitShieldFloorAfter = cfg.cascadeMode === "profitShield"
@@ -1209,6 +1329,10 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       riskBudgetRemainingBefore: Number.isFinite(riskBudgetGuard.remainingBefore) ? riskBudgetGuard.remainingBefore : null,
       profitShieldLockedProfit: cfg.cascadeMode === "profitShield" ? profitShieldLockedProfit : null,
       profitShieldNewlyLocked: cfg.cascadeMode === "profitShield" ? profitShieldNewlyLocked : null,
+      profitShieldRecoveryApplied: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryApplied : null,
+      profitShieldRecoveryDeficit: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryDeficit : null,
+      profitShieldRecoveryMode: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryMode : false,
+      profitShieldRecoveryTradesUsed: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryTradesUsed : null,
       profitShieldProtectedFloor: cfg.cascadeMode === "profitShield" ? profitShieldFloorAfter : null,
       profitShieldAvailableBuffer: cfg.cascadeMode === "profitShield" ? profitShieldBufferAfter : null,
       profitShieldGuardApplied: cfg.cascadeMode === "profitShield" ? !!profitShieldGuard?.applied : false,
@@ -1323,6 +1447,8 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     totalTurnover,
     expectancy,
     profitShieldLockedProfit: cfg.cascadeMode === "profitShield" ? profitShieldLockedProfit : null,
+    profitShieldRecoveryDeficit: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryDeficit : null,
+    profitShieldRecoveryTradesUsed: cfg.cascadeMode === "profitShield" ? profitShieldRecoveryTradesUsed : null,
     profitShieldProtectedFloor: cfg.cascadeMode === "profitShield" ? getProfitShieldCapitalFloor(cfg, profitShieldLockedProfit) : null,
     winsCount: wins.length,
     lossesCount: losses.length,
@@ -1451,6 +1577,10 @@ function cleanConfig(cfg) {
     profitShieldLossRiskPct: Number.isFinite(Number(cfg.profitShieldLossRiskPct)) ? Math.max(0, Math.min(100, Number(cfg.profitShieldLossRiskPct))) : 35,
     profitShieldCapitalFloorPct: Number.isFinite(Number(cfg.profitShieldCapitalFloorPct)) ? Math.max(0, Math.min(100, Number(cfg.profitShieldCapitalFloorPct))) : 97.5,
     profitShieldMaxRiskPct: Number.isFinite(Number(cfg.profitShieldMaxRiskPct)) ? Math.max(0, Math.min(100, Number(cfg.profitShieldMaxRiskPct))) : 3,
+    profitShieldRecoveryEnabled: cfg.profitShieldRecoveryEnabled !== false,
+    profitShieldRecoveryRiskPct: Number.isFinite(Number(cfg.profitShieldRecoveryRiskPct)) ? Math.max(0, Math.min(100, Number(cfg.profitShieldRecoveryRiskPct))) : 50,
+    profitShieldRecoveryMaxTrades: Math.max(1, Math.round(Number(cfg.profitShieldRecoveryMaxTrades) || 4)),
+    profitShieldRecoveryCapturePct: Number.isFinite(Number(cfg.profitShieldRecoveryCapturePct)) ? Math.max(0, Math.min(100, Number(cfg.profitShieldRecoveryCapturePct))) : 100,
     winRiskPct: Number(cfg.winRiskPct) || 0,
     lossRiskPct: Number(cfg.lossRiskPct) || 0,
     lossRiskAdjustPct: Number(cfg.lossRiskAdjustPct) || 0,
@@ -5125,7 +5255,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
               : cfg.cascadeMode === "profit"
               ? "Existing On Profit logic: winning risk is derived from usable previous profit."
               : cfg.cascadeMode === "profitShield"
-              ? "Profit Shield: lock profit first, recycle only the unlocked portion, and contract risk after losses."
+              ? "Profit Shield: recover the Initial-Capital deficit first, lock excess profit, deploy only the unlocked slice, and contract risk during losses."
               : "Existing On Capital logic: risk follows current capital."}
           </div>
 
@@ -5137,6 +5267,19 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                 <Field label="Loss Risk %"><NumInput value={cfg.profitShieldLossRiskPct} onChange={onChange("profitShieldLossRiskPct")} step="1" min="0" max="100" color="violet" /></Field>
                 <Field label="Capital Floor %"><NumInput value={cfg.profitShieldCapitalFloorPct} onChange={onChange("profitShieldCapitalFloorPct")} step="0.5" min="0" max="100" color="violet" /></Field>
                 <Field label="Max Risk %"><NumInput value={cfg.profitShieldMaxRiskPct} onChange={onChange("profitShieldMaxRiskPct")} step="0.1" min="0" max="100" color="violet" /></Field>
+                <div className="col-span-2 mt-1 rounded-md border border-violet-500/15 bg-zinc-950/35 px-2.5 py-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[10px] font-semibold text-violet-200">Recovery Window</span>
+                    <button type="button" onClick={() => setCfg((c) => ({ ...c, profitShieldRecoveryEnabled: !c.profitShieldRecoveryEnabled }))} className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border transition-colors ${cfg.profitShieldRecoveryEnabled ? "bg-violet-500/15 text-violet-300 border-violet-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.profitShieldRecoveryEnabled ? "ON" : "OFF"}</button>
+                  </div>
+                  {cfg.profitShieldRecoveryEnabled && (
+                    <div className="grid grid-cols-2 gap-2 mt-2">
+                      <Field label="Recovery Risk %"><NumInput value={cfg.profitShieldRecoveryRiskPct} onChange={onChange("profitShieldRecoveryRiskPct")} step="1" min="0" max="100" color="violet" /></Field>
+                      <Field label="Max Recovery Trades"><NumInput value={cfg.profitShieldRecoveryMaxTrades} onChange={onChange("profitShieldRecoveryMaxTrades")} step="1" min="1" color="violet" /></Field>
+                      <Field label="Recovery Capture %"><NumInput value={cfg.profitShieldRecoveryCapturePct} onChange={onChange("profitShieldRecoveryCapturePct")} step="1" min="0" max="100" color="violet" /></Field>
+                    </div>
+                  )}
+                </div>
               </>
             ) : cfg.cascadeMode === "profitCumulative" ? (
               <> 
@@ -7431,6 +7574,19 @@ export default function RiskSimulator() {
                         <div className="min-w-0"><Field label="Loss Risk %"><NumInput value={cfg.profitShieldLossRiskPct} onChange={setField("profitShieldLossRiskPct")} step="1" min="0" max="100" color="violet" /></Field></div>
                         <div className="min-w-0"><Field label="Capital Floor %"><NumInput value={cfg.profitShieldCapitalFloorPct} onChange={setField("profitShieldCapitalFloorPct")} step="0.5" min="0" max="100" color="violet" /></Field></div>
                         <div className="min-w-0"><Field label="Max Risk %"><NumInput value={cfg.profitShieldMaxRiskPct} onChange={setField("profitShieldMaxRiskPct")} step="0.1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="col-span-2 mt-1 rounded-md border border-violet-500/15 bg-zinc-950/35 px-2.5 py-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[10px] font-semibold text-violet-200">Recovery Window</span>
+                            <button type="button" onClick={() => setCfg((c) => ({ ...c, profitShieldRecoveryEnabled: !c.profitShieldRecoveryEnabled }))} className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border transition-colors ${cfg.profitShieldRecoveryEnabled ? "bg-violet-500/15 text-violet-300 border-violet-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.profitShieldRecoveryEnabled ? "ON" : "OFF"}</button>
+                          </div>
+                          {cfg.profitShieldRecoveryEnabled && (
+                            <div className="grid grid-cols-2 gap-2 mt-2">
+                              <div className="min-w-0"><Field label="Recovery Risk %"><NumInput value={cfg.profitShieldRecoveryRiskPct} onChange={setField("profitShieldRecoveryRiskPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                              <div className="min-w-0"><Field label="Max Recovery Trades"><NumInput value={cfg.profitShieldRecoveryMaxTrades} onChange={setField("profitShieldRecoveryMaxTrades")} step="1" min="1" color="violet" /></Field></div>
+                              <div className="min-w-0"><Field label="Recovery Capture %"><NumInput value={cfg.profitShieldRecoveryCapturePct} onChange={setField("profitShieldRecoveryCapturePct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     ) : cfg.cascadeMode === "profitCumulative" ? (
                       <>
