@@ -2119,6 +2119,7 @@ function MultiSimTooltip({ active, payload, label }) {
 // a bar loads that exact run's trade sequence into the stats, chart and
 // Trade Log above — same recalculation path as clicking a Scenario card.
 function MultiSimHistogram({ runs, selectedRunIdx, onSelectRun }) {
+  const [histogramFilter, setHistogramFilter] = useState("all");
   if (!runs || !runs.length) return null;
 
   const winRuns = runs.filter((r) => r.result.netPL >= 0);
@@ -2126,26 +2127,64 @@ function MultiSimHistogram({ runs, selectedRunIdx, onSelectRun }) {
   const avgProfit = winRuns.length ? winRuns.reduce((s, r) => s + r.result.netPL, 0) / winRuns.length : null;
   const avgLoss = lossRuns.length ? lossRuns.reduce((s, r) => s + r.result.netPL, 0) / lossRuns.length : null;
 
-  const data = runs.map((r) => ({
+  const filteredRuns = runs.filter((r) => {
+    if (histogramFilter === "profit") return r.result.netPL >= 0;
+    if (histogramFilter === "loss") return r.result.netPL < 0;
+    return true;
+  });
+
+  const data = filteredRuns.map((r) => ({
     index: r.index,
     netPL: r.result.netPL,
     win: r.result.netPL >= 0,
     sequence: Array.isArray(r.winLossSeq) ? r.winLossSeq : [],
     avgProfitLine: avgProfit,
     avgLossLine: avgLoss,
+    run: r,
   }));
+
+  const filterLabel = histogramFilter === "profit"
+    ? "Profitable Scenarios"
+    : histogramFilter === "loss"
+    ? "Losing Scenarios"
+    : "All Scenarios";
 
   return (
     <div className={`${CARD} overflow-hidden`}>
-      <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-zinc-800">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 border-b border-zinc-800">
         <span className="flex items-center gap-2 text-[13px] font-semibold text-zinc-200">
           <BarChart2 size={14} className="text-zinc-300" />
           Simulation Outcomes
         </span>
-        <span className="flex items-center gap-3">
-          <LegendDot color="bg-[#31C950]" label="Profitable" />
-          <LegendDot color="bg-[#F54927]" label="Losing" />
-        </span>
+        <div className="flex items-center gap-2">
+          <div className="inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-zinc-900 border border-zinc-800">
+            {[
+              ["all", "All"],
+              ["profit", "All Profit"],
+              ["loss", "All Loss"],
+            ].map(([key, label]) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setHistogramFilter(key)}
+                className={`px-2.5 py-1 rounded-md text-[10px] font-mono transition-colors ${
+                  histogramFilter === key
+                    ? "bg-zinc-800 text-zinc-200 border border-zinc-700"
+                    : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          <span className="hidden sm:flex items-center gap-3">
+            <LegendDot color="bg-[#31C950]" label="Profitable" />
+            <LegendDot color="bg-[#F54927]" label="Losing" />
+          </span>
+        </div>
+      </div>
+      <div className="px-4 pt-2 text-[9px] font-mono text-zinc-500">
+        {filterLabel} · {data.length.toLocaleString("en-IN")} shown
       </div>
 
       <div className="h-60 sm:h-72 px-2 pt-6 pb-2">
@@ -2179,7 +2218,7 @@ function MultiSimHistogram({ runs, selectedRunIdx, onSelectRun }) {
                   strokeWidth={selectedRunIdx === d.index ? 1.5 : 0}
                   radius={[3, 3, 0, 0]}
                   style={{ cursor: "pointer" }}
-                  onClick={() => onSelectRun(runs[i])}
+                  onClick={() => onSelectRun(d.run)}
                 />
               ))}
             </Bar>
