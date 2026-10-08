@@ -5275,7 +5275,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                   {cfg.profitShieldRecoveryEnabled && (
                     <div className="grid grid-cols-2 gap-2 mt-2">
                       <Field label="Recovery Risk %"><NumInput value={cfg.profitShieldRecoveryRiskPct} onChange={onChange("profitShieldRecoveryRiskPct")} step="1" min="0" max="100" color="violet" /></Field>
-                      <Field label="Max Recovery Trades"><NumInput value={cfg.profitShieldRecoveryMaxTrades} onChange={onChange("profitShieldRecoveryMaxTrades")} step="1" min="1" color="violet" /></Field>
+                      <Field label="Max Recovery"><NumInput value={cfg.profitShieldRecoveryMaxTrades} onChange={onChange("profitShieldRecoveryMaxTrades")} step="1" min="1" color="violet" /></Field>
                       <Field label="Recovery Capture %"><NumInput value={cfg.profitShieldRecoveryCapturePct} onChange={onChange("profitShieldRecoveryCapturePct")} step="1" min="0" max="100" color="violet" /></Field>
                     </div>
                   )}
@@ -7582,7 +7582,7 @@ export default function RiskSimulator() {
                           {cfg.profitShieldRecoveryEnabled && (
                             <div className="grid grid-cols-2 gap-2 mt-2">
                               <div className="min-w-0"><Field label="Recovery Risk %"><NumInput value={cfg.profitShieldRecoveryRiskPct} onChange={setField("profitShieldRecoveryRiskPct")} step="1" min="0" max="100" color="violet" /></Field></div>
-                              <div className="min-w-0"><Field label="Max Recovery Trades"><NumInput value={cfg.profitShieldRecoveryMaxTrades} onChange={setField("profitShieldRecoveryMaxTrades")} step="1" min="1" color="violet" /></Field></div>
+                              <div className="min-w-0"><Field label="Max Recovery"><NumInput value={cfg.profitShieldRecoveryMaxTrades} onChange={setField("profitShieldRecoveryMaxTrades")} step="1" min="1" color="violet" /></Field></div>
                               <div className="min-w-0"><Field label="Recovery Capture %"><NumInput value={cfg.profitShieldRecoveryCapturePct} onChange={setField("profitShieldRecoveryCapturePct")} step="1" min="0" max="100" color="violet" /></Field></div>
                             </div>
                           )}
