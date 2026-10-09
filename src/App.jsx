@@ -2853,14 +2853,12 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
 
               <div className="space-y-2">
                 <div className="text-[10px] uppercase tracking-wide text-zinc-500">Simulation View</div>
-                <div className="grid grid-cols-3 sm:grid-cols-6 gap-1 p-1 rounded-xl bg-zinc-950/70 border border-zinc-800/90">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 p-1 rounded-xl bg-zinc-950/70 border border-zinc-800/90">
                   {[
                     ["outcomes", "Outcomes", "Net P/L for each run"],
                     ["paths", "Path", "Cumulative P/L path"],
                     ["final", "Final", "Final capital distribution"],
                     ["dd", "DD", "Maximum drawdown distribution"],
-                    ["streaks", "Streaks", "Loss-streak episode frequency"],
-                    ["longest", "Longest", "Longest loss streak per run"],
                   ].map(([key, label, title]) => (
                     <button
                       key={key}
@@ -3367,7 +3365,7 @@ function summarizeRecoveryAnalyses(analyses) {
 }
 
 function RecoveryTimeAnalysis({ title = "Drawdown Recovery Time", trades, initialCapital, runs = null, summary = null, breakEvenSummary = null, compact = false }) {
-  const [collapsed, setCollapsed] = useState(false);
+  const [collapsed, setCollapsed] = useState(true);
   const [analysisMode, setAnalysisMode] = useState("drawdown");
 
   let drawdownRecovery = summary;
@@ -6391,6 +6389,18 @@ export default function RiskSimulator() {
     };
   }, [mode, cfg, result, activeRunLabel, batchResult, selectedBatchRunIdx, scenarioInput]);
 
+  // Keep the selected strategy workspace live while editing Win Rate. The
+  // click handler also commits synchronously before any destination workspace
+  // is restored, covering quick tab switches before this effect runs.
+  useEffect(() => {
+    if (mode !== "sweep") return;
+    const baseMode = sweepBaseMode === "fno" ? "fno" : "single";
+    strategyWorkspaceRef.current[baseMode] = {
+      ...strategyWorkspaceRef.current[baseMode],
+      cfg: { ...cfg },
+    };
+  }, [mode, cfg, sweepBaseMode]);
+
   // Persist the complete Builder workspace separately from Single/F&O.
   // The workspace includes the selected combination, Builder matrix result,
   // visible Trade Log/result and the exact calibrated config used by that
@@ -6440,6 +6450,20 @@ export default function RiskSimulator() {
   // (risk budget + trade range) are preserved separately.
   const handleModeChange = useCallback(
     (nextMode) => {
+      // Explicitly persist Win Rate edits at the tab-click boundary. Do not
+      // rely only on the passive useEffect below: when the user changes a
+      // field and immediately switches tabs, the destination can otherwise
+      // restore an older strategy snapshot. Sweep edits belong to whichever
+      // strategy (Single Run or Day / F&O) was selected when Win Rate opened.
+      if (mode === "sweep") {
+        const sweepSourceMode = sweepBaseMode === "fno" ? "fno" : "single";
+        const latestSweepCfg = { ...cfg };
+        strategyWorkspaceRef.current[sweepSourceMode] = {
+          ...strategyWorkspaceRef.current[sweepSourceMode],
+          cfg: latestSweepCfg,
+        };
+      }
+
       // Explicitly save the workspace we are leaving at the exact click.
       if (mode === "builder") {
         builderWorkspaceRef.current = {
@@ -6498,6 +6522,34 @@ export default function RiskSimulator() {
         setSweepBaseMode(nextMode);
         setStrategyBaseMode(nextMode);
         setMode(nextMode);
+        return;
+      }
+
+      if (nextMode === "sweep") {
+        // Re-clicking the active tab should not discard an existing sweep result.
+        if (mode === "sweep") return;
+        const baseMode = mode === "single" || mode === "fno"
+          ? mode
+          : mode === "builder"
+          ? (strategyBaseMode === "fno" ? "fno" : "single")
+          : mode === "bankroll"
+          ? (bankrollBaseMode === "fno" ? "fno" : "single")
+          : (sweepBaseMode === "fno" ? "fno" : "single");
+        const sourceCfg = strategyWorkspaceRef.current[baseMode]?.cfg || cfg;
+        const nextSweepCfg = {
+          ...sourceCfg,
+          // Sweep-only controls keep their existing values when switching tabs.
+          sweepStep: cfg.sweepStep ?? DEFAULTS.sweepStep,
+          sweepRuns: cfg.sweepRuns ?? DEFAULTS.sweepRuns,
+        };
+        setCfg(nextSweepCfg);
+        setSweepBaseMode(baseMode);
+        setStrategyBaseMode(baseMode);
+        setSweep(null);
+        setResult(null);
+        setBatchResult(null);
+        setSelectedBatchRunIdx(null);
+        setMode("sweep");
         return;
       }
 
@@ -6617,6 +6669,7 @@ export default function RiskSimulator() {
       strategyBaseMode,
       scenarioInput,
       bankrollBaseMode,
+      sweepBaseMode,
     ]
   );
 
