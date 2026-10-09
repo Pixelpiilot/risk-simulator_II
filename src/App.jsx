@@ -2472,6 +2472,357 @@ function MultiSimPathsChart({ runs, selectedRunIdx, onSelectRun }) {
 }
 
 
+// Distribution views for Multi Simulations. Capital and drawdown use equal-width
+// histogram bins; loss-streak views use exact integer streak lengths. Bar clicks
+// select a real run from the selected bucket so the existing Trade Log flow stays intact.
+function multiSimExecutedOutcomes(run) {
+  return (Array.isArray(run?.result?.trades) ? run.result.trades : [])
+    .filter((trade) => typeof trade?.win === "boolean")
+    .map((trade) => trade.win);
+}
+
+function multiSimLossStreakLengths(run) {
+  const outcomes = multiSimExecutedOutcomes(run);
+  const lengths = [];
+  let current = 0;
+  for (const isWin of outcomes) {
+    if (isWin) {
+      if (current > 0) lengths.push(current);
+      current = 0;
+    } else {
+      current += 1;
+    }
+  }
+  if (current > 0) lengths.push(current);
+  return lengths;
+}
+
+function multiSimQuantile(values, p) {
+  if (!values?.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const position = (sorted.length - 1) * p;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
+function multiSimHistogramBins(entries, metric, initialCapital) {
+  if (!entries.length) return [];
+  const values = entries.map((entry) => entry.value).filter(Number.isFinite);
+  if (!values.length) return [];
+  const min = values.reduce((current, value) => Math.min(current, value), Infinity);
+  const max = values.reduce((current, value) => Math.max(current, value), -Infinity);
+  if (Math.abs(max - min) < 1e-10) {
+    return [{
+      label: metric === "final" ? String(Math.round(min)) : `${min.toFixed(1)}`,
+      fullRange: metric === "final" ? `Final capital ₹${fmtMoney(min)}` : `Max drawdown ${min.toFixed(2)}%`,
+      count: entries.length,
+      value: entries.length,
+      min,
+      max,
+      midpoint: min,
+      mean: values.reduce((sum, value) => sum + value, 0) / values.length,
+      members: entries,
+      runs: entries.map((entry) => entry.run),
+    }];
+  }
+
+  const q1 = multiSimQuantile(values, 0.25);
+  const q3 = multiSimQuantile(values, 0.75);
+  const iqr = Math.max(0, q3 - q1);
+  const fdWidth = iqr > 0 ? (2 * iqr) / Math.cbrt(values.length) : 0;
+  const fdCount = fdWidth > 0 ? Math.ceil((max - min) / fdWidth) : Math.ceil(Math.sqrt(values.length));
+  const binCount = Math.max(1, Math.min(18, values.length, fdCount || 1));
+  const width = (max - min) / binCount;
+  const bins = Array.from({ length: binCount }, (_, index) => {
+    const lower = min + index * width;
+    const upper = index === binCount - 1 ? max : min + (index + 1) * width;
+    const members = entries.filter((entry) => {
+      if (index === binCount - 1) return entry.value >= lower && entry.value <= upper;
+      return entry.value >= lower && entry.value < upper;
+    });
+    const midpoint = (lower + upper) / 2;
+    const mean = members.length ? members.reduce((sum, entry) => sum + entry.value, 0) / members.length : midpoint;
+    const shortLower = metric === "final" ? String(Math.round(lower)) : lower.toFixed(1);
+    const shortUpper = metric === "final" ? String(Math.round(upper)) : upper.toFixed(1);
+    return {
+      label: `${shortLower}–${shortUpper}`,
+      fullRange: metric === "final"
+        ? `Final capital ₹${fmtMoney(lower)}–₹${fmtMoney(upper)}`
+        : `Max drawdown ${lower.toFixed(2)}%–${upper.toFixed(2)}%`,
+      count: members.length,
+      value: members.length,
+      min: lower,
+      max: upper,
+      midpoint,
+      mean,
+      members,
+      runs: members.map((entry) => entry.run),
+    };
+  });
+  // Empty ranges do not carry information; dropping them keeps the chart cleaner
+  // while each remaining label still discloses its exact, equal-width range.
+  return bins.filter((bin) => bin.count > 0);
+}
+
+function MultiSimDistributionTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const item = payload[0]?.payload;
+  if (!item) return null;
+  return (
+    <div className="bg-zinc-950/95 backdrop-blur-sm border border-zinc-700/80 rounded-xl px-3 py-2.5 shadow-2xl shadow-black/60 font-mono min-w-[165px] max-w-[250px]">
+      <div className="text-[10px] text-zinc-200 font-semibold mb-1.5">{item.fullRange || item.label}</div>
+      <div className="flex items-center justify-between gap-4 text-[10px]">
+        <span className="text-zinc-500">{item.countLabel || "Scenarios"}</span>
+        <span className="text-zinc-100 tabular-nums">{Number(item.count || 0).toLocaleString("en-IN")}</span>
+      </div>
+      {item.uniqueRunCount != null && (
+        <div className="flex items-center justify-between gap-4 text-[10px] mt-1">
+          <span className="text-zinc-500">Unique runs</span>
+          <span className="text-zinc-300 tabular-nums">{Number(item.uniqueRunCount).toLocaleString("en-IN")}</span>
+        </div>
+      )}
+      {item.mean != null && Number.isFinite(item.mean) && (
+        <div className="flex items-center justify-between gap-4 text-[10px] mt-1">
+          <span className="text-zinc-500">Bucket average</span>
+          <span className="text-zinc-300 tabular-nums">{item.metric === "dd" ? `${item.mean.toFixed(2)}%` : fmtMoney(item.mean)}</span>
+        </div>
+      )}
+      <div className="text-[9px] text-zinc-500 mt-2 pt-2 border-t border-zinc-800">Click bar to inspect a scenario</div>
+    </div>
+  );
+}
+
+function MultiSimDistributionChart({ mode, runs, selectedRunIdx, onSelectRun, initialCapital }) {
+  if (!runs?.length) return null;
+
+  const isFinal = mode === "final";
+  const isDD = mode === "dd";
+  const isStreaks = mode === "streaks";
+  const title = isFinal ? "Final Capital Distribution"
+    : isDD ? "Max Drawdown Distribution"
+    : isStreaks ? "Loss Streak Distribution"
+    : "Longest Loss Streak";
+  const subtitle = isFinal ? "Final account value across every simulation run"
+    : isDD ? "Per-run maximum peak-to-trough drawdown, measured in % of the running peak"
+    : isStreaks ? "Count of every consecutive-loss episode by its exact length across all runs"
+    : "One longest consecutive-loss streak per simulation run";
+
+  let data = [];
+  let summary = [];
+  let xAxisLabel = "";
+  let yAxisLabel = "Scenarios";
+
+  if (isFinal || isDD) {
+    const entries = runs.map((run) => ({
+      run,
+      value: isFinal
+        ? Number(run?.result?.finalCapital ?? initialCapital) || 0
+        : Math.max(0, Number(run?.result?.maxDD) || 0),
+    }));
+    data = multiSimHistogramBins(entries, isFinal ? "final" : "dd", initialCapital).map((bin) => ({
+      ...bin,
+      metric: isFinal ? "final" : "dd",
+      countLabel: "Scenarios",
+    }));
+    const values = entries.map((entry) => entry.value).sort((a, b) => a - b);
+    if (isFinal) {
+      const profitable = entries.filter((entry) => entry.value > Number(initialCapital || 0)).length;
+      summary = [
+        { label: "Median final", value: `₹${fmtMoney(multiSimQuantile(values, 0.5))}`, tone: multiSimQuantile(values, 0.5) >= Number(initialCapital || 0) ? "pos" : "neg" },
+        { label: "Profitable runs", value: `${profitable} / ${runs.length}`, tone: "neutral" },
+        { label: "P10–P90 range", value: `₹${fmtMoney(multiSimQuantile(values, 0.1))}–₹${fmtMoney(multiSimQuantile(values, 0.9))}`, tone: "neutral" },
+      ];
+      xAxisLabel = "Final capital (₹)";
+    } else {
+      summary = [
+        { label: "Median max DD", value: `${multiSimQuantile(values, 0.5).toFixed(2)}%`, tone: "neg" },
+        { label: "P90 max DD", value: `${multiSimQuantile(values, 0.9).toFixed(2)}%`, tone: "neg" },
+        { label: "Worst max DD", value: `${values.reduce((current, value) => Math.max(current, value), 0).toFixed(2)}%`, tone: "neg" },
+      ];
+      xAxisLabel = "Maximum drawdown (%)";
+    }
+  } else {
+    const grouped = new Map();
+    let allStreakEpisodes = 0;
+    runs.forEach((run) => {
+      const streaks = multiSimLossStreakLengths(run);
+      if (isStreaks) {
+        streaks.forEach((length) => {
+          allStreakEpisodes += 1;
+          if (!grouped.has(length)) grouped.set(length, { length, occurrences: 0, members: [] });
+          const group = grouped.get(length);
+          group.occurrences += 1;
+          group.members.push(run);
+        });
+      } else {
+        const longest = streaks.length ? Math.max(...streaks) : 0;
+        if (!grouped.has(longest)) grouped.set(longest, { length: longest, occurrences: 0, members: [] });
+        const group = grouped.get(longest);
+        group.occurrences += 1;
+        group.members.push(run);
+      }
+    });
+    const maxLength = [...grouped.keys()].reduce((current, value) => Math.max(current, value), 0);
+    data = Array.from({ length: maxLength + 1 }, (_, length) => {
+      const group = grouped.get(length) || { length, occurrences: 0, members: [] };
+      const members = group.members;
+      const distinctRuns = [...new Map(members.map((run) => [run.index, run])).values()];
+      return {
+        label: String(length),
+        fullRange: length === 0 ? "No losing streak" : `${length} consecutive loss${length === 1 ? "" : "es"}`,
+        value: isStreaks ? group.occurrences : members.length,
+        count: isStreaks ? group.occurrences : members.length,
+        countLabel: isStreaks ? "Streak episodes" : "Scenarios",
+        uniqueRunCount: isStreaks ? distinctRuns.length : undefined,
+        runs: distinctRuns,
+        members: distinctRuns.map((run) => ({ run, value: length })),
+        length,
+      };
+    }).filter((row) => row.count > 0);
+
+    const runLongestValues = runs.map((run) => {
+      const lengths = multiSimLossStreakLengths(run);
+      return lengths.length ? Math.max(...lengths) : 0;
+    }).sort((a, b) => a - b);
+    const streakOccurrencesByLength = [...grouped.values()];
+    const maxObserved = [...grouped.keys()].reduce((current, value) => Math.max(current, value), 0);
+    if (isStreaks) {
+      const uniqueRunsWithLosses = new Set(streakOccurrencesByLength.flatMap((group) => group.members.map((run) => run.index))).size;
+      summary = [
+        { label: "Loss streaks", value: allStreakEpisodes.toLocaleString("en-IN"), tone: "neg" },
+        { label: "Runs with losses", value: `${uniqueRunsWithLosses} / ${runs.length}`, tone: "neutral" },
+        { label: "Longest observed", value: `${maxObserved} trades`, tone: "neg" },
+      ];
+      xAxisLabel = "Consecutive losses in one episode";
+      yAxisLabel = "Streak episodes";
+    } else {
+      summary = [
+        { label: "Median longest", value: `${multiSimQuantile(runLongestValues, 0.5)} trades`, tone: "neg" },
+        { label: "P90 longest", value: `${multiSimQuantile(runLongestValues, 0.9)} trades`, tone: "neg" },
+        { label: "Worst streak", value: `${runLongestValues.reduce((current, value) => Math.max(current, value), 0)} trades`, tone: "neg" },
+      ];
+      xAxisLabel = "Longest losing streak per run (trades)";
+      yAxisLabel = "Scenarios";
+    }
+  }
+
+  const hasBars = data.some((item) => item.count > 0);
+  const pickRun = (item) => {
+    const members = item?.runs || item?.members?.map((member) => member.run) || [];
+    if (!members.length) return;
+    // For range buckets choose the scenario closest to the bucket midpoint.
+    // For exact streak buckets, choose the most negative final P/L among matches.
+    let chosen = members[0];
+    if (isFinal || isDD) {
+      const target = Number(item.midpoint ?? item.mean ?? 0);
+      for (const run of members) {
+        const value = isFinal
+          ? Number(run?.result?.finalCapital ?? initialCapital) || 0
+          : Math.max(0, Number(run?.result?.maxDD) || 0);
+        const chosenValue = isFinal
+          ? Number(chosen?.result?.finalCapital ?? initialCapital) || 0
+          : Math.max(0, Number(chosen?.result?.maxDD) || 0);
+        if (Math.abs(value - target) < Math.abs(chosenValue - target)) chosen = run;
+      }
+    } else {
+      chosen = [...members].sort((a, b) => (Number(a?.result?.netPL) || 0) - (Number(b?.result?.netPL) || 0))[0];
+    }
+    onSelectRun(chosen);
+  };
+
+  return (
+    <div className={`${CARD} overflow-hidden`}>
+      <div className="px-4 py-3 border-b border-zinc-800/90 bg-gradient-to-b from-zinc-900/45 to-transparent">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-[13px] font-semibold text-zinc-100">{title}</div>
+            <div className="text-[10px] text-zinc-500 mt-1 leading-relaxed">{subtitle}</div>
+          </div>
+          <div className="text-[9px] font-mono text-zinc-500 flex-none text-right">
+            {runs.length.toLocaleString("en-IN")} runs
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 mt-3">
+          {summary.map((item) => (
+            <div key={item.label} className="rounded-lg border border-zinc-800/80 bg-black/20 px-2.5 py-2 min-w-0">
+              <div className="text-[9px] uppercase tracking-wide text-zinc-600">{item.label}</div>
+              <div className={`mt-0.5 text-[11px] font-semibold tabular-nums break-words ${item.tone === "pos" ? "text-[#7CCF35]" : item.tone === "neg" ? "text-[#FF8904]" : "text-zinc-200"}`}>
+                {item.value}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      {hasBars ? (
+        <div className="h-64 sm:h-72 px-2 pt-4 pb-1">
+          <ResponsiveContainer width="100%" height="100%">
+            <ComposedChart data={data} margin={{ top: 8, right: 12, bottom: 26, left: 0 }} barCategoryGap="18%">
+              <CartesianGrid stroke="#CAD5E2" strokeOpacity={0.07} strokeDasharray="3 3" vertical={false} />
+              <XAxis
+                dataKey="label"
+                stroke="#737373"
+                fontSize={9}
+                tickLine={false}
+                axisLine={false}
+                interval={data.length > 12 ? Math.ceil(data.length / 10) - 1 : 0}
+                angle={data.length > 8 ? -22 : 0}
+                textAnchor={data.length > 8 ? "end" : "middle"}
+                height={data.length > 8 ? 42 : 28}
+              />
+              <YAxis
+                stroke="#737373"
+                fontSize={10}
+                tickLine={false}
+                axisLine={false}
+                width={48}
+                allowDecimals={false}
+                tickFormatter={(value) => Number(value).toLocaleString("en-IN")}
+              />
+              <Tooltip content={<MultiSimDistributionTooltip />} cursor={{ fill: "rgba(202,213,226,0.06)" }} />
+              <Bar dataKey="value" name={yAxisLabel} isAnimationActive={false} maxBarSize={34} radius={[3, 3, 0, 0]}>
+                {data.map((item, index) => {
+                  const selected = (item.runs || []).some((run) => run.index === selectedRunIdx);
+                  const color = isFinal
+                    ? (item.mean >= Number(initialCapital || 0) ? "#7CCF35" : "#FF692A")
+                    : isDD || item.length > 0 ? "#FF8904" : "#7CCF35";
+                  return (
+                    <Cell
+                      key={`${item.label}-${index}`}
+                      fill={color}
+                      fillOpacity={item.count > 0 ? 0.88 : 0.18}
+                      stroke={selected ? "#DDD6FF" : "none"}
+                      strokeWidth={selected ? 1.5 : 0}
+                      style={{ cursor: item.count > 0 ? "pointer" : "default" }}
+                      onClick={() => pickRun(item)}
+                    />
+                  );
+                })}
+              </Bar>
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+      ) : (
+        <div className="px-4 py-12 text-center text-[11px] text-zinc-500">
+          No losing streaks occurred in these runs.
+        </div>
+      )}
+      <div className="px-4 py-2 border-t border-zinc-800/80 text-[9px] text-zinc-600 font-mono space-y-1">
+        <div>{isStreaks
+          ? "Each bar counts a loss-streak episode; one run may contribute multiple episodes."
+          : mode === "longest"
+          ? "Each run contributes exactly one value: its longest consecutive-loss streak (0 if none)."
+          : isFinal
+          ? "Equal-width final-capital ranges; click a bar to inspect a representative run from that range."
+          : "Maximum drawdown is each run’s largest peak-to-trough decline as a percentage of its running peak."}</div>
+        <div className="text-zinc-700">X: {xAxisLabel} <span className="px-1.5">·</span> Y: {yAxisLabel}</div>
+      </div>
+    </div>
+  );
+}
+
+
 // Small clickable summary of one batch run, used by BatchRunSection for the
 // Max Profit / Max Loss / Max Drawdown scenario callouts. Clicking loads
 // that exact run's trade sequence into the stats/chart/Trade Log above.
@@ -2593,25 +2944,32 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
                 <MiniStat label="95% Return CI (Normal)" value={`${stats.ci95Low.toFixed(2)}% to ${stats.ci95High.toFixed(2)}%`} valueColor="#A3B3FF" />
               </div>
 
-              <div className="flex items-center justify-between gap-3">
+              <div className="space-y-2">
                 <div className="text-[10px] uppercase tracking-wide text-zinc-500">Simulation View</div>
-                <div className="inline-flex items-center gap-0.5 p-0.5 rounded-lg bg-zinc-900 border border-zinc-800">
-                  <button
-                    onClick={() => setChartMode("outcomes")}
-                    className={`px-2.5 py-1 rounded-md text-[10px] font-mono transition-colors ${
-                      chartMode === "outcomes" ? "bg-zinc-800 text-zinc-200 border border-zinc-700" : "text-zinc-500 hover:text-zinc-300 border border-transparent"
-                    }`}
-                  >
-                    Outcomes
-                  </button>
-                  <button
-                    onClick={() => setChartMode("paths")}
-                    className={`px-2.5 py-1 rounded-md text-[10px] font-mono transition-colors ${
-                      chartMode === "paths" ? "bg-zinc-800 text-zinc-200 border border-zinc-700" : "text-zinc-500 hover:text-zinc-300 border border-transparent"
-                    }`}
-                  >
-                    Cumulative path
-                  </button>
+                <div className="grid grid-cols-3 sm:grid-cols-6 gap-1 p-1 rounded-xl bg-zinc-950/70 border border-zinc-800/90">
+                  {[
+                    ["outcomes", "Outcomes", "Net P/L for each run"],
+                    ["paths", "Path", "Cumulative P/L path"],
+                    ["final", "Final", "Final capital distribution"],
+                    ["dd", "DD", "Maximum drawdown distribution"],
+                    ["streaks", "Streaks", "Loss-streak episode frequency"],
+                    ["longest", "Longest", "Longest loss streak per run"],
+                  ].map(([key, label, title]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      title={title}
+                      aria-label={title}
+                      onClick={() => setChartMode(key)}
+                      className={`min-w-0 px-2 py-2 rounded-lg text-[10px] sm:text-[11px] font-mono transition-colors ${
+                        chartMode === key
+                          ? "bg-zinc-800 text-zinc-100 border border-zinc-700 shadow-sm"
+                          : "text-zinc-500 hover:text-zinc-300 border border-transparent"
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
                 </div>
               </div>
 
@@ -2621,11 +2979,19 @@ function BatchRunSection({ mode, cfg, batchResult, onRunBatch, onClearBatch, onS
                   selectedRunIdx={selectedRunIdx}
                   onSelectRun={onSelectRun}
                 />
-              ) : (
+              ) : chartMode === "paths" ? (
                 <MultiSimPathsChart
                   runs={batchResult.runs}
                   selectedRunIdx={selectedRunIdx}
                   onSelectRun={onSelectRun}
+                />
+              ) : (
+                <MultiSimDistributionChart
+                  mode={chartMode}
+                  runs={batchResult.runs}
+                  selectedRunIdx={selectedRunIdx}
+                  onSelectRun={onSelectRun}
+                  initialCapital={cfg.initialCapital}
                 />
               )}
 
