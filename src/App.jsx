@@ -67,8 +67,8 @@ const DEFAULTS = {
   profitShieldRecoveryRiskPct: 50,
   profitShieldRecoveryMaxTrades: 4,
   profitShieldRecoveryCapturePct: 100,
-  // On Profit Reserve: add the full positive net win to Available Reserve,
-  // allocate from latest win / remaining reserve, then use a bounded Base Risk cycle.
+  // On Profit Reserve: each positive net win replaces the active Available Reserve
+  // with that latest win; losses consume only that win's remaining reserve before Base Risk cycling.
   profitReserveWinAllocationPct: 50,
   profitReserveLossRiskPct: 50,
   profitReserveBaseRiskAllocationPct: 50,
@@ -899,13 +899,13 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     if (cfg.cascadeMode === "profitReserve") {
       const epsilon = Math.max(1e-12, Math.abs(BASE_RISK_AMT) * 1e-10);
       if (netPL > 0) {
-        // Every positive NET win is added to Available Reserve. The next trade
-        // is sized from this latest winning trade's net profit × allocation %.
-        // This mode does not lock or withhold any portion of a positive net win.
+        // Every positive NET win resets Available Reserve to that latest WIN only.
+        // Older, unused win pools do not accumulate. The next trade is sized
+        // from this winning trade's net profit × allocation %.
         profitReserveWinningNetProfit = netPL;
         profitReserveLastWinningNetProfit = netPL;
         profitReserveLastOutcome = "win";
-        profitReserveAvailable += netPL;
+        profitReserveAvailable = netPL;
         profitReserveBaseCycleActive = false;
         profitReserveBaseCycleRemaining = BASE_RISK_AMT;
       } else {
@@ -1571,13 +1571,13 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     if (cfg.cascadeMode === "profitReserve") {
       const epsilon = Math.max(1e-12, Math.abs(BASE_RISK_AMT) * 1e-10);
       if (netPL > 0) {
-        // Every positive NET win is added to Available Reserve. The next trade
-        // is sized from this latest winning trade's net profit × allocation %.
-        // This mode does not lock or withhold any portion of a positive net win.
+        // Every positive NET win resets Available Reserve to that latest WIN only.
+        // Older, unused win pools do not accumulate. The next trade is sized
+        // from this winning trade's net profit × allocation %.
         profitReserveWinningNetProfit = netPL;
         profitReserveLastWinningNetProfit = netPL;
         profitReserveLastOutcome = "win";
-        profitReserveAvailable += netPL;
+        profitReserveAvailable = netPL;
         profitReserveBaseCycleActive = false;
         profitReserveBaseCycleRemaining = BASE_RISK_AMT;
       } else {
