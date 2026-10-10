@@ -67,8 +67,9 @@ const DEFAULTS = {
   profitShieldRecoveryRiskPct: 50,
   profitShieldRecoveryMaxTrades: 4,
   profitShieldRecoveryCapturePct: 100,
-  // On Profit Reserve: each positive net win replaces the active Available Reserve
-  // with that latest win; losses consume only that win's remaining reserve before Base Risk cycling.
+  // On Profit Reserve: each positive net win resets Available Reserve to that latest win.
+  // Each trade consumes the unadjusted allocation slice before execution; signed
+  // adjustments change the executed risk only. Loss Net P/L is not debited twice.
   profitReserveWinAllocationPct: 50,
   profitReserveLossRiskPct: 50,
   profitReserveBaseRiskAllocationPct: 50,
@@ -673,6 +674,8 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     let profitReserveRiskTarget = null;
     let profitReserveGuard = null;
     let profitReserveFallbackReason = null;
+    let profitReservePlannedPoolConsumption = 0;
+    let profitReservePoolConsumed = 0;
 
     if (Array.isArray(explicitRiskPlan)) {
       // Builder mode can supply an explicit, already-allocated risk plan.
@@ -721,14 +724,17 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
 
       if (profitReserveAvailable > epsilon) {
         if (profitReserveLastOutcome === "win" && profitReserveLastWinningNetProfit > 0) {
-          // WIN: risk starts from the most recent positive net WIN only.
+          // WIN: calculate the base slice from the latest positive net WIN only.
+          // The signed modifier changes the requested risk, not the unadjusted
+          // allocation slice consumed from the available profit pool.
           reserveBaseAllocation = profitReserveLastWinningNetProfit * (reserveSettings.winAllocationPct / 100);
           reserveCandidateRisk = Math.min(
             profitReserveAvailable,
             applyProfitReserveRiskAdjustment(reserveBaseAllocation, reserveSettings.winAllocationAdjustPct)
           );
         } else {
-          // LOSS: risk uses only the remaining profit from the latest win.
+          // LOSS: calculate from the remaining unallocated profit reserve.
+          // The adjustment modifies the risk target but does not alter the base slice.
           reserveBaseAllocation = profitReserveAvailable * (reserveSettings.lossRiskPct / 100);
           reserveCandidateRisk = Math.min(
             profitReserveAvailable,
@@ -740,7 +746,10 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       if (reserveCandidateRisk !== null && reserveCandidateRisk >= minimumVisibleRisk) {
         riskAmt = reserveCandidateRisk;
         profitReserveRiskSource = "profitReserve";
+        // Keep the full pool-before-allocation for safety checks. Deduct only
+        // the unadjusted base slice before executing this trade.
         profitReservePoolLimit = profitReserveAvailable;
+        profitReservePlannedPoolConsumption = Math.min(profitReserveAvailable, reserveBaseAllocation);
       } else {
         // FIX: a tiny positive pool can otherwise produce 0.00 displayed risk
         // indefinitely (especially when trading costs nearly consume the last
@@ -879,7 +888,14 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       break;
     }
 
-   
+    // Debit the unadjusted base allocation before executing the trade. Signed
+    // allocation changes modify the target risk only; this pool is not reduced
+    // a second time by the realized loss on the same trade.
+    if (cfg.cascadeMode === "profitReserve" && profitReserveRiskSource === "profitReserve") {
+      profitReservePoolConsumed = Math.min(profitReserveAvailable, profitReservePlannedPoolConsumption);
+      profitReserveAvailable = Math.max(0, profitReserveAvailable - profitReservePoolConsumed);
+    }
+
     const entryPrice = price + (cfg.entrySpread || 0);
     const isWin = !!winLossSeq[i - 1];
     // Draw one RR realization per trade in Range mode. Losses remain -1R.
@@ -952,7 +968,6 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
         profitShieldRecoveryTradesUsed = shieldSettings.recoveryMaxTrades;
       }
     }
-    let profitReservePoolConsumed = 0;
     let profitReserveWinningNetProfit = 0;
     if (cfg.cascadeMode === "profitReserve") {
       const epsilon = Math.max(1e-12, Math.abs(BASE_RISK_AMT) * 1e-10);
@@ -970,10 +985,10 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       } else {
         profitReserveLastWinningNetProfit = 0;
         profitReserveLastOutcome = "loss";
-        const actualLoss = Math.max(0, -netPL);
         if (profitReserveRiskSource === "profitReserve") {
-          profitReservePoolConsumed = Math.min(profitReserveAvailable, actualLoss);
-          profitReserveAvailable = Math.max(0, profitReserveAvailable - actualLoss);
+          // The unadjusted base allocation was already consumed before execution.
+          // Do not debit actual Net P/L a second time; keep the unallocated portion
+          // of the previous win as the pool for the next LOSS allocation.
           if (profitReserveAvailable <= epsilon) {
             profitReserveAvailable = 0;
             profitReserveBaseCycleActive = false;
@@ -1374,6 +1389,8 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     let profitReserveRiskTarget = null;
     let profitReserveGuard = null;
     let profitReserveFallbackReason = null;
+    let profitReservePlannedPoolConsumption = 0;
+    let profitReservePoolConsumed = 0;
 
     if (Array.isArray(explicitRiskPlan)) {
       // Builder supplies a final risk allocation; all Day/F&O trading, costs
@@ -1413,12 +1430,14 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
 
       if (profitReserveAvailable > epsilon) {
         if (profitReserveLastOutcome === "win" && profitReserveLastWinningNetProfit > 0) {
+          // WIN allocation from the most recent winning trade only.
           reserveBaseAllocation = profitReserveLastWinningNetProfit * (reserveSettings.winAllocationPct / 100);
           reserveCandidateRisk = Math.min(
             profitReserveAvailable,
             applyProfitReserveRiskAdjustment(reserveBaseAllocation, reserveSettings.winAllocationAdjustPct)
           );
         } else {
+          // LOSS allocation from the remaining unallocated profit reserve.
           reserveBaseAllocation = profitReserveAvailable * (reserveSettings.lossRiskPct / 100);
           reserveCandidateRisk = Math.min(
             profitReserveAvailable,
@@ -1430,7 +1449,9 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       if (reserveCandidateRisk !== null && reserveCandidateRisk >= minimumVisibleRisk) {
         targetRiskAmt = reserveCandidateRisk;
         profitReserveRiskSource = "profitReserve";
+        // Record pool before allocation, but consume only the unadjusted base slice.
         profitReservePoolLimit = profitReserveAvailable;
+        profitReservePlannedPoolConsumption = Math.min(profitReserveAvailable, reserveBaseAllocation);
       } else {
         if (reserveCandidateRisk !== null && reserveCandidateRisk > 0) {
           profitReserveFallbackReason = `Available reserve could only allocate ${fmtMoney(reserveCandidateRisk)} risk, below the minimum visible risk; switched to Base Risk Cycle.`;
@@ -1536,7 +1557,8 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     }
     // On Profit Reserve follows the configured risk allocation target. F&O
     // sizing below floors to executable whole units so it never rounds risk up.
-    // Realized costs are included in Net P/L and in the remaining reserve.
+    // Realized costs affect capital and a new winning reserve, but do not debit
+    // a loss from the reserve a second time after its base slice was consumed.
     if (cfg.cascadeMode === "profitReserve" && targetRiskAmt <= 1e-12) {
       stopped = true;
       stopReason = `On Profit Reserve calculated zero risk for Trade ${i}; increase an allocation percentage or available reserve.`;
@@ -1587,6 +1609,13 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       stopped = true;
       stopReason = `Trade ${i} risk (${fmtMoney(riskAmt)}, ${units} ${unitLabel}${units === 1 ? "" : "s"}) exceeded ${cfg.perTradeCapPct}% of current capital (${fmtMoney(capital)}).`;
       break;
+    }
+
+    // Day/F&O consumes the unadjusted reserve slice after whole-unit sizing and
+    // caps pass. Realized costs affect Net P/L but do not debit this reserve twice.
+    if (cfg.cascadeMode === "profitReserve" && profitReserveRiskSource === "profitReserve") {
+      profitReservePoolConsumed = Math.min(profitReserveAvailable, profitReservePlannedPoolConsumption);
+      profitReserveAvailable = Math.max(0, profitReserveAvailable - profitReservePoolConsumed);
     }
 
     const entryPrice = price + (cfg.fnoEntrySpread || 0);
@@ -1667,7 +1696,6 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
         profitShieldRecoveryTradesUsed = shieldSettings.recoveryMaxTrades;
       }
     }
-    let profitReservePoolConsumed = 0;
     let profitReserveWinningNetProfit = 0;
     if (cfg.cascadeMode === "profitReserve") {
       const epsilon = Math.max(1e-12, Math.abs(BASE_RISK_AMT) * 1e-10);
@@ -1685,10 +1713,10 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       } else {
         profitReserveLastWinningNetProfit = 0;
         profitReserveLastOutcome = "loss";
-        const actualLoss = Math.max(0, -netPL);
         if (profitReserveRiskSource === "profitReserve") {
-          profitReservePoolConsumed = Math.min(profitReserveAvailable, actualLoss);
-          profitReserveAvailable = Math.max(0, profitReserveAvailable - actualLoss);
+          // The unadjusted base allocation was already consumed before execution.
+          // Do not debit actual Net P/L a second time; keep the unallocated portion
+          // of the previous win as the pool for the next LOSS allocation.
           if (profitReserveAvailable <= epsilon) {
             profitReserveAvailable = 0;
             profitReserveBaseCycleActive = false;
@@ -6706,7 +6734,7 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                   <td className="px-3 py-1.5">
                     <TradeResultBadge win={t.win} />
                   </td>
-                  <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Reserve consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after trade " + fmtMoney(t.profitReserveAvailable) + " · Actual Net P/L includes fees, slippage and spread; the available reserve is updated from that Net P/L.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                  <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                   <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                   <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                   <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmtMoney(t.grossPL)}</td>
@@ -8924,7 +8952,7 @@ export default function RiskSimulator() {
                             >
                               <TradeResultBadge win={t.win} />
                             </td>
-                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300">BUDGET</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Reserve consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after trade " + fmtMoney(t.profitReserveAvailable) + " · Actual Net P/L includes fees, slippage and spread; the available reserve is updated from that Net P/L.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300">BUDGET</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                             <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>
@@ -9192,7 +9220,7 @@ export default function RiskSimulator() {
                             >
                               <TradeResultBadge win={t.win} />
                             </td>
-                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Reserve consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after trade " + fmtMoney(t.profitReserveAvailable) + " · Actual Net P/L includes fees, slippage and spread; the available reserve is updated from that Net P/L.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots}</td>
                             <td className="px-3 py-1.5 text-right">{t.quantity}</td>
