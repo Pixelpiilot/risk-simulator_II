@@ -1996,11 +1996,11 @@ const SECTION_COLORS = {
   indigo: { chip: "bg-indigo-500/15 text-indigo-400", text: "text-indigo-300", ring: "focus:border-indigo-500/70 focus:ring-indigo-500/20", dot: "bg-indigo-500" },
 };
 
-function Field({ label, children }) {
+function Field({ label, children, labelClassName = "" }) {
   return (
     <div className="mb-3">
-      <div className="mb-1.5">
-        <label className="text-xs text-zinc-400">{label}</label>
+      <div className={`mb-1.5 ${labelClassName}`}>
+        <label className={`text-xs text-zinc-400 ${labelClassName ? "block leading-4" : ""}`}>{label}</label>
       </div>
       {children}
     </div>
@@ -5883,9 +5883,9 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
               </>
             ) : cfg.cascadeMode === "profitReserve" ? (
               <>
-                <Field label="Win Profit Allocation %"><NumInput value={cfg.profitReserveWinAllocationPct} onChange={onChange("profitReserveWinAllocationPct")} step="1" min="0" max="100" color="violet" /></Field>
-                <Field label="Loss Reserve Risk %"><NumInput value={cfg.profitReserveLossRiskPct} onChange={onChange("profitReserveLossRiskPct")} step="1" min="0" max="100" color="violet" /></Field>
-                <Field label="Base Risk Allocation %"><NumInput value={cfg.profitReserveBaseRiskAllocationPct} onChange={onChange("profitReserveBaseRiskAllocationPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Win Profit Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveWinAllocationPct} onChange={onChange("profitReserveWinAllocationPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Loss Reserve Risk %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveLossRiskPct} onChange={onChange("profitReserveLossRiskPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Base Risk Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveBaseRiskAllocationPct} onChange={onChange("profitReserveBaseRiskAllocationPct")} step="1" min="0" max="100" color="violet" /></Field>
               </>
             ) : cfg.cascadeMode === "profitCumulative" ? (
               <> 
@@ -8237,9 +8237,9 @@ export default function RiskSimulator() {
                       </div>
                     ) : cfg.cascadeMode === "profitReserve" ? (
                       <div className="grid grid-cols-2 gap-2 min-w-0">
-                        <div className="min-w-0"><Field label="Win Profit Allocation %"><NumInput value={cfg.profitReserveWinAllocationPct} onChange={setField("profitReserveWinAllocationPct")} step="1" min="0" max="100" color="violet" /></Field></div>
-                        <div className="min-w-0"><Field label="Loss Reserve Risk %"><NumInput value={cfg.profitReserveLossRiskPct} onChange={setField("profitReserveLossRiskPct")} step="1" min="0" max="100" color="violet" /></Field></div>
-                        <div className="min-w-0"><Field label="Base Risk Allocation %"><NumInput value={cfg.profitReserveBaseRiskAllocationPct} onChange={setField("profitReserveBaseRiskAllocationPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Win Profit Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveWinAllocationPct} onChange={setField("profitReserveWinAllocationPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Loss Reserve Risk %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveLossRiskPct} onChange={setField("profitReserveLossRiskPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Base Risk Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveBaseRiskAllocationPct} onChange={setField("profitReserveBaseRiskAllocationPct")} step="1" min="0" max="100" color="violet" /></Field></div>
                       </div>
                     ) : cfg.cascadeMode === "profitCumulative" ? (
                       <>
