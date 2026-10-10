@@ -72,6 +72,12 @@ const DEFAULTS = {
   profitReserveWinAllocationPct: 50,
   profitReserveLossRiskPct: 50,
   profitReserveBaseRiskAllocationPct: 50,
+  // Signed changes modify each calculated allocation amount, not the configured
+  // allocation percentage: +20 means risk × 1.20; -20 means risk × 0.80.
+  // Zero preserves the original On Profit Reserve behavior exactly.
+  profitReserveWinAllocationAdjustPct: 0,
+  profitReserveLossAllocationAdjustPct: 0,
+  profitReserveBaseCycleAdjustPct: 0,
   winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
@@ -360,6 +366,9 @@ const BUILDER_RISK_ALLOCATION_KEYS = [
   "profitReserveWinAllocationPct",
   "profitReserveLossRiskPct",
   "profitReserveBaseRiskAllocationPct",
+  "profitReserveWinAllocationAdjustPct",
+  "profitReserveLossAllocationAdjustPct",
+  "profitReserveBaseCycleAdjustPct",
   "winRiskPct",
   "lossRiskPct",
   "lossRiskAdjustPct",
@@ -433,11 +442,24 @@ function getProfitShieldSettings(cfg) {
 }
 
 function getProfitReserveSettings(cfg) {
+  const signedChange = (value) => Math.max(-100, Math.min(200, Number(value) || 0));
   return {
     winAllocationPct: Math.max(0, Math.min(100, Number(cfg.profitReserveWinAllocationPct) || 0)),
     lossRiskPct: Math.max(0, Math.min(100, Number(cfg.profitReserveLossRiskPct) || 0)),
     baseRiskAllocationPct: Math.max(0, Math.min(100, Number(cfg.profitReserveBaseRiskAllocationPct) || 0)),
+    winAllocationAdjustPct: signedChange(cfg.profitReserveWinAllocationAdjustPct),
+    lossAllocationAdjustPct: signedChange(cfg.profitReserveLossAllocationAdjustPct),
+    baseCycleAdjustPct: signedChange(cfg.profitReserveBaseCycleAdjustPct),
   };
+}
+
+// Apply a signed modifier to the calculated risk amount. This does NOT alter
+// the configured Win/Loss/Base allocation percentage itself. For example,
+// ₹40 with +20% becomes ₹48; ₹40 with -20% becomes ₹32.
+function applyProfitReserveRiskAdjustment(baseRiskAmt, adjustmentPct) {
+  const base = Math.max(0, Number(baseRiskAmt) || 0);
+  const change = Math.max(-100, Math.min(200, Number(adjustmentPct) || 0));
+  return Math.max(0, base * (1 + change / 100));
 }
 
 function isProfitShieldRecoveryActive(cfg, capital, initialCapital, recoveryTradesUsed) {
@@ -627,6 +649,7 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   let profitReserveLastOutcome = null; // "win" or "loss" after the latest executed trade
   let profitReserveBaseCycleRemaining = BASE_RISK_AMT;
   let profitReserveBaseCycleActive = false;
+  let profitReserveBaseCycleStage = 0; // 0 = configured first slice; 1 = remaining slice
   let price = Number(cfg.currentPrice) || 0; // running instrument price (drives turnover fee + is itself driven by each trade's gross P/L)
 
   const trades = [];
@@ -686,30 +709,38 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       const epsilon = Math.max(1e-12, Math.abs(BASE_RISK_AMT) * 1e-10);
       if (profitReserveAvailable > epsilon) {
         if (profitReserveLastOutcome === "win" && profitReserveLastWinningNetProfit > 0) {
-          // After a qualifying WIN, deploy only the configured share of that
-          // WIN's net profit, capped by the currently available reserve.
+          // Start from the latest WIN's configured allocation, then apply the
+          // signed change to the calculated amount. Never allocate above reserve.
+          const baseAllocation = profitReserveLastWinningNetProfit * (reserveSettings.winAllocationPct / 100);
           riskAmt = Math.min(
             profitReserveAvailable,
-            profitReserveLastWinningNetProfit * (reserveSettings.winAllocationPct / 100)
+            applyProfitReserveRiskAdjustment(baseAllocation, reserveSettings.winAllocationAdjustPct)
           );
         } else {
-          // After a LOSS, allocate the configured share of what remains in
-          // Available Reserve. The all-in pool guard below prevents reserve
-          // consumption (including costs) from exceeding this balance.
-          riskAmt = profitReserveAvailable * (reserveSettings.lossRiskPct / 100);
+          // Apply the loss change to the configured share of the remaining reserve.
+          const baseAllocation = profitReserveAvailable * (reserveSettings.lossRiskPct / 100);
+          riskAmt = Math.min(
+            profitReserveAvailable,
+            applyProfitReserveRiskAdjustment(baseAllocation, reserveSettings.lossAllocationAdjustPct)
+          );
         }
         profitReserveRiskSource = "profitReserve";
         profitReservePoolLimit = profitReserveAvailable;
       } else {
-        // No deployable profit remains. Start/restart a bounded Base Risk cycle:
-        // first allocate the configured portion, then only the unconsumed balance.
+        // Base cycle remains a two-stage schedule. The signed change modifies
+        // the configured first slice; the next loss receives the true remainder.
         if ((prevWin && Number(prevNet) > 0) || !profitReserveBaseCycleActive || profitReserveBaseCycleRemaining <= epsilon) {
           profitReserveBaseCycleActive = true;
           profitReserveBaseCycleRemaining = BASE_RISK_AMT;
-          riskAmt = BASE_RISK_AMT * (reserveSettings.baseRiskAllocationPct / 100);
+          profitReserveBaseCycleStage = 0;
+          const baseAllocation = BASE_RISK_AMT * (reserveSettings.baseRiskAllocationPct / 100);
+          riskAmt = Math.min(
+            profitReserveBaseCycleRemaining,
+            applyProfitReserveRiskAdjustment(baseAllocation, reserveSettings.baseCycleAdjustPct)
+          );
         } else {
-          // The second Base Cycle allocation is the entire cycle balance left
-          // after the first loss, not another percentage of that balance.
+          // The first-slice adjustment changes how much remains. The second
+          // allocation is the cycle's remaining amount, not another modified slice.
           riskAmt = profitReserveBaseCycleRemaining;
         }
         profitReserveRiskSource = "baseCycle";
@@ -908,6 +939,7 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
         profitReserveAvailable = netPL;
         profitReserveBaseCycleActive = false;
         profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+        profitReserveBaseCycleStage = 0;
       } else {
         profitReserveLastWinningNetProfit = 0;
         profitReserveLastOutcome = "loss";
@@ -919,21 +951,35 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
             profitReserveAvailable = 0;
             profitReserveBaseCycleActive = false;
             profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+            profitReserveBaseCycleStage = 0;
           }
         } else if (profitReserveRiskSource === "baseCycle") {
-          // The Base Risk Cycle is a two-part risk-allocation schedule.
-          // Consume the executed risk slice itself, not fee/slippage/spread
-          // added to net loss, so 50% of a 40 Base Risk leaves the other 20.
+          // The first base-cycle loss consumes the adjusted first slice; the
+          // next base-cycle loss uses the remaining slice and ends the cycle.
+          // The modifier changes risk size, not the two-stage cycle structure.
           const baseRiskSliceUsed = Math.max(0, Number(riskAmt) || 0);
           profitReservePoolConsumed = Math.min(profitReserveBaseCycleRemaining, baseRiskSliceUsed);
-          profitReserveBaseCycleRemaining = Math.max(0, profitReserveBaseCycleRemaining - baseRiskSliceUsed);
-          if (profitReserveBaseCycleRemaining <= epsilon) {
-            profitReserveBaseCycleActive = false;
-            profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+          if (profitReserveBaseCycleStage === 0) {
+            profitReserveBaseCycleRemaining = Math.max(0, BASE_RISK_AMT - baseRiskSliceUsed);
+            if (profitReserveBaseCycleRemaining <= epsilon) {
+              profitReserveBaseCycleActive = false;
+              profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+              profitReserveBaseCycleStage = 0;
+            } else {
+              profitReserveBaseCycleStage = 1;
+            }
+          } else {
+            profitReserveBaseCycleRemaining = Math.max(0, profitReserveBaseCycleRemaining - baseRiskSliceUsed);
+            if (profitReserveBaseCycleRemaining <= epsilon) {
+              profitReserveBaseCycleActive = false;
+              profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+              profitReserveBaseCycleStage = 0;
+            }
           }
         } else if (profitReserveRiskSource === "baseInitial") {
           profitReserveBaseCycleActive = false;
           profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+          profitReserveBaseCycleStage = 0;
         }
       }
     }
@@ -1283,6 +1329,7 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   let profitReserveLastOutcome = null; // "win" or "loss" after the latest executed trade
   let profitReserveBaseCycleRemaining = BASE_RISK_AMT;
   let profitReserveBaseCycleActive = false;
+  let profitReserveBaseCycleStage = 0; // 0 = configured first slice; 1 = remaining slice
   let price = Number(cfg.fnoCurrentPrice) || 0;
 
   const trades = [];
@@ -1333,13 +1380,17 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       const epsilon = Math.max(1e-12, Math.abs(BASE_RISK_AMT) * 1e-10);
       if (profitReserveAvailable > epsilon) {
         if (profitReserveLastOutcome === "win" && profitReserveLastWinningNetProfit > 0) {
+          const baseAllocation = profitReserveLastWinningNetProfit * (reserveSettings.winAllocationPct / 100);
           targetRiskAmt = Math.min(
             profitReserveAvailable,
-            profitReserveLastWinningNetProfit * (reserveSettings.winAllocationPct / 100)
+            applyProfitReserveRiskAdjustment(baseAllocation, reserveSettings.winAllocationAdjustPct)
           );
         } else {
-          // After a LOSS, use the configured share of the remaining reserve.
-          targetRiskAmt = profitReserveAvailable * (reserveSettings.lossRiskPct / 100);
+          const baseAllocation = profitReserveAvailable * (reserveSettings.lossRiskPct / 100);
+          targetRiskAmt = Math.min(
+            profitReserveAvailable,
+            applyProfitReserveRiskAdjustment(baseAllocation, reserveSettings.lossAllocationAdjustPct)
+          );
         }
         profitReserveRiskSource = "profitReserve";
         profitReservePoolLimit = profitReserveAvailable;
@@ -1347,10 +1398,15 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
         if ((prevWin && Number(prevNet) > 0) || !profitReserveBaseCycleActive || profitReserveBaseCycleRemaining <= epsilon) {
           profitReserveBaseCycleActive = true;
           profitReserveBaseCycleRemaining = BASE_RISK_AMT;
-          targetRiskAmt = BASE_RISK_AMT * (reserveSettings.baseRiskAllocationPct / 100);
+          profitReserveBaseCycleStage = 0;
+          const baseAllocation = BASE_RISK_AMT * (reserveSettings.baseRiskAllocationPct / 100);
+          targetRiskAmt = Math.min(
+            profitReserveBaseCycleRemaining,
+            applyProfitReserveRiskAdjustment(baseAllocation, reserveSettings.baseCycleAdjustPct)
+          );
         } else {
-          // The second Base Cycle allocation is the full balance left in
-          // this cycle after the first loss.
+          // The first-slice adjustment changes the remainder; this stage uses
+          // the remaining cycle amount exactly.
           targetRiskAmt = profitReserveBaseCycleRemaining;
         }
         profitReserveRiskSource = "baseCycle";
@@ -1580,6 +1636,7 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
         profitReserveAvailable = netPL;
         profitReserveBaseCycleActive = false;
         profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+        profitReserveBaseCycleStage = 0;
       } else {
         profitReserveLastWinningNetProfit = 0;
         profitReserveLastOutcome = "loss";
@@ -1591,20 +1648,34 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
             profitReserveAvailable = 0;
             profitReserveBaseCycleActive = false;
             profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+            profitReserveBaseCycleStage = 0;
           }
         } else if (profitReserveRiskSource === "baseCycle") {
-          // Consume the executed risk slice, not the net loss after costs.
-          // That preserves the intended first-half / remaining-half cycle.
+          // Use executed whole-unit risk, but retain the configured two-stage
+          // base-cycle structure even when a signed adjustment reduces a slice.
           const baseRiskSliceUsed = Math.max(0, Number(riskAmt) || 0);
           profitReservePoolConsumed = Math.min(profitReserveBaseCycleRemaining, baseRiskSliceUsed);
-          profitReserveBaseCycleRemaining = Math.max(0, profitReserveBaseCycleRemaining - baseRiskSliceUsed);
-          if (profitReserveBaseCycleRemaining <= epsilon) {
-            profitReserveBaseCycleActive = false;
-            profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+          if (profitReserveBaseCycleStage === 0) {
+            profitReserveBaseCycleRemaining = Math.max(0, BASE_RISK_AMT - baseRiskSliceUsed);
+            if (profitReserveBaseCycleRemaining <= epsilon) {
+              profitReserveBaseCycleActive = false;
+              profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+              profitReserveBaseCycleStage = 0;
+            } else {
+              profitReserveBaseCycleStage = 1;
+            }
+          } else {
+            profitReserveBaseCycleRemaining = Math.max(0, profitReserveBaseCycleRemaining - baseRiskSliceUsed);
+            if (profitReserveBaseCycleRemaining <= epsilon) {
+              profitReserveBaseCycleActive = false;
+              profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+              profitReserveBaseCycleStage = 0;
+            }
           }
         } else if (profitReserveRiskSource === "baseInitial") {
           profitReserveBaseCycleActive = false;
           profitReserveBaseCycleRemaining = BASE_RISK_AMT;
+          profitReserveBaseCycleStage = 0;
         }
       }
     }
@@ -1891,6 +1962,9 @@ function cleanConfig(cfg) {
     profitReserveWinAllocationPct: Number.isFinite(Number(cfg.profitReserveWinAllocationPct)) ? Math.max(0, Math.min(100, Number(cfg.profitReserveWinAllocationPct))) : 50,
     profitReserveLossRiskPct: Number.isFinite(Number(cfg.profitReserveLossRiskPct)) ? Math.max(0, Math.min(100, Number(cfg.profitReserveLossRiskPct))) : 50,
     profitReserveBaseRiskAllocationPct: Number.isFinite(Number(cfg.profitReserveBaseRiskAllocationPct)) ? Math.max(0, Math.min(100, Number(cfg.profitReserveBaseRiskAllocationPct))) : 50,
+    profitReserveWinAllocationAdjustPct: Number.isFinite(Number(cfg.profitReserveWinAllocationAdjustPct)) ? Math.max(-100, Math.min(200, Number(cfg.profitReserveWinAllocationAdjustPct))) : 0,
+    profitReserveLossAllocationAdjustPct: Number.isFinite(Number(cfg.profitReserveLossAllocationAdjustPct)) ? Math.max(-100, Math.min(200, Number(cfg.profitReserveLossAllocationAdjustPct))) : 0,
+    profitReserveBaseCycleAdjustPct: Number.isFinite(Number(cfg.profitReserveBaseCycleAdjustPct)) ? Math.max(-100, Math.min(200, Number(cfg.profitReserveBaseCycleAdjustPct))) : 0,
     winRiskPct: Number(cfg.winRiskPct) || 0,
     lossRiskPct: Number(cfg.lossRiskPct) || 0,
     lossRiskAdjustPct: Number(cfg.lossRiskAdjustPct) || 0,
@@ -5877,7 +5951,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
               : cfg.cascadeMode === "profitShield"
               ? "Profit Shield: recover the Initial-Capital deficit first, lock excess profit, deploy only the unlocked slice, and contract risk during losses."
               : cfg.cascadeMode === "profitReserve"
-              ? "On Profit Reserve: lock part of net wins, spend only available reserve on losses, then fall back to a two-stage Base Risk cycle with an all-in reserve guard."
+              ? "Signed changes modify calculated risk (+20% = ×1.20; -20% = ×0.80). WIN uses latest net profit; LOSS uses remaining reserve. Base Cycle Change adjusts the first slice; after a loss, the next allocation uses the remaining cycle amount."
               : "Existing On Capital logic: risk follows current capital."}
           </div>
 
@@ -5906,8 +5980,11 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
             ) : cfg.cascadeMode === "profitReserve" ? (
               <>
                 <Field label="Win Profit Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveWinAllocationPct} onChange={onChange("profitReserveWinAllocationPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Win Allocation Change %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveWinAllocationAdjustPct} onChange={onChange("profitReserveWinAllocationAdjustPct")} step="1" min="-100" max="200" color="violet" /></Field>
                 <Field label="Loss Reserve Risk %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveLossRiskPct} onChange={onChange("profitReserveLossRiskPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Loss Allocation Change %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveLossAllocationAdjustPct} onChange={onChange("profitReserveLossAllocationAdjustPct")} step="1" min="-100" max="200" color="violet" /></Field>
                 <Field label="Base Risk Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveBaseRiskAllocationPct} onChange={onChange("profitReserveBaseRiskAllocationPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Base Cycle Change %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveBaseCycleAdjustPct} onChange={onChange("profitReserveBaseCycleAdjustPct")} step="1" min="-100" max="200" color="violet" /></Field>
               </>
             ) : cfg.cascadeMode === "profitCumulative" ? (
               <> 
@@ -8260,8 +8337,11 @@ export default function RiskSimulator() {
                     ) : cfg.cascadeMode === "profitReserve" ? (
                       <div className="grid grid-cols-2 gap-2 min-w-0">
                         <div className="min-w-0"><Field label="Win Profit Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveWinAllocationPct} onChange={setField("profitReserveWinAllocationPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Win Allocation Change %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveWinAllocationAdjustPct} onChange={setField("profitReserveWinAllocationAdjustPct")} step="1" min="-100" max="200" color="violet" /></Field></div>
                         <div className="min-w-0"><Field label="Loss Reserve Risk %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveLossRiskPct} onChange={setField("profitReserveLossRiskPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Loss Allocation Change %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveLossAllocationAdjustPct} onChange={setField("profitReserveLossAllocationAdjustPct")} step="1" min="-100" max="200" color="violet" /></Field></div>
                         <div className="min-w-0"><Field label="Base Risk Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveBaseRiskAllocationPct} onChange={setField("profitReserveBaseRiskAllocationPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Base Cycle Change %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveBaseCycleAdjustPct} onChange={setField("profitReserveBaseCycleAdjustPct")} step="1" min="-100" max="200" color="violet" /></Field></div>
                       </div>
                     ) : cfg.cascadeMode === "profitCumulative" ? (
                       <>
