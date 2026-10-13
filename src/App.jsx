@@ -716,7 +716,13 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
         const fullKelly = rr > 0 ? Math.max(0, (p * rr - (1 - p)) / rr) : 0;
         const fractionalKelly = fullKelly * Math.max(0, Math.min(100, Number(cfg.aegisFractionalKellyPct) || 0)) / 100;
         aegisEdgeExpectedR = expectedR;
-        aegisRiskCeiling = Math.max(0, capital * fractionalKelly);
+        // With Edge Gate OFF, keep the sweep diagnostic: size a non-positive-edge
+        // point using the existing Per-Trade Cap so 0%-below-breakeven results
+        // show their actual simulated downside instead of a zero-risk flat line.
+        // With Edge Gate ON, non-positive edge is still stopped below.
+        aegisRiskCeiling = expectedR <= 0 && cfg.aegisEdgeGateEnabled === false
+          ? Math.max(0, capital * (Math.max(0, Number(cfg.perTradeCapPct) || 0) / 100))
+          : Math.max(0, capital * fractionalKelly);
         if (cfg.aegisEdgeGateEnabled !== false && expectedR <= 0) {
           stopped = true;
           stopReason = `Aegis EdgeVault Edge Gate stopped before Trade 1: estimated expectancy ${expectedR.toFixed(3)}R is not positive at configured Win Rate and RR.`;
@@ -764,7 +770,13 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       aegisEdgeExpectedR = expectedR;
       const fullKelly = rr > 0 ? Math.max(0, (p * rr - (1 - p)) / rr) : 0;
       const fractionalKelly = fullKelly * Math.max(0, Math.min(100, Number(cfg.aegisFractionalKellyPct) || 0)) / 100;
-      aegisRiskCeiling = Math.max(0, capital * fractionalKelly);
+      // With Edge Gate OFF, keep the sweep diagnostic: size a non-positive-edge
+        // point using the existing Per-Trade Cap so 0%-below-breakeven results
+        // show their actual simulated downside instead of a zero-risk flat line.
+        // With Edge Gate ON, non-positive edge is still stopped below.
+        aegisRiskCeiling = expectedR <= 0 && cfg.aegisEdgeGateEnabled === false
+          ? Math.max(0, capital * (Math.max(0, Number(cfg.perTradeCapPct) || 0) / 100))
+          : Math.max(0, capital * fractionalKelly);
       if (cfg.aegisEdgeGateEnabled !== false && expectedR <= 0) {
         stopped = true;
         stopReason = `Aegis EdgeVault Edge Gate stopped before Trade ${i}: estimated expectancy ${expectedR.toFixed(3)}R is not positive at configured Win Rate and RR.`;
@@ -1504,7 +1516,13 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
         const fullKelly = rr > 0 ? Math.max(0, (p * rr - (1 - p)) / rr) : 0;
         const fractionalKelly = fullKelly * Math.max(0, Math.min(100, Number(cfg.aegisFractionalKellyPct) || 0)) / 100;
         aegisEdgeExpectedR = expectedR;
-        aegisRiskCeiling = Math.max(0, capital * fractionalKelly);
+        // With Edge Gate OFF, keep the sweep diagnostic: size a non-positive-edge
+        // point using the existing Per-Trade Cap so 0%-below-breakeven results
+        // show their actual simulated downside instead of a zero-risk flat line.
+        // With Edge Gate ON, non-positive edge is still stopped below.
+        aegisRiskCeiling = expectedR <= 0 && cfg.aegisEdgeGateEnabled === false
+          ? Math.max(0, capital * (Math.max(0, Number(cfg.perTradeCapPct) || 0) / 100))
+          : Math.max(0, capital * fractionalKelly);
         if (cfg.aegisEdgeGateEnabled !== false && expectedR <= 0) {
           stopped = true;
           stopReason = `Aegis EdgeVault Edge Gate stopped before Trade 1: estimated expectancy ${expectedR.toFixed(3)}R is not positive at configured Win Rate and RR.`;
@@ -1545,7 +1563,13 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       aegisEdgeExpectedR = expectedR;
       const fullKelly = rr > 0 ? Math.max(0, (p * rr - (1 - p)) / rr) : 0;
       const fractionalKelly = fullKelly * Math.max(0, Math.min(100, Number(cfg.aegisFractionalKellyPct) || 0)) / 100;
-      aegisRiskCeiling = Math.max(0, capital * fractionalKelly);
+      // With Edge Gate OFF, keep the sweep diagnostic: size a non-positive-edge
+        // point using the existing Per-Trade Cap so 0%-below-breakeven results
+        // show their actual simulated downside instead of a zero-risk flat line.
+        // With Edge Gate ON, non-positive edge is still stopped below.
+        aegisRiskCeiling = expectedR <= 0 && cfg.aegisEdgeGateEnabled === false
+          ? Math.max(0, capital * (Math.max(0, Number(cfg.perTradeCapPct) || 0) / 100))
+          : Math.max(0, capital * fractionalKelly);
       if (cfg.aegisEdgeGateEnabled !== false && expectedR <= 0) {
         stopped = true;
         stopReason = `Aegis EdgeVault Edge Gate stopped before Trade ${i}: estimated expectancy ${expectedR.toFixed(3)}R is not positive at configured Win Rate and RR.`;
@@ -6886,7 +6910,7 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                 <th className="text-left px-3 py-2 font-medium">No</th>
                 <th className="text-left px-3 py-2 font-medium">Result</th>
                 <th className="text-right px-3 py-2 font-medium">Risk</th>
-                <th className="text-right px-3 py-2 font-medium">RR</th>
+                <th title="Average Max Profit divided by average Max Drawdown. This is not the configured Reward:Risk input." className="text-right px-3 py-2 font-medium">Reward/DD</th>
                 <th className="text-right px-3 py-2 font-medium">Lots</th>
                 <th className="text-right px-3 py-2 font-medium">Gross P/L</th>
                 <th className="text-right px-3 py-2 font-medium">Fee</th>
@@ -9106,7 +9130,7 @@ export default function RiskSimulator() {
                           <th className="text-left px-3 py-2 font-medium">No</th>
                           <th className="text-left px-3 py-2 font-medium">Result</th>
                           <th className="text-right px-3 py-2 font-medium">Risk</th>
-                          <th className="text-right px-3 py-2 font-medium">RR</th>
+                          <th title="Average Max Profit divided by average Max Drawdown. This is not the configured Reward:Risk input." className="text-right px-3 py-2 font-medium">Reward/DD</th>
                           <th className="text-right px-3 py-2 font-medium">Lots</th>
                           <th className="text-right px-3 py-2 font-medium">Gross P/L</th>
                           <th className="text-right px-3 py-2 font-medium">Fee</th>
@@ -9373,7 +9397,7 @@ export default function RiskSimulator() {
                           <th className="text-left px-3 py-2 font-medium">No</th>
                           <th className="text-left px-3 py-2 font-medium">Result</th>
                           <th className="text-right px-3 py-2 font-medium">Risk</th>
-                          <th className="text-right px-3 py-2 font-medium">RR</th>
+                          <th title="Average Max Profit divided by average Max Drawdown. This is not the configured Reward:Risk input." className="text-right px-3 py-2 font-medium">Reward/DD</th>
                           <th className="text-right px-3 py-2 font-medium">{isFnoIntraday ? "Shares" : "Lots"}</th>
                           <th className="text-right px-3 py-2 font-medium">Qty</th>
                           <th className="text-right px-3 py-2 font-medium">Gross P/L</th>
@@ -9659,7 +9683,7 @@ export default function RiskSimulator() {
                           <th className="text-right px-3 py-2 font-medium">Max DD</th>
                           <th className="text-right px-3 py-2 font-medium">Max Profit</th>
                           <th className="text-right px-3 py-2 font-medium">Max Loss</th>
-                          <th className="text-right px-3 py-2 font-medium">RR</th>
+                          <th title="Average Max Profit divided by average Max Drawdown. This is not the configured Reward:Risk input." className="text-right px-3 py-2 font-medium">Reward/DD</th>
                           <th className="text-right px-3 py-2 font-medium">Profitable Runs</th>
                         </tr>
                       </thead>
