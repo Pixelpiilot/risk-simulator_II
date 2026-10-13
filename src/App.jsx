@@ -86,6 +86,16 @@ const DEFAULTS = {
   aegisLossStepDownPct: 20,
   aegisFractionalKellyPct: 25,
   aegisEdgeGateEnabled: true,
+  // Aegis EdgeVault 2.0: cost-aware Kelly ceiling, active/locked vaults,
+  // drawdown-scaled risk, and a two-stage base-risk cycle after vault exhaustion.
+  aegis2ProfitLockPct: 60,
+  aegis2WinDeployPct: 75,
+  aegis2LossDeployPct: 50,
+  aegis2LossStepDownPct: 20,
+  aegis2BaseCycleAllocationPct: 50,
+  aegis2FractionalKellyPct: 25,
+  aegis2DrawdownDeRiskPct: 50,
+  aegis2EdgeGateEnabled: true,
   winRiskPct: 65,
   lossRiskPct: 18,
   lossRiskAdjustPct: -1,
@@ -296,6 +306,84 @@ function computeFnoOtherAndGst(segment, buyValue, sellValue, brokerageFee, other
   return { otherCharges, gst, total: otherCharges + gst };
 }
 
+// AEV 2.0 estimates expectancy and Kelly from the configured win rate/RR
+// AFTER a representative round-trip of the currently configured trading costs.
+// This is a pre-trade estimate (not a guarantee); realized P/L still comes from
+// the simulator's per-trade cost calculations.
+function estimateAegis2NetEdge(cfg, useFno, priceNow, baseRiskAmt) {
+  const p = Math.max(0, Math.min(1, (Number(cfg.winRate) || 0) / 100));
+  const rr = cfg.rrMode === "range"
+    ? Math.max(0, ((Number(cfg.rrMin) || 0) + (Number(cfg.rrMax) || 0)) / 2)
+    : Math.max(0, Number(cfg.rr) || 0);
+  const risk = Math.max(0, Number(baseRiskAmt) || 0);
+  if (risk <= 1e-12) {
+    const grossExpectedR = p * rr - (1 - p);
+    return { expectedR: grossExpectedR, fullKelly: grossExpectedR > 0 ? Math.max(0, p - (1 - p) / Math.max(rr, 1e-12)) : 0, winNetR: rr, lossAbsR: 1, rr };
+  }
+
+  const estimateSingleNet = (grossPL) => {
+    const baseLots = Math.max(1e-12, Number(cfg.baseLots) || 0);
+    const lotValue = risk / baseLots;
+    const lots = lotValue > 0 ? risk / lotValue : 0;
+    const entryPrice = (Number(priceNow) || 0) + (Number(cfg.entrySpread) || 0);
+    const trueExitPrice = (Number(priceNow) || 0) + (lots > 0 ? grossPL / lots : 0);
+    const exitPrice = trueExitPrice - (Number(cfg.exitSpread) || 0);
+    let fee = 0;
+    if (cfg.feeMode === "turnover") {
+      fee = entryPrice * lots * ((Number(cfg.entryFeeTurnoverPct) || 0) / 100)
+        + exitPrice * lots * ((Number(cfg.exitFeeTurnoverPct) || 0) / 100);
+    } else {
+      fee = lots * ((Number(cfg.feeBaseEntry) || 0) / baseLots)
+        + lots * ((Number(cfg.feeBaseExit) || 0) / baseLots);
+    }
+    const slip = cfg.slipMode === "ticks"
+      ? lots * (Number(cfg.slipTicks) || 0) * (Number(cfg.tickValue) || 0)
+      : lots * entryPrice * ((Number(cfg.slipPct) || 0) / 100);
+    const spreadCost = lots * ((Number(cfg.entrySpread) || 0) + (Number(cfg.exitSpread) || 0));
+    return grossPL - fee - slip - spreadCost;
+  };
+
+  const estimateFnoNet = (grossPL) => {
+    const segment = cfg.fnoSegment === "options" || cfg.fnoSegment === "futures" ? cfg.fnoSegment : "intraday";
+    const broker = ["groww", "dhan", "upstox", "custom"].includes(cfg.fnoBroker) ? cfg.fnoBroker : "groww";
+    const isIntraday = segment === "intraday";
+    const units = isIntraday
+      ? Math.max(1, Math.round(Number(cfg.fnoQuantity) || 1))
+      : Math.max(1, Math.round(Number(cfg.fnoLots) || 1));
+    const lotSize = isIntraday ? 1 : Math.max(1, Math.round(Number(cfg.fnoLotSize) || 1));
+    const leverage = cfg.fnoLeverage && Number(cfg.fnoLeverage) > 0 ? Number(cfg.fnoLeverage) : 1;
+    const quantity = Math.max(1, Math.round(units * lotSize * leverage));
+    const price = Number(priceNow) || 0;
+    const entryPrice = price + (Number(cfg.fnoEntrySpread) || 0);
+    const trueExitPrice = price + grossPL / quantity;
+    const exitPrice = trueExitPrice - (Number(cfg.fnoExitSpread) || 0);
+    const buyValue = entryPrice * quantity;
+    const sellValue = exitPrice * quantity;
+    const brokerage = computeFnoBrokerage(broker, segment, buyValue, sellValue, cfg);
+    const { otherCharges, gst } = computeFnoOtherAndGst(
+      segment, buyValue, sellValue, brokerage, cfg.fnoOtherChargesPct, cfg.fnoGstPct
+    );
+    const fee = brokerage + otherCharges + gst;
+    const slip = cfg.slipMode === "ticks"
+      ? quantity * (Number(cfg.slipTicks) || 0) * (Number(cfg.tickValue) || 0)
+      : quantity * entryPrice * ((Number(cfg.slipPct) || 0) / 100);
+    const spreadCost = quantity * ((Number(cfg.fnoEntrySpread) || 0) + (Number(cfg.fnoExitSpread) || 0));
+    return grossPL - fee - slip - spreadCost;
+  };
+
+  const netForGross = useFno ? estimateFnoNet : estimateSingleNet;
+  const netWin = netForGross(risk * rr);
+  const netLoss = netForGross(-risk);
+  const winNetR = netWin / risk;
+  const lossAbsR = Math.max(1e-9, Math.abs(netLoss) / risk);
+  const expectedR = p * winNetR - (1 - p) * lossAbsR;
+  // Kelly for asymmetric net win/loss multiples: f* = p/lossMultiple - q/winMultiple.
+  const fullKelly = winNetR > 0
+    ? Math.max(0, Math.min(1, p / lossAbsR - (1 - p) / winNetR))
+    : 0;
+  return { expectedR, fullKelly, winNetR, lossAbsR, rr };
+}
+
 function fmtMoney(v) {
   const n = Number(v) || 0;
   return n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -355,6 +443,7 @@ const RISK_ALLOCATION_MODES = [
   "profitShield",
   "profitReserve",
   "aegisEdgeVault",
+  "aegisEdgeVault2",
 ];
 
 const BUILDER_RISK_ALLOCATION_KEYS = [
@@ -384,6 +473,14 @@ const BUILDER_RISK_ALLOCATION_KEYS = [
   "aegisLossStepDownPct",
   "aegisFractionalKellyPct",
   "aegisEdgeGateEnabled",
+  "aegis2ProfitLockPct",
+  "aegis2WinDeployPct",
+  "aegis2LossDeployPct",
+  "aegis2LossStepDownPct",
+  "aegis2BaseCycleAllocationPct",
+  "aegis2FractionalKellyPct",
+  "aegis2DrawdownDeRiskPct",
+  "aegis2EdgeGateEnabled",
   "winRiskPct",
   "lossRiskPct",
   "lossRiskAdjustPct",
@@ -410,6 +507,7 @@ function riskAllocationModeLabel(mode) {
     profitShield: "Profit Shield",
     profitReserve: "On Profit Reserve",
     aegisEdgeVault: "Aegis EdgeVault",
+    aegisEdgeVault2: "Aegis EdgeVault 2.0",
   };
   return labels[RISK_ALLOCATION_MODES.includes(mode) ? mode : "profit"];
 }
@@ -635,6 +733,139 @@ function guardProfitReserveFnoRiskToPool(cfg, targetRiskAmt, poolBudget, price, 
   return { riskAmt: bestUnits * unitValue, units: bestUnits, applied: true, blocked: false, pool, reason: "On Profit Reserve capped sizing to whole units within the remaining pool." };
 }
 
+function getAegis2RiskDecision(cfg, useFno, state) {
+  const baseRisk = Math.max(0, Number(state.baseRiskAmt) || 0);
+  const capital = Math.max(0, Number(state.capital) || 0);
+  const peak = Math.max(0, Number(state.peak) || 0);
+  const price = Number(state.price) || 0;
+  const edge = estimateAegis2NetEdge(cfg, useFno, price, baseRisk);
+  const gateOn = cfg.aegis2EdgeGateEnabled !== false;
+  const fraction = Math.max(0, Math.min(100, Number(cfg.aegis2FractionalKellyPct) || 0)) / 100;
+  const perTradeCap = Math.max(0, Number(cfg.perTradeCapPct) || 0) / 100;
+  const maxRiskFromCapital = capital * perTradeCap;
+  const ddPct = peak > 0 ? Math.max(0, (peak - capital) / peak * 100) : 0;
+  const ddReference = Math.max(1, Number(cfg.overallCapPct) || 30);
+  const ddUtilization = Math.min(1, ddPct / ddReference);
+  const drawdownDeRiskPct = Math.max(0, Math.min(100, Number(cfg.aegis2DrawdownDeRiskPct) || 0));
+  const drawdownScale = Math.max(0.05, 1 - ddUtilization * drawdownDeRiskPct / 100);
+
+  if (gateOn && edge.expectedR <= 0) {
+    return {
+      stopped: true,
+      stopReason: `Aegis EdgeVault 2.0 Edge Gate stopped before Trade ${state.tradeIndex}: estimated net expectancy ${edge.expectedR.toFixed(3)}R is not positive after estimated costs.`,
+      riskAmt: 0,
+      riskCeiling: 0,
+      edgeExpectedR: edge.expectedR,
+      fullKellyPct: edge.fullKelly * 100,
+      drawdownScale,
+      allocationSource: "edge-gate",
+      baseCycleConsumption: 0,
+    };
+  }
+
+  // If the Edge Gate is intentionally OFF, allow a negative-edge simulation
+  // for diagnostics, bounded by the normal per-trade cap; do not let Kelly=0
+  // hide the real downside in Win Rate sweeps.
+  const grossCeiling = edge.expectedR <= 0 && !gateOn
+    ? maxRiskFromCapital
+    : Math.min(maxRiskFromCapital, capital * edge.fullKelly * fraction);
+  const riskCeiling = Math.max(0, grossCeiling * drawdownScale);
+  if (riskCeiling <= 1e-12) {
+    return {
+      stopped: true,
+      stopReason: `Aegis EdgeVault 2.0 has no positive risk ceiling before Trade ${state.tradeIndex}. Check Base Risk, Fractional Kelly, and safety settings.`,
+      riskAmt: 0,
+      riskCeiling,
+      edgeExpectedR: edge.expectedR,
+      fullKellyPct: edge.fullKelly * 100,
+      drawdownScale,
+      allocationSource: "zero-ceiling",
+      baseCycleConsumption: 0,
+    };
+  }
+
+  const winDeploy = Math.max(0, Math.min(100, Number(cfg.aegis2WinDeployPct) || 0)) / 100;
+  const lossDeploy = Math.max(0, Math.min(100, Number(cfg.aegis2LossDeployPct) || 0)) / 100;
+  const stepDown = Math.max(0, Math.min(95, Number(cfg.aegis2LossStepDownPct) || 0)) / 100;
+  const baseCyclePct = Math.max(0, Math.min(100, Number(cfg.aegis2BaseCycleAllocationPct) || 0)) / 100;
+  const lossFactor = Math.max(0.05, 1 - stepDown * Math.max(0, (Number(state.lossStreak) || 0) - 1));
+  const poolEpsilon = Math.max(1e-10, baseRisk * 1e-8);
+
+  let riskAmt = 0;
+  let source = "base";
+  let baseCycleConsumption = 0;
+  if (state.tradeIndex === 1) {
+    riskAmt = Math.min(baseRisk, riskCeiling);
+    source = "base";
+  } else if (state.previousOutcome === "win" && Number(state.activeVault) > poolEpsilon) {
+    riskAmt = Math.max(0, Number(state.activeVault) || 0) * winDeploy;
+    source = "active-vault-win";
+  } else if (Number(state.activeVault) > poolEpsilon) {
+    riskAmt = Math.max(0, Number(state.activeVault) || 0) * lossDeploy * lossFactor;
+    source = "active-vault-loss";
+  } else {
+    // When the active vault is empty, operate a defined two-stage base cycle.
+    // The cycle budget is the configured base risk. Its first slice is the
+    // configured percentage; the second trade receives the full remainder.
+    let remaining = Math.max(0, Number(state.baseCycleRemaining) || 0);
+    let stage = Number(state.baseCycleStage) || 0;
+    let active = state.baseCycleActive === true;
+    if (!active || remaining <= poolEpsilon) {
+      remaining = baseRisk;
+      stage = 0;
+      active = true;
+    }
+    if (baseCyclePct <= 0) {
+      return {
+        stopped: true,
+        stopReason: `Aegis EdgeVault 2.0 Base Cycle Allocation is 0%; blocked before Trade ${state.tradeIndex}.`,
+        riskAmt: 0,
+        riskCeiling,
+        edgeExpectedR: edge.expectedR,
+        fullKellyPct: edge.fullKelly * 100,
+        drawdownScale,
+        allocationSource: "base-cycle-zero",
+        baseCycleConsumption: 0,
+      };
+    }
+    if (stage === 0) {
+      baseCycleConsumption = Math.min(remaining, remaining * baseCyclePct);
+      riskAmt = baseCycleConsumption * lossFactor;
+      source = "base-cycle-first";
+    } else {
+      baseCycleConsumption = remaining;
+      riskAmt = remaining * lossFactor;
+      source = "base-cycle-remaining";
+    }
+  }
+
+  riskAmt = Math.min(Math.max(0, riskAmt), riskCeiling);
+  if (riskAmt <= 1e-12) {
+    return {
+      stopped: true,
+      stopReason: `Aegis EdgeVault 2.0 calculated zero risk before Trade ${state.tradeIndex}; no zero-risk trade was fabricated.`,
+      riskAmt: 0,
+      riskCeiling,
+      edgeExpectedR: edge.expectedR,
+      fullKellyPct: edge.fullKelly * 100,
+      drawdownScale,
+      allocationSource: source,
+      baseCycleConsumption,
+    };
+  }
+  return {
+    stopped: false,
+    stopReason: null,
+    riskAmt,
+    riskCeiling,
+    edgeExpectedR: edge.expectedR,
+    fullKellyPct: edge.fullKelly * 100,
+    drawdownScale,
+    allocationSource: source,
+    baseCycleConsumption,
+  };
+}
+
 function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   const BASE_RISK_AMT = cfg.initialCapital * (cfg.riskPct / 100);
   const LOT_VALUE = BASE_RISK_AMT / cfg.baseLots;
@@ -680,6 +911,18 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   let aegisAllocationSource = null;
   let aegisRiskCeiling = null;
   let aegisEdgeExpectedR = null;
+  let aegis2LockedProfit = 0;
+  let aegis2ActiveVault = 0;
+  let aegis2PreviousOutcome = null;
+  let aegis2LossStreak = 0;
+  let aegis2BaseCycleRemaining = BASE_RISK_AMT;
+  let aegis2BaseCycleActive = false;
+  let aegis2BaseCycleStage = 0;
+  let aegis2AllocationSource = null;
+  let aegis2RiskCeiling = null;
+  let aegis2EdgeExpectedR = null;
+  let aegis2FullKellyPct = null;
+  let aegis2DrawdownScale = 1;
   let price = Number(cfg.currentPrice) || 0; // running instrument price (drives turnover fee + is itself driven by each trade's gross P/L)
 
   const trades = [];
@@ -691,6 +934,11 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
 
   for (let i = 1; i <= numTrades; i++) {
     let riskAmt;
+    let aegis2BaseCycleConsumptionThisTrade = 0;
+    let aegis2RiskCeilingThisTrade = null;
+    let aegis2VaultGuardAppliedThisTrade = false;
+    let aegis2VaultBeforeTrade = null;
+    let aegis2VaultRiskTargetBeforeGuard = null;
     let profitReserveRiskSource = null;
     let profitReservePoolLimit = null;
     let profitReserveRiskTarget = null;
@@ -699,7 +947,7 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
     let profitReservePlannedPoolConsumption = 0;
     let profitReservePoolConsumed = 0;
 
-    if (Array.isArray(explicitRiskPlan) && cfg.cascadeMode !== "aegisEdgeVault") {
+    if (Array.isArray(explicitRiskPlan) && cfg.cascadeMode !== "aegisEdgeVault" && cfg.cascadeMode !== "aegisEdgeVault2") {
       // Builder mode can supply an explicit, already-allocated risk plan.
       // The plan is scaled to the Builder Total Risk Budget before it reaches
       // this engine, so keep the regular cascade/reset logic out of this path.
@@ -707,7 +955,28 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       profitReserveRiskSource = "explicit";
     } else if (i === 1) {
       // Trade 1 starts at Base Risk; AEV still applies its edge gate and fractional-Kelly ceiling.
-      if (cfg.cascadeMode === "aegisEdgeVault") {
+      if (cfg.cascadeMode === "aegisEdgeVault2") {
+        const decision = getAegis2RiskDecision(cfg, false, {
+          tradeIndex: i, baseRiskAmt: BASE_RISK_AMT, capital, peak, price,
+          previousOutcome: aegis2PreviousOutcome, activeVault: aegis2ActiveVault,
+          lossStreak: aegis2LossStreak, baseCycleRemaining: aegis2BaseCycleRemaining,
+          baseCycleActive: aegis2BaseCycleActive, baseCycleStage: aegis2BaseCycleStage,
+        });
+        if (decision.stopped) { stopped = true; stopReason = decision.stopReason; break; }
+        riskAmt = decision.riskAmt;
+        aegis2RiskCeiling = decision.riskCeiling;
+        aegis2RiskCeilingThisTrade = decision.riskCeiling;
+        aegis2EdgeExpectedR = decision.edgeExpectedR;
+        aegis2FullKellyPct = decision.fullKellyPct;
+        aegis2DrawdownScale = decision.drawdownScale;
+        aegis2AllocationSource = decision.allocationSource;
+        aegis2BaseCycleConsumptionThisTrade = decision.baseCycleConsumption;
+        if (aegis2AllocationSource.startsWith("base-cycle") && (!aegis2BaseCycleActive || aegis2BaseCycleRemaining <= Math.max(1e-10, BASE_RISK_AMT * 1e-8))) {
+          aegis2BaseCycleRemaining = BASE_RISK_AMT;
+          aegis2BaseCycleActive = true;
+          aegis2BaseCycleStage = 0;
+        }
+      } else if (cfg.cascadeMode === "aegisEdgeVault") {
         const p = Math.max(0, Math.min(1, (Number(cfg.winRate) || 0) / 100));
         const rr = cfg.rrMode === "range"
           ? Math.max(0, ((Number(cfg.rrMin) || 0) + (Number(cfg.rrMax) || 0)) / 2)
@@ -733,6 +1002,27 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       } else {
         riskAmt = BASE_RISK_AMT;
         if (cfg.cascadeMode === "profitReserve") profitReserveRiskSource = "baseInitial";
+      }
+    } else if (cfg.cascadeMode === "aegisEdgeVault2") {
+      const decision = getAegis2RiskDecision(cfg, false, {
+        tradeIndex: i, baseRiskAmt: BASE_RISK_AMT, capital, peak, price,
+        previousOutcome: aegis2PreviousOutcome, activeVault: aegis2ActiveVault,
+        lossStreak: aegis2LossStreak, baseCycleRemaining: aegis2BaseCycleRemaining,
+        baseCycleActive: aegis2BaseCycleActive, baseCycleStage: aegis2BaseCycleStage,
+      });
+      if (decision.stopped) { stopped = true; stopReason = decision.stopReason; break; }
+      riskAmt = decision.riskAmt;
+      aegis2RiskCeiling = decision.riskCeiling;
+      aegis2RiskCeilingThisTrade = decision.riskCeiling;
+      aegis2EdgeExpectedR = decision.edgeExpectedR;
+      aegis2FullKellyPct = decision.fullKellyPct;
+      aegis2DrawdownScale = decision.drawdownScale;
+      aegis2AllocationSource = decision.allocationSource;
+      aegis2BaseCycleConsumptionThisTrade = decision.baseCycleConsumption;
+      if (aegis2AllocationSource.startsWith("base-cycle") && (!aegis2BaseCycleActive || aegis2BaseCycleRemaining <= Math.max(1e-10, BASE_RISK_AMT * 1e-8))) {
+        aegis2BaseCycleRemaining = BASE_RISK_AMT;
+        aegis2BaseCycleActive = true;
+        aegis2BaseCycleStage = 0;
       }
     } else if (cfg.cascadeMode === "profitCumulative") {
       // On Profit+ (Cumulative):
@@ -919,6 +1209,18 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       const shieldMaxRisk = getProfitShieldModeMaxRisk(cfg);
       if (shieldMaxRisk > 0) riskAmt = Math.min(riskAmt, shieldMaxRisk);
     }
+    if (cfg.cascadeMode === "aegisEdgeVault2" && Number.isFinite(aegis2RiskCeilingThisTrade)) {
+      // Kelly/DD ceiling stays hard even if the global Risk Allocation Reset asks for more.
+      riskAmt = Math.min(riskAmt, aegis2RiskCeilingThisTrade);
+    }
+    if (cfg.cascadeMode === "aegisEdgeVault2" && aegis2AllocationSource && aegis2AllocationSource.startsWith("active-vault")) {
+      aegis2VaultBeforeTrade = aegis2ActiveVault;
+      aegis2VaultRiskTargetBeforeGuard = riskAmt;
+      const vaultGuard = guardAegis2SingleVault(cfg, riskAmt, aegis2ActiveVault, price, LOT_VALUE, feePerLotEntry, feePerLotExit, isTurnoverFee);
+      if (vaultGuard.blocked) { stopped = true; stopReason = vaultGuard.reason || `AEV 2.0 Active Vault blocked Trade ${i}.`; break; }
+      riskAmt = Math.min(riskAmt, vaultGuard.riskAmt);
+      aegis2VaultGuardAppliedThisTrade = !!vaultGuard.applied;
+    }
     const riskBudgetGuard = guardSingleRiskToBudget(
       cfg,
       riskAmt,
@@ -1066,6 +1368,37 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
         aegisLossStreak += 1;
       }
     }
+    if (cfg.cascadeMode === "aegisEdgeVault2") {
+      const eps = Math.max(1e-10, BASE_RISK_AMT * 1e-8);
+      if (netPL > 0) {
+        const locked = netPL * (Math.max(0, Math.min(100, Number(cfg.aegis2ProfitLockPct) || 0)) / 100);
+        aegis2LockedProfit += locked;
+        aegis2ActiveVault += Math.max(0, netPL - locked);
+        aegis2PreviousOutcome = "win";
+        aegis2LossStreak = 0;
+        // Any WIN ends the defensive base cycle; a new Active Vault is now available.
+        aegis2BaseCycleRemaining = BASE_RISK_AMT;
+        aegis2BaseCycleActive = false;
+        aegis2BaseCycleStage = 0;
+      } else {
+        aegis2ActiveVault = Math.max(0, aegis2ActiveVault - Math.abs(netPL));
+        aegis2PreviousOutcome = "loss";
+        aegis2LossStreak += 1;
+        if (aegis2AllocationSource && aegis2AllocationSource.startsWith("base-cycle") && aegis2BaseCycleActive) {
+          // Consume the cycle's planned slice. If risk was capped by Kelly/DD,
+          // the cycle remains bounded by its original Base Risk budget.
+          aegis2BaseCycleRemaining = Math.max(0, aegis2BaseCycleRemaining - aegis2BaseCycleConsumptionThisTrade);
+          if (aegis2BaseCycleRemaining <= eps) {
+            aegis2BaseCycleRemaining = BASE_RISK_AMT;
+            aegis2BaseCycleActive = false;
+            aegis2BaseCycleStage = 0;
+          } else {
+            aegis2BaseCycleActive = true;
+            aegis2BaseCycleStage = 1;
+          }
+        }
+      }
+    }
 
     let profitReserveWinningNetProfit = 0;
     if (cfg.cascadeMode === "profitReserve") {
@@ -1165,6 +1498,17 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       aegisAllocationSource: cfg.cascadeMode === "aegisEdgeVault" ? aegisAllocationSource : null,
       aegisRiskCeiling: cfg.cascadeMode === "aegisEdgeVault" ? aegisRiskCeiling : null,
       aegisEdgeExpectedR: cfg.cascadeMode === "aegisEdgeVault" ? aegisEdgeExpectedR : null,
+      aegis2LockedProfit: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2LockedProfit : null,
+      aegis2ActiveVault: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2ActiveVault : null,
+      aegis2AllocationSource: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2AllocationSource : null,
+      aegis2RiskCeiling: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RiskCeiling : null,
+      aegis2ExpectedNetR: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2EdgeExpectedR : null,
+      aegis2FullKellyPct: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2FullKellyPct : null,
+      aegis2DrawdownScale: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2DrawdownScale : null,
+      aegis2BaseCycleRemaining: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2BaseCycleRemaining : null,
+      aegis2VaultGuardApplied: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2VaultGuardAppliedThisTrade : false,
+      aegis2VaultBeforeTrade: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2VaultBeforeTrade : null,
+      aegis2VaultRiskTargetBeforeGuard: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2VaultRiskTargetBeforeGuard : null,
       lots,
       entryPrice,
       price: exitPrice,
@@ -1392,6 +1736,52 @@ function estimateFnoWorstLossForUnits(cfg, units, price, unitValue, lotSize, lev
   return Math.max(0, riskAmt + fee + slip + spreadCost);
 }
 
+function guardAegis2SingleVault(cfg, targetRiskAmt, availableVault, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee) {
+  const target = Math.max(0, Number(targetRiskAmt) || 0);
+  const pool = Math.max(0, Number(availableVault) || 0);
+  const epsilon = Math.max(1e-10, pool * 1e-8);
+  if (target <= 1e-12 || pool <= epsilon) {
+    return { riskAmt: 0, applied: target > 0, blocked: true, reason: "AEV 2.0 Active Vault has no available amount for an all-in-loss-safe trade." };
+  }
+  const targetLoss = estimateSingleWorstLossForRisk(cfg, target, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee);
+  if (targetLoss <= pool + epsilon) return { riskAmt: target, applied: false, blocked: false, reason: null };
+  let lo = 0;
+  let hi = target;
+  let best = 0;
+  for (let i = 0; i < 48; i++) {
+    const mid = (lo + hi) / 2;
+    const loss = estimateSingleWorstLossForRisk(cfg, mid, price, lotValue, feePerLotEntry, feePerLotExit, isTurnoverFee);
+    if (loss <= pool + epsilon) { best = mid; lo = mid; } else { hi = mid; }
+  }
+  if (best <= 1e-12) return { riskAmt: 0, applied: true, blocked: true, reason: "AEV 2.0 Active Vault cannot cover the minimum all-in risk after fees, slippage and spread." };
+  return { riskAmt: best, applied: true, blocked: false, reason: "AEV 2.0 capped risk so the estimated all-in loss fits inside the Active Vault." };
+}
+
+function guardAegis2FnoVault(cfg, targetRiskAmt, availableVault, price, unitValue, lotSize, leverageFactor, broker, segment) {
+  const target = Math.max(0, Number(targetRiskAmt) || 0);
+  const pool = Math.max(0, Number(availableVault) || 0);
+  const epsilon = Math.max(1e-10, pool * 1e-8);
+  const targetUnits = Math.floor(target / Math.max(1e-12, unitValue) + 1e-12);
+  if (targetUnits < 1 || pool <= epsilon) {
+    return { riskAmt: 0, units: 0, applied: target > 0, blocked: true, reason: "AEV 2.0 Active Vault cannot fund the minimum executable share/lot." };
+  }
+  const lossFor = (units) => estimateFnoWorstLossForUnits(cfg, units, price, unitValue, lotSize, leverageFactor, broker, segment);
+  if (lossFor(targetUnits) <= pool + epsilon) {
+    return { riskAmt: targetUnits * unitValue, units: targetUnits, applied: false, blocked: false, reason: null };
+  }
+  let lo = 1;
+  let hi = targetUnits;
+  let bestUnits = 0;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (lossFor(mid) <= pool + epsilon) { bestUnits = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  if (bestUnits < 1) {
+    return { riskAmt: 0, units: 0, applied: true, blocked: true, reason: "AEV 2.0 Active Vault cannot cover even one share/lot after F&O charges, slippage and spread." };
+  }
+  return { riskAmt: bestUnits * unitValue, units: bestUnits, applied: true, blocked: false, reason: "AEV 2.0 capped risk to the largest whole share/lot whose all-in loss fits inside the Active Vault." };
+}
+
 function guardFnoRiskToBudget(cfg, targetRiskAmt, capital, peak, price, unitValue, lotSize, leverageFactor, broker, segment) {
   const budget = getRiskBudgetAmount(cfg);
   if (!Number.isFinite(budget)) {
@@ -1484,6 +1874,18 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   let aegisAllocationSource = null;
   let aegisRiskCeiling = null;
   let aegisEdgeExpectedR = null;
+  let aegis2LockedProfit = 0;
+  let aegis2ActiveVault = 0;
+  let aegis2PreviousOutcome = null;
+  let aegis2LossStreak = 0;
+  let aegis2BaseCycleRemaining = BASE_RISK_AMT;
+  let aegis2BaseCycleActive = false;
+  let aegis2BaseCycleStage = 0;
+  let aegis2AllocationSource = null;
+  let aegis2RiskCeiling = null;
+  let aegis2EdgeExpectedR = null;
+  let aegis2FullKellyPct = null;
+  let aegis2DrawdownScale = 1;
   let price = Number(cfg.fnoCurrentPrice) || 0;
 
   const trades = [];
@@ -1495,6 +1897,11 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
 
   for (let i = 1; i <= numTrades; i++) {
     let targetRiskAmt;
+    let aegis2BaseCycleConsumptionThisTrade = 0;
+    let aegis2RiskCeilingThisTrade = null;
+    let aegis2VaultGuardAppliedThisTrade = false;
+    let aegis2VaultBeforeTrade = null;
+    let aegis2VaultRiskTargetBeforeGuard = null;
     let profitReserveRiskSource = null;
     let profitReservePoolLimit = null;
     let profitReserveRiskTarget = null;
@@ -1503,13 +1910,34 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
     let profitReservePlannedPoolConsumption = 0;
     let profitReservePoolConsumed = 0;
 
-    if (Array.isArray(explicitRiskPlan) && cfg.cascadeMode !== "aegisEdgeVault") {
+    if (Array.isArray(explicitRiskPlan) && cfg.cascadeMode !== "aegisEdgeVault" && cfg.cascadeMode !== "aegisEdgeVault2") {
       // Builder supplies a final risk allocation; all Day/F&O trading, costs
       // and safety-stop mechanics below still run exactly as usual.
       targetRiskAmt = Number(explicitRiskPlan[i - 1]) || 0;
       profitReserveRiskSource = "explicit";
     } else if (i === 1) {
-      if (cfg.cascadeMode === "aegisEdgeVault") {
+      if (cfg.cascadeMode === "aegisEdgeVault2") {
+        const decision = getAegis2RiskDecision(cfg, true, {
+          tradeIndex: i, baseRiskAmt: BASE_RISK_AMT, capital, peak, price,
+          previousOutcome: aegis2PreviousOutcome, activeVault: aegis2ActiveVault,
+          lossStreak: aegis2LossStreak, baseCycleRemaining: aegis2BaseCycleRemaining,
+          baseCycleActive: aegis2BaseCycleActive, baseCycleStage: aegis2BaseCycleStage,
+        });
+        if (decision.stopped) { stopped = true; stopReason = decision.stopReason; break; }
+        targetRiskAmt = decision.riskAmt;
+        aegis2RiskCeiling = decision.riskCeiling;
+        aegis2RiskCeilingThisTrade = decision.riskCeiling;
+        aegis2EdgeExpectedR = decision.edgeExpectedR;
+        aegis2FullKellyPct = decision.fullKellyPct;
+        aegis2DrawdownScale = decision.drawdownScale;
+        aegis2AllocationSource = decision.allocationSource;
+        aegis2BaseCycleConsumptionThisTrade = decision.baseCycleConsumption;
+        if (aegis2AllocationSource.startsWith("base-cycle") && (!aegis2BaseCycleActive || aegis2BaseCycleRemaining <= Math.max(1e-10, BASE_RISK_AMT * 1e-8))) {
+          aegis2BaseCycleRemaining = BASE_RISK_AMT;
+          aegis2BaseCycleActive = true;
+          aegis2BaseCycleStage = 0;
+        }
+      } else if (cfg.cascadeMode === "aegisEdgeVault") {
         const p = Math.max(0, Math.min(1, (Number(cfg.winRate) || 0) / 100));
         const rr = cfg.rrMode === "range" ? Math.max(0, ((Number(cfg.rrMin) || 0) + (Number(cfg.rrMax) || 0)) / 2) : Math.max(0, Number(cfg.rr) || 0);
         const expectedR = p * rr - (1 - p);
@@ -1533,6 +1961,27 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       } else {
         targetRiskAmt = BASE_RISK_AMT;
         if (cfg.cascadeMode === "profitReserve") profitReserveRiskSource = "baseInitial";
+      }
+    } else if (cfg.cascadeMode === "aegisEdgeVault2") {
+      const decision = getAegis2RiskDecision(cfg, true, {
+        tradeIndex: i, baseRiskAmt: BASE_RISK_AMT, capital, peak, price,
+        previousOutcome: aegis2PreviousOutcome, activeVault: aegis2ActiveVault,
+        lossStreak: aegis2LossStreak, baseCycleRemaining: aegis2BaseCycleRemaining,
+        baseCycleActive: aegis2BaseCycleActive, baseCycleStage: aegis2BaseCycleStage,
+      });
+      if (decision.stopped) { stopped = true; stopReason = decision.stopReason; break; }
+      targetRiskAmt = decision.riskAmt;
+      aegis2RiskCeiling = decision.riskCeiling;
+      aegis2RiskCeilingThisTrade = decision.riskCeiling;
+      aegis2EdgeExpectedR = decision.edgeExpectedR;
+      aegis2FullKellyPct = decision.fullKellyPct;
+      aegis2DrawdownScale = decision.drawdownScale;
+      aegis2AllocationSource = decision.allocationSource;
+      aegis2BaseCycleConsumptionThisTrade = decision.baseCycleConsumption;
+      if (aegis2AllocationSource.startsWith("base-cycle") && (!aegis2BaseCycleActive || aegis2BaseCycleRemaining <= Math.max(1e-10, BASE_RISK_AMT * 1e-8))) {
+        aegis2BaseCycleRemaining = BASE_RISK_AMT;
+        aegis2BaseCycleActive = true;
+        aegis2BaseCycleStage = 0;
       }
     } else if (cfg.cascadeMode === "profitCumulative") {
       if (prevWin) {
@@ -1701,6 +2150,17 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       const shieldMaxRisk = getProfitShieldModeMaxRisk(cfg);
       if (shieldMaxRisk > 0) targetRiskAmt = Math.min(targetRiskAmt, shieldMaxRisk);
     }
+    if (cfg.cascadeMode === "aegisEdgeVault2" && Number.isFinite(aegis2RiskCeilingThisTrade)) {
+      targetRiskAmt = Math.min(targetRiskAmt, aegis2RiskCeilingThisTrade);
+    }
+    if (cfg.cascadeMode === "aegisEdgeVault2" && aegis2AllocationSource && aegis2AllocationSource.startsWith("active-vault")) {
+      aegis2VaultBeforeTrade = aegis2ActiveVault;
+      aegis2VaultRiskTargetBeforeGuard = targetRiskAmt;
+      const vaultGuard = guardAegis2FnoVault(cfg, targetRiskAmt, aegis2ActiveVault, price, UNIT_VALUE, lotSize, leverageFactor, broker, segment);
+      if (vaultGuard.blocked) { stopped = true; stopReason = vaultGuard.reason || `AEV 2.0 Active Vault blocked Trade ${i}.`; break; }
+      targetRiskAmt = Math.min(targetRiskAmt, vaultGuard.riskAmt);
+      aegis2VaultGuardAppliedThisTrade = !!vaultGuard.applied;
+    }
     const riskBudgetGuard = guardFnoRiskToBudget(
       cfg,
       targetRiskAmt,
@@ -1719,6 +2179,9 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       break;
     }
     targetRiskAmt = riskBudgetGuard.riskAmt;
+    if (cfg.cascadeMode === "aegisEdgeVault2" && Number.isFinite(aegis2RiskCeilingThisTrade)) {
+      targetRiskAmt = Math.min(targetRiskAmt, aegis2RiskCeilingThisTrade);
+    }
 
     if (
       cfg.cascadeMode === "profitReserve" &&
@@ -1759,9 +2222,14 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       ? Number(profitShieldGuard.units)
       : cfg.cascadeMode === "profitReserve" && profitReserveGuard && Number(profitReserveGuard.units) > 0
       ? Number(profitReserveGuard.units)
-      : isProfitReserveAllocatedRisk
+      : (isProfitReserveAllocatedRisk || cfg.cascadeMode === "aegisEdgeVault2")
       ? Math.floor(rawUnits + 1e-12)
       : Math.max(1, Math.round(rawUnits));
+    if (cfg.cascadeMode === "aegisEdgeVault2" && units < 1) {
+      stopped = true;
+      stopReason = `Aegis EdgeVault 2.0 blocked Trade ${i}: the minimum executable share/lot exceeds the Kelly/drawdown risk ceiling.`;
+      break;
+    }
     if (isProfitReserveAllocatedRisk && units < 1) {
       stopped = true;
       stopReason = profitReserveRiskSource === "baseCycle"
@@ -1881,6 +2349,37 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
         aegisLossStreak += 1;
       }
     }
+    if (cfg.cascadeMode === "aegisEdgeVault2") {
+      const eps = Math.max(1e-10, BASE_RISK_AMT * 1e-8);
+      if (netPL > 0) {
+        const locked = netPL * (Math.max(0, Math.min(100, Number(cfg.aegis2ProfitLockPct) || 0)) / 100);
+        aegis2LockedProfit += locked;
+        aegis2ActiveVault += Math.max(0, netPL - locked);
+        aegis2PreviousOutcome = "win";
+        aegis2LossStreak = 0;
+        // Any WIN ends the defensive base cycle; a new Active Vault is now available.
+        aegis2BaseCycleRemaining = BASE_RISK_AMT;
+        aegis2BaseCycleActive = false;
+        aegis2BaseCycleStage = 0;
+      } else {
+        aegis2ActiveVault = Math.max(0, aegis2ActiveVault - Math.abs(netPL));
+        aegis2PreviousOutcome = "loss";
+        aegis2LossStreak += 1;
+        if (aegis2AllocationSource && aegis2AllocationSource.startsWith("base-cycle") && aegis2BaseCycleActive) {
+          // Consume the cycle's planned slice. If risk was capped by Kelly/DD,
+          // the cycle remains bounded by its original Base Risk budget.
+          aegis2BaseCycleRemaining = Math.max(0, aegis2BaseCycleRemaining - aegis2BaseCycleConsumptionThisTrade);
+          if (aegis2BaseCycleRemaining <= eps) {
+            aegis2BaseCycleRemaining = BASE_RISK_AMT;
+            aegis2BaseCycleActive = false;
+            aegis2BaseCycleStage = 0;
+          } else {
+            aegis2BaseCycleActive = true;
+            aegis2BaseCycleStage = 1;
+          }
+        }
+      }
+    }
 
     let profitReserveWinningNetProfit = 0;
     if (cfg.cascadeMode === "profitReserve") {
@@ -1979,6 +2478,17 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       aegisAllocationSource: cfg.cascadeMode === "aegisEdgeVault" ? aegisAllocationSource : null,
       aegisRiskCeiling: cfg.cascadeMode === "aegisEdgeVault" ? aegisRiskCeiling : null,
       aegisEdgeExpectedR: cfg.cascadeMode === "aegisEdgeVault" ? aegisEdgeExpectedR : null,
+      aegis2LockedProfit: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2LockedProfit : null,
+      aegis2ActiveVault: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2ActiveVault : null,
+      aegis2AllocationSource: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2AllocationSource : null,
+      aegis2RiskCeiling: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RiskCeiling : null,
+      aegis2ExpectedNetR: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2EdgeExpectedR : null,
+      aegis2FullKellyPct: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2FullKellyPct : null,
+      aegis2DrawdownScale: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2DrawdownScale : null,
+      aegis2BaseCycleRemaining: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2BaseCycleRemaining : null,
+      aegis2VaultGuardApplied: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2VaultGuardAppliedThisTrade : false,
+      aegis2VaultBeforeTrade: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2VaultBeforeTrade : null,
+      aegis2VaultRiskTargetBeforeGuard: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2VaultRiskTargetBeforeGuard : null,
       lots: units,
       quantity,
       entryPrice,
@@ -2236,6 +2746,14 @@ function cleanConfig(cfg) {
     aegisLossStepDownPct: Number.isFinite(Number(cfg.aegisLossStepDownPct)) ? Math.max(0, Math.min(95, Number(cfg.aegisLossStepDownPct))) : 20,
     aegisFractionalKellyPct: Number.isFinite(Number(cfg.aegisFractionalKellyPct)) ? Math.max(0, Math.min(100, Number(cfg.aegisFractionalKellyPct))) : 25,
     aegisEdgeGateEnabled: cfg.aegisEdgeGateEnabled !== false,
+    aegis2ProfitLockPct: Number.isFinite(Number(cfg.aegis2ProfitLockPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2ProfitLockPct))) : 60,
+    aegis2WinDeployPct: Number.isFinite(Number(cfg.aegis2WinDeployPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2WinDeployPct))) : 75,
+    aegis2LossDeployPct: Number.isFinite(Number(cfg.aegis2LossDeployPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2LossDeployPct))) : 50,
+    aegis2LossStepDownPct: Number.isFinite(Number(cfg.aegis2LossStepDownPct)) ? Math.max(0, Math.min(95, Number(cfg.aegis2LossStepDownPct))) : 20,
+    aegis2BaseCycleAllocationPct: Number.isFinite(Number(cfg.aegis2BaseCycleAllocationPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2BaseCycleAllocationPct))) : 50,
+    aegis2FractionalKellyPct: Number.isFinite(Number(cfg.aegis2FractionalKellyPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2FractionalKellyPct))) : 25,
+    aegis2DrawdownDeRiskPct: Number.isFinite(Number(cfg.aegis2DrawdownDeRiskPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2DrawdownDeRiskPct))) : 50,
+    aegis2EdgeGateEnabled: cfg.aegis2EdgeGateEnabled !== false,
     winRiskPct: Number(cfg.winRiskPct) || 0,
     lossRiskPct: Number(cfg.lossRiskPct) || 0,
     lossRiskAdjustPct: Number(cfg.lossRiskAdjustPct) || 0,
@@ -6223,6 +6741,8 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
               ? "Profit Shield: recover the Initial-Capital deficit first, lock excess profit, deploy only the unlocked slice, and contract risk during losses."
               : cfg.cascadeMode === "aegisEdgeVault"
               ? "Aegis EdgeVault: lock part of each net win, deploy only the active vault, step down after losses, and cap risk using fractional Kelly. Edge Gate blocks a non-positive estimated edge."
+              : cfg.cascadeMode === "aegisEdgeVault2"
+              ? "Aegis EdgeVault 2.0: costs-aware edge/Kelly ceiling, risk scales down as drawdown grows, locked profit is never recycled, and a two-stage Base Cycle activates when the Active Vault is exhausted."
               : cfg.cascadeMode === "profitReserve"
               ? "Signed changes modify calculated risk (+20% = ×1.20; -20% = ×0.80). WIN uses latest net profit; LOSS uses remaining reserve. Base Cycle Change adjusts the first slice; after a loss, the next allocation uses the remaining cycle amount."
               : "Existing On Capital logic: risk follows current capital."}
@@ -6260,6 +6780,20 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                 <div className="col-span-2 mt-1 rounded-md border border-emerald-500/15 bg-zinc-950/35 px-2.5 py-2">
                   <div className="flex items-center justify-between gap-2"><span className="text-[10px] font-semibold text-emerald-200">Edge Gate</span><button type="button" onClick={() => setCfg((c) => ({ ...c, aegisEdgeGateEnabled: !c.aegisEdgeGateEnabled }))} className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border ${cfg.aegisEdgeGateEnabled ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegisEdgeGateEnabled ? "ON" : "OFF"}</button></div>
                   <div className="mt-1 text-[9px] text-zinc-500">Estimated edge = Win Rate × RR − Loss Rate. A non-positive edge pauses this mode.</div>
+                </div>
+              </>
+            ) : cfg.cascadeMode === "aegisEdgeVault2" ? (
+              <>
+                <Field label="Profit Lock %"><NumInput value={cfg.aegis2ProfitLockPct} onChange={onChange("aegis2ProfitLockPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Win Deploy %"><NumInput value={cfg.aegis2WinDeployPct} onChange={onChange("aegis2WinDeployPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Loss Deploy %"><NumInput value={cfg.aegis2LossDeployPct} onChange={onChange("aegis2LossDeployPct")} step="1" min="0" max="100" color="violet" /></Field>
+                <Field label="Loss Step-Down %"><NumInput value={cfg.aegis2LossStepDownPct} onChange={onChange("aegis2LossStepDownPct")} step="1" min="0" max="95" color="violet" /></Field>
+                <Field label="Base Cycle Allocation %"><NumInput value={cfg.aegis2BaseCycleAllocationPct} onChange={onChange("aegis2BaseCycleAllocationPct")} step="1" min="1" max="100" color="violet" /></Field>
+                <Field label="Fractional Kelly %"><NumInput value={cfg.aegis2FractionalKellyPct} onChange={onChange("aegis2FractionalKellyPct")} step="5" min="0" max="100" color="violet" /></Field>
+                <Field label="DD De-risk %"><NumInput value={cfg.aegis2DrawdownDeRiskPct} onChange={onChange("aegis2DrawdownDeRiskPct")} step="5" min="0" max="100" color="violet" /></Field>
+                <div className="col-span-2 mt-1 rounded-md border border-emerald-500/15 bg-zinc-950/35 px-2.5 py-2">
+                  <div className="flex items-center justify-between gap-2"><span className="text-[10px] font-semibold text-emerald-200">Net Edge Gate</span><button type="button" onClick={() => onChange("aegis2EdgeGateEnabled")({ target: { value: !cfg.aegis2EdgeGateEnabled } })} className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border ${cfg.aegis2EdgeGateEnabled ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegis2EdgeGateEnabled ? "ON" : "OFF"}</button></div>
+                  <div className="mt-1 text-[9px] text-zinc-500">Uses estimated net expectancy after configured fees, spread and slippage. When OFF, negative-edge simulations still run for diagnostics but remain capped by existing safety limits.</div>
                 </div>
               </>
             ) : cfg.cascadeMode === "profitReserve" ? (
@@ -6945,7 +7479,7 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                   <td className="px-3 py-1.5">
                     <TradeResultBadge win={t.win} />
                   </td>
-                  <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                  <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Full Kelly ${Number(t.aegis2FullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                   <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                   <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                   <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmtMoney(t.grossPL)}</td>
@@ -7358,7 +7892,7 @@ export default function RiskSimulator() {
       "builderSequenceFilterMatch",
       "builderSequenceFilterFinalPnl",
     ]);
-    const booleanKeys = new Set(["builderRiskMenuOpen", "builderSequenceFilterEnabled", "builderSequenceFilterOpen"]);
+    const booleanKeys = new Set(["builderRiskMenuOpen", "builderSequenceFilterEnabled", "builderSequenceFilterOpen", "aegis2EdgeGateEnabled"]);
     setCfg((c) => ({
       ...c,
       [key]: booleanKeys.has(key)
@@ -8631,6 +9165,20 @@ export default function RiskSimulator() {
                           <div className="mt-1 text-[9px] text-zinc-500">A non-positive estimated expectancy blocks new trades in this mode.</div>
                         </div>
                       </>
+                    ) : cfg.cascadeMode === "aegisEdgeVault2" ? (
+                      <div className="grid grid-cols-2 gap-2 min-w-0">
+                        <div className="min-w-0"><Field label="Profit Lock %"><NumInput value={cfg.aegis2ProfitLockPct} onChange={setField("aegis2ProfitLockPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Win Deploy %"><NumInput value={cfg.aegis2WinDeployPct} onChange={setField("aegis2WinDeployPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Loss Deploy %"><NumInput value={cfg.aegis2LossDeployPct} onChange={setField("aegis2LossDeployPct")} step="1" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Loss Step-Down %"><NumInput value={cfg.aegis2LossStepDownPct} onChange={setField("aegis2LossStepDownPct")} step="1" min="0" max="95" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Base Cycle Allocation %"><NumInput value={cfg.aegis2BaseCycleAllocationPct} onChange={setField("aegis2BaseCycleAllocationPct")} step="1" min="1" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="Fractional Kelly %"><NumInput value={cfg.aegis2FractionalKellyPct} onChange={setField("aegis2FractionalKellyPct")} step="5" min="0" max="100" color="violet" /></Field></div>
+                        <div className="min-w-0"><Field label="DD De-risk %"><NumInput value={cfg.aegis2DrawdownDeRiskPct} onChange={setField("aegis2DrawdownDeRiskPct")} step="5" min="0" max="100" color="violet" /></Field></div>
+                        <div className="col-span-2 mt-1 rounded-md border border-emerald-500/15 bg-zinc-950/35 px-2.5 py-2">
+                          <div className="flex items-center justify-between gap-2"><span className="text-[10px] font-semibold text-emerald-200">Net Edge Gate</span><button type="button" onClick={() => setCfg((c) => ({ ...c, aegis2EdgeGateEnabled: !c.aegis2EdgeGateEnabled }))} className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border ${cfg.aegis2EdgeGateEnabled ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegis2EdgeGateEnabled ? "ON" : "OFF"}</button></div>
+                          <div className="mt-1 text-[9px] text-zinc-500">Uses configured costs to estimate net edge. OFF allows loss diagnostics but existing safety limits still apply.</div>
+                        </div>
+                      </div>
                     ) : cfg.cascadeMode === "profitReserve" ? (
                       <div className="grid grid-cols-2 gap-2 min-w-0">
                         <div className="min-w-0"><Field label="Win Profit Allocation %" labelClassName="min-h-8"><NumInput value={cfg.profitReserveWinAllocationPct} onChange={setField("profitReserveWinAllocationPct")} step="1" min="0" max="100" color="violet" /></Field></div>
@@ -9175,7 +9723,7 @@ export default function RiskSimulator() {
                             >
                               <TradeResultBadge win={t.win} />
                             </td>
-                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300">BUDGET</span> : null}{t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300">BUDGET</span> : null}{t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Full Kelly ${Number(t.aegis2FullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                             <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>
@@ -9443,7 +9991,7 @@ export default function RiskSimulator() {
                             >
                               <TradeResultBadge win={t.win} />
                             </td>
-                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Full Kelly ${Number(t.aegis2FullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots}</td>
                             <td className="px-3 py-1.5 text-right">{t.quantity}</td>
