@@ -93,7 +93,16 @@ const DEFAULTS = {
   aegis2LossDeployPct: 50,
   aegis2LossStepDownPct: 20,
   aegis2BaseCycleAllocationPct: 50,
+  // Classic Fractional Kelly remains independently switchable.
+  aegis2FractionalKellyEnabled: true,
   aegis2FractionalKellyPct: 25,
+  // AEV 2.0 Robust Edge Fraction (REF): Wilson lower confidence bound on the
+  // configured win rate, then cost-adjusted Kelly. This is a conservative
+  // estimate, not a forecast or guarantee; sample size is user supplied.
+  aegis2AdaptiveEdgeEnabled: true,
+  aegis2AdaptiveSampleTrades: 500,
+  aegis2AdaptiveConfidencePct: 90,
+  aegis2AdaptiveKellyPct: 25,
   aegis2DrawdownDeRiskPct: 50,
   aegis2EdgeGateEnabled: true,
   winRiskPct: 65,
@@ -478,7 +487,12 @@ const BUILDER_RISK_ALLOCATION_KEYS = [
   "aegis2LossDeployPct",
   "aegis2LossStepDownPct",
   "aegis2BaseCycleAllocationPct",
+  "aegis2FractionalKellyEnabled",
   "aegis2FractionalKellyPct",
+  "aegis2AdaptiveEdgeEnabled",
+  "aegis2AdaptiveSampleTrades",
+  "aegis2AdaptiveConfidencePct",
+  "aegis2AdaptiveKellyPct",
   "aegis2DrawdownDeRiskPct",
   "aegis2EdgeGateEnabled",
   "winRiskPct",
@@ -733,14 +747,68 @@ function guardProfitReserveFnoRiskToPool(cfg, targetRiskAmt, poolBudget, price, 
   return { riskAmt: bestUnits * unitValue, units: bestUnits, applied: true, blocked: false, pool, reason: "On Profit Reserve capped sizing to whole units within the remaining pool." };
 }
 
+// Inverse standard normal CDF (Acklam approximation), used to get the z-score
+// for a configurable confidence level without adding a dependency.
+function inverseStandardNormal(p) {
+  const qP = Math.min(1 - 1e-12, Math.max(1e-12, Number(p) || 0.5));
+  const a = [-39.6968302866538, 220.946098424521, -275.928510446969, 138.357751867269, -30.6647980661472, 2.50662827745924];
+  const b = [-54.4760987982241, 161.585836858041, -155.698979859887, 66.8013118877197, -13.2806815528857];
+  const c = [-0.00778489400243029, -0.322396458041136, -2.40075827716184, -2.54973253934373, 4.37466414146497, 2.93816398269878];
+  const d = [0.00778469570904146, 0.32246712907004, 2.445134137143, 3.75440866190742];
+  const low = 0.02425;
+  const high = 1 - low;
+  if (qP < low) {
+    const q = Math.sqrt(-2 * Math.log(qP));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+      ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  if (qP > high) {
+    const q = Math.sqrt(-2 * Math.log(1 - qP));
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) /
+      ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  const q = qP - 0.5;
+  const r = q * q;
+  return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q /
+    (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+}
+
+// Robust Edge Fraction (REF): use a Wilson lower confidence bound on the
+// configured win rate before applying the same estimated net win/loss multiples
+// as the cost-aware AEV2 Kelly estimate. It naturally shrinks risk when the
+// sample is small or uncertain. The entered sample must represent real trades.
+function estimateAegis2RobustEdge(cfg, netEdge) {
+  const p = Math.max(0, Math.min(1, (Number(cfg.winRate) || 0) / 100));
+  const sampleTrades = Math.max(1, Math.min(1000000, Math.round(Number(cfg.aegis2AdaptiveSampleTrades) || 500)));
+  const confidencePct = Math.max(80, Math.min(99.9, Number(cfg.aegis2AdaptiveConfidencePct) || 90));
+  const z = inverseStandardNormal(0.5 + confidencePct / 200);
+  const z2 = z * z;
+  const n = sampleTrades;
+  const denominator = 1 + z2 / n;
+  const center = p + z2 / (2 * n);
+  const margin = z * Math.sqrt(Math.max(0, (p * (1 - p) + z2 / (4 * n)) / n));
+  const lowerWinRate = Math.max(0, Math.min(1, (center - margin) / denominator));
+  const winNetR = Math.max(0, Number(netEdge?.winNetR) || 0);
+  const lossAbsR = Math.max(1e-9, Number(netEdge?.lossAbsR) || 1);
+  const expectedR = lowerWinRate * winNetR - (1 - lowerWinRate) * lossAbsR;
+  const fullKelly = winNetR > 0
+    ? Math.max(0, Math.min(1, lowerWinRate / lossAbsR - (1 - lowerWinRate) / winNetR))
+    : 0;
+  return { lowerWinRate, sampleTrades, confidencePct, expectedR, fullKelly };
+}
+
 function getAegis2RiskDecision(cfg, useFno, state) {
   const baseRisk = Math.max(0, Number(state.baseRiskAmt) || 0);
   const capital = Math.max(0, Number(state.capital) || 0);
   const peak = Math.max(0, Number(state.peak) || 0);
   const price = Number(state.price) || 0;
   const edge = estimateAegis2NetEdge(cfg, useFno, price, baseRisk);
+  const robustEdge = estimateAegis2RobustEdge(cfg, edge);
   const gateOn = cfg.aegis2EdgeGateEnabled !== false;
+  const fractionalKellyEnabled = cfg.aegis2FractionalKellyEnabled !== false;
+  const adaptiveEdgeEnabled = cfg.aegis2AdaptiveEdgeEnabled !== false;
   const fraction = Math.max(0, Math.min(100, Number(cfg.aegis2FractionalKellyPct) || 0)) / 100;
+  const adaptiveFraction = Math.max(0, Math.min(100, Number(cfg.aegis2AdaptiveKellyPct) || 0)) / 100;
   const perTradeCap = Math.max(0, Number(cfg.perTradeCapPct) || 0) / 100;
   const maxRiskFromCapital = capital * perTradeCap;
   const ddPct = peak > 0 ? Math.max(0, (peak - capital) / peak * 100) : 0;
@@ -757,27 +825,41 @@ function getAegis2RiskDecision(cfg, useFno, state) {
       riskCeiling: 0,
       edgeExpectedR: edge.expectedR,
       fullKellyPct: edge.fullKelly * 100,
+      robustWinRateLowerPct: robustEdge.lowerWinRate * 100,
+      robustExpectedR: robustEdge.expectedR,
+      robustFullKellyPct: robustEdge.fullKelly * 100,
       drawdownScale,
       allocationSource: "edge-gate",
       baseCycleConsumption: 0,
     };
   }
 
-  // If the Edge Gate is intentionally OFF, allow a negative-edge simulation
-  // for diagnostics, bounded by the normal per-trade cap; do not let Kelly=0
-  // hide the real downside in Win Rate sweeps.
-  const grossCeiling = edge.expectedR <= 0 && !gateOn
-    ? maxRiskFromCapital
-    : Math.min(maxRiskFromCapital, capital * edge.fullKelly * fraction);
+  // Independent ceilings: classic Fractional Kelly and the new Robust Edge
+  // Fraction can each be toggled separately. When both are ON, use the stricter
+  // cap. With the Edge Gate OFF and point-estimate edge <= 0, deliberately bypass
+  // both edge-based caps so Win Rate sweeps still show the real downside.
+  const diagnosticNegativeEdge = edge.expectedR <= 0 && !gateOn;
+  let grossCeiling = maxRiskFromCapital;
+  if (!diagnosticNegativeEdge) {
+    if (fractionalKellyEnabled) {
+      grossCeiling = Math.min(grossCeiling, capital * edge.fullKelly * fraction);
+    }
+    if (adaptiveEdgeEnabled) {
+      grossCeiling = Math.min(grossCeiling, capital * robustEdge.fullKelly * adaptiveFraction);
+    }
+  }
   const riskCeiling = Math.max(0, grossCeiling * drawdownScale);
   if (riskCeiling <= 1e-12) {
     return {
       stopped: true,
-      stopReason: `Aegis EdgeVault 2.0 has no positive risk ceiling before Trade ${state.tradeIndex}. Check Base Risk, Fractional Kelly, and safety settings.`,
+      stopReason: `Aegis EdgeVault 2.0 has no positive risk ceiling before Trade ${state.tradeIndex}. Check enabled Kelly/Robust Edge ceilings, sample confidence, Base Risk, and safety settings.`,
       riskAmt: 0,
       riskCeiling,
       edgeExpectedR: edge.expectedR,
       fullKellyPct: edge.fullKelly * 100,
+      robustWinRateLowerPct: robustEdge.lowerWinRate * 100,
+      robustExpectedR: robustEdge.expectedR,
+      robustFullKellyPct: robustEdge.fullKelly * 100,
       drawdownScale,
       allocationSource: "zero-ceiling",
       baseCycleConsumption: 0,
@@ -823,6 +905,9 @@ function getAegis2RiskDecision(cfg, useFno, state) {
         riskCeiling,
         edgeExpectedR: edge.expectedR,
         fullKellyPct: edge.fullKelly * 100,
+        robustWinRateLowerPct: robustEdge.lowerWinRate * 100,
+        robustExpectedR: robustEdge.expectedR,
+        robustFullKellyPct: robustEdge.fullKelly * 100,
         drawdownScale,
         allocationSource: "base-cycle-zero",
         baseCycleConsumption: 0,
@@ -848,6 +933,9 @@ function getAegis2RiskDecision(cfg, useFno, state) {
       riskCeiling,
       edgeExpectedR: edge.expectedR,
       fullKellyPct: edge.fullKelly * 100,
+      robustWinRateLowerPct: robustEdge.lowerWinRate * 100,
+      robustExpectedR: robustEdge.expectedR,
+      robustFullKellyPct: robustEdge.fullKelly * 100,
       drawdownScale,
       allocationSource: source,
       baseCycleConsumption,
@@ -860,6 +948,9 @@ function getAegis2RiskDecision(cfg, useFno, state) {
     riskCeiling,
     edgeExpectedR: edge.expectedR,
     fullKellyPct: edge.fullKelly * 100,
+    robustWinRateLowerPct: robustEdge.lowerWinRate * 100,
+    robustExpectedR: robustEdge.expectedR,
+    robustFullKellyPct: robustEdge.fullKelly * 100,
     drawdownScale,
     allocationSource: source,
     baseCycleConsumption,
@@ -922,6 +1013,9 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
   let aegis2RiskCeiling = null;
   let aegis2EdgeExpectedR = null;
   let aegis2FullKellyPct = null;
+  let aegis2RobustWinRateLowerPct = null;
+  let aegis2RobustExpectedR = null;
+  let aegis2RobustFullKellyPct = null;
   let aegis2DrawdownScale = 1;
   let price = Number(cfg.currentPrice) || 0; // running instrument price (drives turnover fee + is itself driven by each trade's gross P/L)
 
@@ -968,6 +1062,9 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
         aegis2RiskCeilingThisTrade = decision.riskCeiling;
         aegis2EdgeExpectedR = decision.edgeExpectedR;
         aegis2FullKellyPct = decision.fullKellyPct;
+        aegis2RobustWinRateLowerPct = decision.robustWinRateLowerPct;
+        aegis2RobustExpectedR = decision.robustExpectedR;
+        aegis2RobustFullKellyPct = decision.robustFullKellyPct;
         aegis2DrawdownScale = decision.drawdownScale;
         aegis2AllocationSource = decision.allocationSource;
         aegis2BaseCycleConsumptionThisTrade = decision.baseCycleConsumption;
@@ -1016,6 +1113,9 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       aegis2RiskCeilingThisTrade = decision.riskCeiling;
       aegis2EdgeExpectedR = decision.edgeExpectedR;
       aegis2FullKellyPct = decision.fullKellyPct;
+      aegis2RobustWinRateLowerPct = decision.robustWinRateLowerPct;
+      aegis2RobustExpectedR = decision.robustExpectedR;
+      aegis2RobustFullKellyPct = decision.robustFullKellyPct;
       aegis2DrawdownScale = decision.drawdownScale;
       aegis2AllocationSource = decision.allocationSource;
       aegis2BaseCycleConsumptionThisTrade = decision.baseCycleConsumption;
@@ -1504,6 +1604,11 @@ function simulateFromSequence(cfg, winLossSeq, explicitRiskPlan = null) {
       aegis2RiskCeiling: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RiskCeiling : null,
       aegis2ExpectedNetR: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2EdgeExpectedR : null,
       aegis2FullKellyPct: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2FullKellyPct : null,
+      aegis2FractionalKellyEnabled: cfg.cascadeMode === "aegisEdgeVault2" ? cfg.aegis2FractionalKellyEnabled !== false : null,
+      aegis2AdaptiveEdgeEnabled: cfg.cascadeMode === "aegisEdgeVault2" ? cfg.aegis2AdaptiveEdgeEnabled !== false : null,
+      aegis2RobustWinRateLowerPct: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RobustWinRateLowerPct : null,
+      aegis2RobustExpectedR: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RobustExpectedR : null,
+      aegis2RobustFullKellyPct: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RobustFullKellyPct : null,
       aegis2DrawdownScale: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2DrawdownScale : null,
       aegis2BaseCycleRemaining: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2BaseCycleRemaining : null,
       aegis2VaultGuardApplied: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2VaultGuardAppliedThisTrade : false,
@@ -1885,6 +1990,9 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
   let aegis2RiskCeiling = null;
   let aegis2EdgeExpectedR = null;
   let aegis2FullKellyPct = null;
+  let aegis2RobustWinRateLowerPct = null;
+  let aegis2RobustExpectedR = null;
+  let aegis2RobustFullKellyPct = null;
   let aegis2DrawdownScale = 1;
   let price = Number(cfg.fnoCurrentPrice) || 0;
 
@@ -1929,6 +2037,9 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
         aegis2RiskCeilingThisTrade = decision.riskCeiling;
         aegis2EdgeExpectedR = decision.edgeExpectedR;
         aegis2FullKellyPct = decision.fullKellyPct;
+        aegis2RobustWinRateLowerPct = decision.robustWinRateLowerPct;
+        aegis2RobustExpectedR = decision.robustExpectedR;
+        aegis2RobustFullKellyPct = decision.robustFullKellyPct;
         aegis2DrawdownScale = decision.drawdownScale;
         aegis2AllocationSource = decision.allocationSource;
         aegis2BaseCycleConsumptionThisTrade = decision.baseCycleConsumption;
@@ -1975,6 +2086,9 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       aegis2RiskCeilingThisTrade = decision.riskCeiling;
       aegis2EdgeExpectedR = decision.edgeExpectedR;
       aegis2FullKellyPct = decision.fullKellyPct;
+      aegis2RobustWinRateLowerPct = decision.robustWinRateLowerPct;
+      aegis2RobustExpectedR = decision.robustExpectedR;
+      aegis2RobustFullKellyPct = decision.robustFullKellyPct;
       aegis2DrawdownScale = decision.drawdownScale;
       aegis2AllocationSource = decision.allocationSource;
       aegis2BaseCycleConsumptionThisTrade = decision.baseCycleConsumption;
@@ -2484,6 +2598,11 @@ function simulateFromSequenceFnO(cfg, winLossSeq, explicitRiskPlan = null) {
       aegis2RiskCeiling: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RiskCeiling : null,
       aegis2ExpectedNetR: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2EdgeExpectedR : null,
       aegis2FullKellyPct: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2FullKellyPct : null,
+      aegis2FractionalKellyEnabled: cfg.cascadeMode === "aegisEdgeVault2" ? cfg.aegis2FractionalKellyEnabled !== false : null,
+      aegis2AdaptiveEdgeEnabled: cfg.cascadeMode === "aegisEdgeVault2" ? cfg.aegis2AdaptiveEdgeEnabled !== false : null,
+      aegis2RobustWinRateLowerPct: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RobustWinRateLowerPct : null,
+      aegis2RobustExpectedR: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RobustExpectedR : null,
+      aegis2RobustFullKellyPct: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2RobustFullKellyPct : null,
       aegis2DrawdownScale: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2DrawdownScale : null,
       aegis2BaseCycleRemaining: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2BaseCycleRemaining : null,
       aegis2VaultGuardApplied: cfg.cascadeMode === "aegisEdgeVault2" ? aegis2VaultGuardAppliedThisTrade : false,
@@ -2751,7 +2870,12 @@ function cleanConfig(cfg) {
     aegis2LossDeployPct: Number.isFinite(Number(cfg.aegis2LossDeployPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2LossDeployPct))) : 50,
     aegis2LossStepDownPct: Number.isFinite(Number(cfg.aegis2LossStepDownPct)) ? Math.max(0, Math.min(95, Number(cfg.aegis2LossStepDownPct))) : 20,
     aegis2BaseCycleAllocationPct: Number.isFinite(Number(cfg.aegis2BaseCycleAllocationPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2BaseCycleAllocationPct))) : 50,
+    aegis2FractionalKellyEnabled: cfg.aegis2FractionalKellyEnabled !== false,
     aegis2FractionalKellyPct: Number.isFinite(Number(cfg.aegis2FractionalKellyPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2FractionalKellyPct))) : 25,
+    aegis2AdaptiveEdgeEnabled: cfg.aegis2AdaptiveEdgeEnabled !== false,
+    aegis2AdaptiveSampleTrades: Number.isFinite(Number(cfg.aegis2AdaptiveSampleTrades)) ? Math.max(1, Math.min(1000000, Math.round(Number(cfg.aegis2AdaptiveSampleTrades)))) : 500,
+    aegis2AdaptiveConfidencePct: Number.isFinite(Number(cfg.aegis2AdaptiveConfidencePct)) ? Math.max(80, Math.min(99.9, Number(cfg.aegis2AdaptiveConfidencePct))) : 90,
+    aegis2AdaptiveKellyPct: Number.isFinite(Number(cfg.aegis2AdaptiveKellyPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2AdaptiveKellyPct))) : 25,
     aegis2DrawdownDeRiskPct: Number.isFinite(Number(cfg.aegis2DrawdownDeRiskPct)) ? Math.max(0, Math.min(100, Number(cfg.aegis2DrawdownDeRiskPct))) : 50,
     aegis2EdgeGateEnabled: cfg.aegis2EdgeGateEnabled !== false,
     winRiskPct: Number(cfg.winRiskPct) || 0,
@@ -2892,7 +3016,7 @@ function Field({ label, children, labelClassName = "" }) {
   );
 }
 
-function NumInput({ value, onChange, step = "1", color = "blue", min, max }) {
+function NumInput({ value, onChange, step = "1", color = "blue", min, max, disabled = false }) {
   const c = SECTION_COLORS[color] || SECTION_COLORS.blue;
   return (
     <input
@@ -2901,8 +3025,9 @@ function NumInput({ value, onChange, step = "1", color = "blue", min, max }) {
       step={step}
       min={min}
       max={max}
+      disabled={disabled}
       onChange={onChange}
-      className={`w-full bg-black/30 border border-white/[0.08] text-zinc-100 rounded-lg text-sm px-3 py-2.5 outline-none focus:ring-1 transition-colors font-mono ${c.ring}`}
+      className={`w-full bg-black/30 border border-white/[0.08] text-zinc-100 rounded-lg text-sm px-3 py-2.5 outline-none focus:ring-1 transition-colors font-mono disabled:opacity-40 disabled:cursor-not-allowed ${c.ring}`}
     />
   );
 }
@@ -6742,7 +6867,7 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
               : cfg.cascadeMode === "aegisEdgeVault"
               ? "Aegis EdgeVault: lock part of each net win, deploy only the active vault, step down after losses, and cap risk using fractional Kelly. Edge Gate blocks a non-positive estimated edge."
               : cfg.cascadeMode === "aegisEdgeVault2"
-              ? "Aegis EdgeVault 2.0: costs-aware edge/Kelly ceiling, risk scales down as drawdown grows, locked profit is never recycled, and a two-stage Base Cycle activates when the Active Vault is exhausted."
+              ? "Aegis EdgeVault 2.0: cost-aware classic Fractional Kelly plus an optional confidence-adjusted Robust Edge Sizer (Wilson lower bound). When both are ON, the stricter ceiling applies."
               : cfg.cascadeMode === "profitReserve"
               ? "Signed changes modify calculated risk (+20% = ×1.20; -20% = ×0.80). WIN uses latest net profit; LOSS uses remaining reserve. Base Cycle Change adjusts the first slice; after a loss, the next allocation uses the remaining cycle amount."
               : "Existing On Capital logic: risk follows current capital."}
@@ -6789,8 +6914,26 @@ function BuilderConfig({ cfg, strategyCfg, baseMode, autoCandidate, onChange, on
                 <Field label="Loss Deploy %"><NumInput value={cfg.aegis2LossDeployPct} onChange={onChange("aegis2LossDeployPct")} step="1" min="0" max="100" color="violet" /></Field>
                 <Field label="Loss Step-Down %"><NumInput value={cfg.aegis2LossStepDownPct} onChange={onChange("aegis2LossStepDownPct")} step="1" min="0" max="95" color="violet" /></Field>
                 <Field label="Base Cycle Allocation %"><NumInput value={cfg.aegis2BaseCycleAllocationPct} onChange={onChange("aegis2BaseCycleAllocationPct")} step="1" min="1" max="100" color="violet" /></Field>
-                <Field label="Fractional Kelly %"><NumInput value={cfg.aegis2FractionalKellyPct} onChange={onChange("aegis2FractionalKellyPct")} step="5" min="0" max="100" color="violet" /></Field>
                 <Field label="DD De-risk %"><NumInput value={cfg.aegis2DrawdownDeRiskPct} onChange={onChange("aegis2DrawdownDeRiskPct")} step="5" min="0" max="100" color="violet" /></Field>
+                <div className="col-span-2 min-w-0 rounded-md border border-violet-500/20 bg-zinc-950/35 p-2.5">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="min-w-0 rounded-md border border-zinc-800 px-2 py-2 flex items-center justify-between gap-2">
+                      <span className="text-[10px] leading-tight text-zinc-200">Fractional Kelly</span>
+                      <button type="button" onClick={() => onChange("aegis2FractionalKellyEnabled")({ target: { value: !cfg.aegis2FractionalKellyEnabled } })} className={`shrink-0 px-2 py-1 rounded-md text-[9px] font-mono border ${cfg.aegis2FractionalKellyEnabled ? "bg-violet-500/15 text-violet-300 border-violet-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegis2FractionalKellyEnabled ? "ON" : "OFF"}</button>
+                    </div>
+                    <div className="min-w-0 rounded-md border border-zinc-800 px-2 py-2 flex items-center justify-between gap-2">
+                      <span className="text-[10px] leading-tight text-zinc-200">Robust Edge Sizer</span>
+                      <button type="button" onClick={() => onChange("aegis2AdaptiveEdgeEnabled")({ target: { value: !cfg.aegis2AdaptiveEdgeEnabled } })} className={`shrink-0 px-2 py-1 rounded-md text-[9px] font-mono border ${cfg.aegis2AdaptiveEdgeEnabled ? "bg-cyan-500/15 text-cyan-300 border-cyan-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegis2AdaptiveEdgeEnabled ? "ON" : "OFF"}</button>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 mt-2 min-w-0">
+                    <div className="min-w-0"><Field label="Fractional Kelly %"><NumInput value={cfg.aegis2FractionalKellyPct} disabled={!cfg.aegis2FractionalKellyEnabled} onChange={onChange("aegis2FractionalKellyPct")} step="5" min="0" max="100" color="violet" /></Field></div>
+                    <div className="min-w-0"><Field label="Historical Sample Trades"><NumInput value={cfg.aegis2AdaptiveSampleTrades} disabled={!cfg.aegis2AdaptiveEdgeEnabled} onChange={onChange("aegis2AdaptiveSampleTrades")} step="50" min="1" max="1000000" color="violet" /></Field></div>
+                    <div className="min-w-0"><Field label="Confidence Level %"><NumInput value={cfg.aegis2AdaptiveConfidencePct} disabled={!cfg.aegis2AdaptiveEdgeEnabled} onChange={onChange("aegis2AdaptiveConfidencePct")} step="1" min="80" max="99.9" color="violet" /></Field></div>
+                    <div className="min-w-0"><Field label="Robust Kelly %"><NumInput value={cfg.aegis2AdaptiveKellyPct} disabled={!cfg.aegis2AdaptiveEdgeEnabled} onChange={onChange("aegis2AdaptiveKellyPct")} step="5" min="0" max="100" color="violet" /></Field></div>
+                  </div>
+                  <div className="mt-2 text-[9px] leading-relaxed text-zinc-500">Robust Edge Sizer uses a Wilson lower confidence bound for the configured win rate, then a cost-adjusted Kelly ceiling. Enter the number of historical trades behind your win-rate estimate. When both sizing controls are ON, the stricter ceiling wins.</div>
+                </div>
                 <div className="col-span-2 mt-1 rounded-md border border-emerald-500/15 bg-zinc-950/35 px-2.5 py-2">
                   <div className="flex items-center justify-between gap-2"><span className="text-[10px] font-semibold text-emerald-200">Net Edge Gate</span><button type="button" onClick={() => onChange("aegis2EdgeGateEnabled")({ target: { value: !cfg.aegis2EdgeGateEnabled } })} className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border ${cfg.aegis2EdgeGateEnabled ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegis2EdgeGateEnabled ? "ON" : "OFF"}</button></div>
                   <div className="mt-1 text-[9px] text-zinc-500">Uses estimated net expectancy after configured fees, spread and slippage. When OFF, negative-edge simulations still run for diagnostics but remain capped by existing safety limits.</div>
@@ -7479,7 +7622,7 @@ function BuilderTradeLog({ result, strategyCfg, baseMode, activeRunLabel, onReor
                   <td className="px-3 py-1.5">
                     <TradeResultBadge win={t.win} />
                   </td>
-                  <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Full Kelly ${Number(t.aegis2FullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                  <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Classic Fractional Kelly ${t.aegis2FractionalKellyEnabled ? "ON" : "OFF"} (${Number(t.aegis2FullKellyPct).toFixed(2)}% full Kelly) · Robust Edge Sizer ${t.aegis2AdaptiveEdgeEnabled ? "ON" : "OFF"} · Win-rate lower bound ${Number(t.aegis2RobustWinRateLowerPct).toFixed(2)}% · Robust expectancy ${Number(t.aegis2RobustExpectedR).toFixed(3)}R · Robust full Kelly ${Number(t.aegis2RobustFullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                   <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                   <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                   <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>{fmtMoney(t.grossPL)}</td>
@@ -7892,7 +8035,7 @@ export default function RiskSimulator() {
       "builderSequenceFilterMatch",
       "builderSequenceFilterFinalPnl",
     ]);
-    const booleanKeys = new Set(["builderRiskMenuOpen", "builderSequenceFilterEnabled", "builderSequenceFilterOpen", "aegis2EdgeGateEnabled"]);
+    const booleanKeys = new Set(["builderRiskMenuOpen", "builderSequenceFilterEnabled", "builderSequenceFilterOpen", "aegis2EdgeGateEnabled", "aegis2FractionalKellyEnabled", "aegis2AdaptiveEdgeEnabled"]);
     setCfg((c) => ({
       ...c,
       [key]: booleanKeys.has(key)
@@ -9172,11 +9315,29 @@ export default function RiskSimulator() {
                         <div className="min-w-0"><Field label="Loss Deploy %"><NumInput value={cfg.aegis2LossDeployPct} onChange={setField("aegis2LossDeployPct")} step="1" min="0" max="100" color="violet" /></Field></div>
                         <div className="min-w-0"><Field label="Loss Step-Down %"><NumInput value={cfg.aegis2LossStepDownPct} onChange={setField("aegis2LossStepDownPct")} step="1" min="0" max="95" color="violet" /></Field></div>
                         <div className="min-w-0"><Field label="Base Cycle Allocation %"><NumInput value={cfg.aegis2BaseCycleAllocationPct} onChange={setField("aegis2BaseCycleAllocationPct")} step="1" min="1" max="100" color="violet" /></Field></div>
-                        <div className="min-w-0"><Field label="Fractional Kelly %"><NumInput value={cfg.aegis2FractionalKellyPct} onChange={setField("aegis2FractionalKellyPct")} step="5" min="0" max="100" color="violet" /></Field></div>
                         <div className="min-w-0"><Field label="DD De-risk %"><NumInput value={cfg.aegis2DrawdownDeRiskPct} onChange={setField("aegis2DrawdownDeRiskPct")} step="5" min="0" max="100" color="violet" /></Field></div>
+                        <div className="col-span-2 min-w-0 rounded-md border border-violet-500/20 bg-zinc-950/35 p-2.5">
+                          <div className="grid grid-cols-2 gap-2">
+                            <div className="min-w-0 rounded-md border border-zinc-800 px-2 py-2 flex items-center justify-between gap-2">
+                              <span className="text-[10px] leading-tight text-zinc-200">Fractional Kelly</span>
+                              <button type="button" onClick={() => setCfg((c) => ({ ...c, aegis2FractionalKellyEnabled: !c.aegis2FractionalKellyEnabled }))} className={`shrink-0 px-2 py-1 rounded-md text-[9px] font-mono border ${cfg.aegis2FractionalKellyEnabled ? "bg-violet-500/15 text-violet-300 border-violet-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegis2FractionalKellyEnabled ? "ON" : "OFF"}</button>
+                            </div>
+                            <div className="min-w-0 rounded-md border border-zinc-800 px-2 py-2 flex items-center justify-between gap-2">
+                              <span className="text-[10px] leading-tight text-zinc-200">Robust Edge Sizer</span>
+                              <button type="button" onClick={() => setCfg((c) => ({ ...c, aegis2AdaptiveEdgeEnabled: !c.aegis2AdaptiveEdgeEnabled }))} className={`shrink-0 px-2 py-1 rounded-md text-[9px] font-mono border ${cfg.aegis2AdaptiveEdgeEnabled ? "bg-cyan-500/15 text-cyan-300 border-cyan-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegis2AdaptiveEdgeEnabled ? "ON" : "OFF"}</button>
+                            </div>
+                          </div>
+                          <div className="grid grid-cols-2 gap-2 mt-2 min-w-0">
+                            <div className="min-w-0"><Field label="Fractional Kelly %"><NumInput value={cfg.aegis2FractionalKellyPct} disabled={!cfg.aegis2FractionalKellyEnabled} onChange={setField("aegis2FractionalKellyPct")} step="5" min="0" max="100" color="violet" /></Field></div>
+                            <div className="min-w-0"><Field label="Historical Sample Trades"><NumInput value={cfg.aegis2AdaptiveSampleTrades} disabled={!cfg.aegis2AdaptiveEdgeEnabled} onChange={setField("aegis2AdaptiveSampleTrades")} step="50" min="1" max="1000000" color="violet" /></Field></div>
+                            <div className="min-w-0"><Field label="Confidence Level %"><NumInput value={cfg.aegis2AdaptiveConfidencePct} disabled={!cfg.aegis2AdaptiveEdgeEnabled} onChange={setField("aegis2AdaptiveConfidencePct")} step="1" min="80" max="99.9" color="violet" /></Field></div>
+                            <div className="min-w-0"><Field label="Robust Kelly %"><NumInput value={cfg.aegis2AdaptiveKellyPct} disabled={!cfg.aegis2AdaptiveEdgeEnabled} onChange={setField("aegis2AdaptiveKellyPct")} step="5" min="0" max="100" color="violet" /></Field></div>
+                          </div>
+                          <div className="mt-2 text-[9px] leading-relaxed text-zinc-500">Uses a Wilson lower confidence bound on the configured win rate, then a cost-adjusted Kelly ceiling. Enter the actual historical sample size. When both sizing controls are ON, the stricter ceiling wins.</div>
+                        </div>
                         <div className="col-span-2 mt-1 rounded-md border border-emerald-500/15 bg-zinc-950/35 px-2.5 py-2">
                           <div className="flex items-center justify-between gap-2"><span className="text-[10px] font-semibold text-emerald-200">Net Edge Gate</span><button type="button" onClick={() => setCfg((c) => ({ ...c, aegis2EdgeGateEnabled: !c.aegis2EdgeGateEnabled }))} className={`shrink-0 px-2.5 py-1 rounded-md text-[9px] font-mono border ${cfg.aegis2EdgeGateEnabled ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30" : "bg-zinc-800/70 text-zinc-400 border-zinc-700/60"}`}>{cfg.aegis2EdgeGateEnabled ? "ON" : "OFF"}</button></div>
-                          <div className="mt-1 text-[9px] text-zinc-500">Uses configured costs to estimate net edge. OFF allows loss diagnostics but existing safety limits still apply.</div>
+                          <div className="mt-1 text-[9px] text-zinc-500">Uses configured costs to estimate point-estimate net edge. OFF allows negative-edge diagnostic runs; risk still follows enabled sizing ceilings and safety limits.</div>
                         </div>
                       </div>
                     ) : cfg.cascadeMode === "profitReserve" ? (
@@ -9723,7 +9884,7 @@ export default function RiskSimulator() {
                             >
                               <TradeResultBadge win={t.win} />
                             </td>
-                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300">BUDGET</span> : null}{t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Full Kelly ${Number(t.aegis2FullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.riskAllocationReset ? <span className="ml-1 text-[9px] text-violet-300">RESET</span> : null}{t.riskBudgetGuardApplied ? <span className="ml-1 text-[9px] text-emerald-300">BUDGET</span> : null}{t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Classic Fractional Kelly ${t.aegis2FractionalKellyEnabled ? "ON" : "OFF"} (${Number(t.aegis2FullKellyPct).toFixed(2)}% full Kelly) · Robust Edge Sizer ${t.aegis2AdaptiveEdgeEnabled ? "ON" : "OFF"} · Win-rate lower bound ${Number(t.aegis2RobustWinRateLowerPct).toFixed(2)}% · Robust expectancy ${Number(t.aegis2RobustExpectedR).toFixed(3)}R · Robust full Kelly ${Number(t.aegis2RobustFullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots.toFixed(2)}</td>
                             <td className={`px-3 py-1.5 text-right ${t.grossPL >= 0 ? "text-emerald-400" : "text-red-400"}`}>
@@ -9991,7 +10152,7 @@ export default function RiskSimulator() {
                             >
                               <TradeResultBadge win={t.win} />
                             </td>
-                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Full Kelly ${Number(t.aegis2FullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
+                            <td className="px-3 py-1.5 text-right"><span>{fmtMoney(t.risk)}</span> {t.aegisAllocationSource ? <span title={`AEV · ${t.aegisAllocationSource} · Active Vault ${fmtMoney(t.aegisActiveVault)} · Locked Vault ${fmtMoney(t.aegisLockedProfit)} · Kelly ceiling ${fmtMoney(t.aegisRiskCeiling)} · Estimated edge ${Number(t.aegisEdgeExpectedR).toFixed(3)}R`} className="ml-1 text-[9px] text-emerald-300">AEV</span> : null}{t.aegis2AllocationSource ? <span title={`AEV 2.0 · ${t.aegis2AllocationSource} · Active Vault after trade ${fmtMoney(t.aegis2ActiveVault)} · Locked Vault ${fmtMoney(t.aegis2LockedProfit)} · Cost-aware Kelly/DD ceiling ${fmtMoney(t.aegis2RiskCeiling)} · Estimated net expectancy ${Number(t.aegis2ExpectedNetR).toFixed(3)}R · Classic Fractional Kelly ${t.aegis2FractionalKellyEnabled ? "ON" : "OFF"} (${Number(t.aegis2FullKellyPct).toFixed(2)}% full Kelly) · Robust Edge Sizer ${t.aegis2AdaptiveEdgeEnabled ? "ON" : "OFF"} · Win-rate lower bound ${Number(t.aegis2RobustWinRateLowerPct).toFixed(2)}% · Robust expectancy ${Number(t.aegis2RobustExpectedR).toFixed(3)}R · Robust full Kelly ${Number(t.aegis2RobustFullKellyPct).toFixed(2)}% · Drawdown scale ${(Number(t.aegis2DrawdownScale) * 100).toFixed(1)}% · Base Cycle remaining ${fmtMoney(t.aegis2BaseCycleRemaining)}${t.aegis2VaultBeforeTrade !== null ? ` · Vault before trade ${fmtMoney(t.aegis2VaultBeforeTrade)} · Risk target before vault guard ${fmtMoney(t.aegis2VaultRiskTargetBeforeGuard)} · All-in vault guard ${t.aegis2VaultGuardApplied ? "capped risk" : "not needed"}` : ""}`} className="ml-1 text-[9px] text-cyan-300">AEV2</span> : null}{t.profitReserveAllocationSource ? <span title={(t.profitReserveAllocationSource === "baseCycle" ? "Base cycle remaining before trade " : "Available profit reserve before trade ") + fmtMoney(t.profitReservePoolBefore) + " · Allocation target " + fmtMoney(t.profitReserveRiskTarget) + " · Executed risk " + fmtMoney(t.risk) + (t.profitReserveAllocationSource === "baseCycle" ? " · Base cycle consumes the executed risk slice; transaction costs do not reduce the next base-risk slice. Base cycle remaining after trade " + fmtMoney(t.profitReserveBaseCycleRemaining) : " · Unadjusted allocation slice consumed " + fmtMoney(t.profitReservePoolConsumed) + " · Reserve after allocation/trade " + fmtMoney(t.profitReserveAvailable) + " · The signed adjustment changes target risk only; the unadjusted base slice is consumed once before execution. A LOSS does not deduct its Net P/L from this pool a second time. A positive WIN resets the reserve to that trade's net profit after costs.") + (t.profitReserveFallbackReason ? " · " + t.profitReserveFallbackReason : "")} className={`ml-1 text-[9px] ${t.profitReserveAllocationSource === "profitReserve" ? "text-emerald-300" : "text-sky-300"}`}>{t.profitReserveAllocationSource === "profitReserve" ? "RESERVE" : t.profitReserveAllocationSource === "baseCycle" ? "BASE CYCLE" : "BASE"}</span> : null}{t.profitReserveGuardApplied ? <span title={`Reserve target: ${fmtMoney(t.profitReserveRiskTarget)} · Executed risk after all-in cost cap: ${fmtMoney(t.risk)} · Remaining pool before trade: ${fmtMoney(t.profitReservePoolBefore)}`} className="ml-1 text-[9px] text-amber-300">CAP</span> : null}{Number(t.profitReserveRiskTarget) > Number(t.risk) + 1e-9 ? <span className="block text-[9px] text-zinc-500" title="Configured allocation target. Actual risk is lower because Day/F&O trades only whole shares or lots.">Target {fmtMoney(t.profitReserveRiskTarget)}</span> : null}</td>
                             <td className="px-3 py-1.5 text-right text-zinc-300">{Number(t.rr ?? -1).toFixed(2)}R</td>
                             <td className="px-3 py-1.5 text-right text-[#FEF9C2]">{t.lots}</td>
                             <td className="px-3 py-1.5 text-right">{t.quantity}</td>
